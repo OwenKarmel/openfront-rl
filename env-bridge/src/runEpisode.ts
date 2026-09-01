@@ -17,7 +17,14 @@
  *   npx tsx src/runEpisode.ts [--map plains] [--seed smoke-1] [--ticks 300]
  *                              [--spawn-turns 3] [--act-every 10]
  *                              [--difficulty medium]
+ *                              [--dump-game-record ../training/replays]
+ *
+ * --dump-game-record <dir> writes a full GameRecord (Episode.toGameRecord())
+ * to <dir>/<wireGameID>.json, servable by ReplayServer.ts for watching in
+ * the actual OpenFrontIO client — see README "Watching a game".
  */
+import fs from "fs";
+import path from "path";
 import { AGENT_CLIENT_ID, Episode } from "./GameSetup";
 import { Difficulty } from "../../OpenFrontIO/src/core/game/Game";
 import { StampedIntent } from "../../OpenFrontIO/src/core/Schemas";
@@ -30,6 +37,7 @@ interface Options {
   actEvery: number;
   difficulty: Difficulty;
   dumpRecord: string | undefined;
+  dumpGameRecord: string | undefined;
 }
 
 function parseDifficulty(name: string): Difficulty {
@@ -53,6 +61,7 @@ function parseArgs(argv: string[]): Options {
     actEvery: 10,
     difficulty: Difficulty.Medium,
     dumpRecord: undefined,
+    dumpGameRecord: undefined,
   };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -82,6 +91,9 @@ function parseArgs(argv: string[]): Options {
         break;
       case "--dump-record":
         opts.dumpRecord = next();
+        break;
+      case "--dump-game-record":
+        opts.dumpGameRecord = next();
         break;
       default:
         throw new Error(`unknown argument: ${arg}`);
@@ -122,6 +134,16 @@ async function runEpisode(opts: Options): Promise<EpisodeResult> {
   if (opts.dumpRecord) {
     episode.writeReplayRecord(opts.dumpRecord);
     console.log(`Wrote replay record to ${opts.dumpRecord}`);
+  }
+  if (opts.dumpGameRecord) {
+    fs.mkdirSync(opts.dumpGameRecord, { recursive: true });
+    const gameID = episode.wireGameID();
+    const outFile = path.join(opts.dumpGameRecord, `${gameID}.json`);
+    fs.writeFileSync(outFile, JSON.stringify(episode.toGameRecord()));
+    console.log(
+      `Wrote GameRecord to ${outFile} — with ReplayServer.ts running, ` +
+        `watch it at http://localhost:<vite-port>/game/${gameID}`,
+    );
   }
 
   return {

@@ -53,6 +53,7 @@ class OpenFrontEnv(gym.Env):
         max_steps: int = 200,
         node_bin: str = "node",
         dump_record: str | None = None,
+        dump_game_record_dir: str | None = None,
     ) -> None:
         super().__init__()
         if difficulty not in DIFFICULTIES:
@@ -65,6 +66,7 @@ class OpenFrontEnv(gym.Env):
         self.max_steps = max_steps
         self._node_bin = node_bin
         self.dump_record = dump_record
+        self.dump_game_record_dir = dump_game_record_dir
 
         self._proc: subprocess.Popen | None = None
         self._step_count = 0
@@ -158,6 +160,8 @@ class OpenFrontEnv(gym.Env):
         }
         if self.dump_record is not None:
             reset_cmd["dumpRecord"] = self.dump_record
+        if self.dump_game_record_dir is not None:
+            reset_cmd["dumpGameRecordDir"] = self.dump_game_record_dir
         raw = self._send(reset_cmd)
         self._step_count = 0
         self._last_obs = raw

@@ -1,3 +1,4 @@
+import crypto from "crypto";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -28,10 +29,13 @@ import { UserSettings } from "../../OpenFrontIO/src/core/game/UserSettings";
 import { GameRunner } from "../../OpenFrontIO/src/core/GameRunner";
 import {
   GameConfig,
+  GameRecord,
+  PlayerRecord,
   StampedIntent,
   Turn,
   Winner,
 } from "../../OpenFrontIO/src/core/Schemas";
+import { createPartialGameRecord } from "../../OpenFrontIO/src/core/Util";
 import { EnvConfig } from "./EnvConfig";
 import { NodeGameMapLoader } from "../../OpenFrontIO/tests/perf/fullgame/NodeGameMapLoader";
 
@@ -45,8 +49,24 @@ const PRODUCTION_MAPS_DIR = path.join(
   "../../OpenFrontIO/resources/maps",
 );
 
-export const AGENT_CLIENT_ID = "AGENT";
+// Exactly 8 alphanumeric chars each — Schemas.ts's ID/MappedID (used for
+// player clientIDs and gameIDs throughout, including StampedIntent.clientID
+// on every recorded turn) requires `GAME_ID_REGEX = /^[A-Za-z0-9]{8}$/`.
+// Only matters for toGameRecord()'s output (the real client strictly
+// schema-validates it); writeReplayRecord()/verifyRecord.ts don't care, but
+// using valid IDs everywhere avoids needing two different ID schemes.
+export const AGENT_CLIENT_ID = "AGENTAAA";
 export const OPPONENT_CLIENT_ID = "OPPONENT";
+
+/**
+ * Deterministically derives a schema-valid 8-char alphanumeric gameID (see
+ * GAME_ID_REGEX) from an arbitrary episode seed string, so a training
+ * episode's own seed (e.g. "onion-42", not 8 chars, has a hyphen) can still
+ * be used as OpenFrontIO's wire gameID in toGameRecord()/ReplayServer.ts.
+ */
+export function wireGameID(seed: string): string {
+  return crypto.createHash("sha256").update(seed).digest("hex").slice(0, 8);
+}
 
 interface ResolvedMap {
   gameMap: GameMap;
@@ -156,6 +176,7 @@ export class Episode {
   private seed: string;
   private gameConfig: GameConfig;
   private spawnTurns: number;
+  private readonly startTimeMs = Date.now();
 
   private constructor(
     runner: GameRunner,
@@ -361,6 +382,11 @@ export class Episode {
     return ok;
   }
 
+  /** The gameID toGameRecord() writes into the record — visit /game/<this> in the client. */
+  wireGameID(): string {
+    return wireGameID(this.seed);
+  }
+
   isDone(): boolean {
     return (
       this.lastWinner !== undefined ||
@@ -398,5 +424,42 @@ export class Episode {
       turns: this.turns,
     };
     fs.writeFileSync(filePath, JSON.stringify(record));
+  }
+
+  /**
+   * Builds a strictly schema-valid GameRecord (GameRecordSchema in
+   * Schemas.ts) using the same `createPartialGameRecord` helper the real
+   * server uses to archive games. Unlike writeReplayRecord()'s loose shape,
+   * this is what the actual OpenFrontIO browser client requires: its only
+   * path for loading an archived game (JoinLobbyModal.checkArchivedGame)
+   * does `GET {apiBase}/game/{gameID}` and runs the strict
+   * `GameRecordSchema.safeParse` on the response with no fallback — see
+   * ReplayServer.ts, which serves records built by this method so a
+   * training episode can actually be watched in the real client.
+   */
+  toGameRecord(): GameRecord {
+    const players: PlayerRecord[] = [
+      {
+        clientID: AGENT_CLIENT_ID,
+        username: "Agent",
+        clanTag: null,
+        persistentID: null,
+        stats: {},
+      },
+    ];
+    const partial = createPartialGameRecord(
+      wireGameID(this.seed),
+      this.gameConfig,
+      players,
+      this.turns,
+      this.startTimeMs,
+      Date.now(),
+      this.lastWinner,
+    );
+    // gitCommit: "DEV" makes JoinLobbyModal.checkArchivedGame skip the
+    // build-matches-record check entirely (it only compares when the
+    // client's own build is non-DEV) — exactly matches a `npm run dev`
+    // client, which also reports "DEV".
+    return { ...partial, gitCommit: "DEV" };
   }
 }

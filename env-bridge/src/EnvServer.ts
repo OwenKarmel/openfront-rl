@@ -38,8 +38,12 @@
  * `dumpRecord` (optional, on reset) writes every turn of the episode to a
  * replayable JSON file — see Episode.writeReplayRecord — once the episode
  * ends (done:true from step) or the session is closed, whichever comes
- * first.
+ * first. `dumpGameRecordDir` similarly writes a full, strictly schema-valid
+ * GameRecord (Episode.toGameRecord()) to <dir>/<wireGameID>.json, watchable
+ * in the real OpenFrontIO client via ReplayServer.ts — see README.
  */
+import fs from "fs";
+import path from "path";
 import readline from "readline";
 import { Difficulty, Game, Player } from "../../OpenFrontIO/src/core/game/Game";
 import { StampedIntent } from "../../OpenFrontIO/src/core/Schemas";
@@ -56,6 +60,7 @@ interface ResetCmd {
   spawnTurns?: number;
   ticksPerStep?: number;
   dumpRecord?: string;
+  dumpGameRecordDir?: string;
 }
 interface StepCmd {
   cmd: "step";
@@ -175,6 +180,7 @@ class Session {
   ticksPerStep = 10;
   prevPotential = 0;
   dumpRecordPath: string | undefined;
+  dumpGameRecordDir: string | undefined;
 
   async reset(cmd: ResetCmd): Promise<object> {
     this.episode = await Episode.create(
@@ -187,6 +193,7 @@ class Session {
     this.height = this.episode.game.height();
     this.ticksPerStep = cmd.ticksPerStep ?? 10;
     this.dumpRecordPath = cmd.dumpRecord;
+    this.dumpGameRecordDir = cmd.dumpGameRecordDir;
     this.prevPotential = potential(this.episode.game);
     return {
       obs: observation(this.episode.game, this.width, this.height),
@@ -240,11 +247,19 @@ class Session {
     };
   }
 
-  /** Writes the pending replay record (if any dumpRecord path was set on reset). */
+  /** Writes any pending replay/GameRecord dumps requested on reset. */
   flushRecord(): void {
     if (this.episode && this.dumpRecordPath) {
       this.episode.writeReplayRecord(this.dumpRecordPath);
       this.dumpRecordPath = undefined;
+    }
+    if (this.episode && this.dumpGameRecordDir) {
+      fs.mkdirSync(this.dumpGameRecordDir, { recursive: true });
+      const gameID = this.episode.wireGameID();
+      const outFile = path.join(this.dumpGameRecordDir, `${gameID}.json`);
+      fs.writeFileSync(outFile, JSON.stringify(this.episode.toGameRecord()));
+      console.log(`Wrote GameRecord to ${outFile} (watch at /game/${gameID})`);
+      this.dumpGameRecordDir = undefined;
     }
   }
 }

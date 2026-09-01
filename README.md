@@ -30,6 +30,11 @@ MuZero/EfficientZero, action/observation space, phased milestones).
     format and action space).
   - `src/verifyRecord.ts` — headless replay verification for a dumped turn
     log (re-simulates it and diffs hash checkpoints).
+  - `src/ReplayServer.ts` — tiny local HTTP server (defaults to port 8787,
+    which a plain `npm run dev` client already checks by default) serving
+    `GET /game/:id` from a directory of `Episode.toGameRecord()` dumps, so
+    a training episode can be watched in the real OpenFrontIO browser
+    client — see "Watching a game" below.
 - `training/` — Python.
   - `envs/openfront_env.py` — `gymnasium.Env` wrapping `EnvServer.ts` over a
     subprocess. Single-agent: AGENT is controlled by `step(action)`;
@@ -75,19 +80,53 @@ legality.
     `AGENT`/`OPPONENT` ids, `EnvConfig`'s deterministic combat) — the two
     diverge from tick 0 even though both are internally deterministic. Our
     own turn logs verify correctly with `verifyRecord.ts` instead.
-- **Full visual playback in the actual browser client** (investigated, not
-  built): the client only ever loads a `GameRecord` one way —
-  `JoinLobbyModal.checkArchivedGame()` does `GET {apiBase}/game/{gameID}`
-  and requires the response to pass `GameRecordSchema.safeParse` *strictly*
-  (unlike the headless replay tool, there's no lenient fallback), plus a
-  `gitCommit` match (or a DEV-build client, which skips that check). Getting
-  a training episode on screen in the real client would need: (1) a tiny
-  local HTTP server serving our dumped record at that route, with
-  `getApiBase()` pointed at it, and (2) the record actually filled out to
-  the full schema — real `GameEndInfo`/`PlayerRecord`/stats fields, not the
-  loose shape `writeReplayRecord()` produces today. Not started; a bigger
-  lift than headless verification was, and orthogonal to the training
-  milestone, so scoped separately.
+- **Full visual playback in the actual browser client** (built and
+  verified as far as this environment allows):
+  ```bash
+  # 1. Dump a full, strictly schema-valid GameRecord for an episode
+  cd env-bridge
+  npx tsx --tsconfig ../OpenFrontIO/tsconfig.json src/runEpisode.ts \
+    --map onion --difficulty impossible --dump-game-record ../training/replays
+  # -> prints the watch URL, e.g. .../game/772632da
+
+  # 2. Serve it (defaults to port 8787 — the address a plain `npm run dev`
+  #    client already checks with zero configuration)
+  npx tsx --tsconfig ../OpenFrontIO/tsconfig.json src/ReplayServer.ts
+
+  # 3. In OpenFrontIO/: npm run dev, then open the printed URL, e.g.
+  #    http://localhost:9000/game/772632da
+  ```
+  `EnvServer.ts`'s `reset` also takes `dumpGameRecordDir` (Python:
+  `OpenFrontEnv(dump_game_record_dir=...)`) to do the same from a training
+  run. Built via `Episode.toGameRecord()`, which reuses
+  `createPartialGameRecord` (the same helper the real server uses to
+  archive games) — validated directly against `GameRecordSchema.safeParse`
+  (passes) and, live: `JoinLobbyModal.checkArchivedGame()` in an actual
+  running dev client fetches it, accepts it, and proceeds into
+  `handleJoinLobby` (confirmed via console/network logs). One fix needed
+  along the way: `ReplayServer.ts`'s CORS headers must echo the request's
+  `Origin` (not `Access-Control-Allow-Origin: *`) and set
+  `Access-Control-Allow-Credentials: true`, since several of the client's
+  other `apiBase`-directed calls (auth refresh, cosmetics, news) use
+  `credentials: "include"`, which a wildcard origin can't satisfy.
+  - **Two things this project's constants had to satisfy that weren't
+    obvious upfront**: `GAME_ID_REGEX` requires exactly 8 alphanumeric
+    characters for both `gameID` and every player `clientID` — env-bridge's
+    episode seeds (e.g. `"onion-42"`) don't qualify, so `toGameRecord()`
+    derives a stable 8-char id via `wireGameID()` (sha256 of the seed,
+    truncated), and `AGENT_CLIENT_ID` itself had to become an 8-char value
+    (`"AGENTAAA"`) rather than `"AGENT"`.
+  - **Not independently confirmed**: pixels actually on screen. This dev
+    environment's headless Chromium hits OpenFrontIO's `WebGLGate`
+    (`src/client/components/WebGLGate.ts`) — a deliberate hard block on
+    software-rendered WebGL2 (SwiftShader/llvmpipe), added for real users
+    hitting the same issue (see its `#4357` reference) — which also blocks
+    the repo's own pre-existing `game.mjs` smoke test in this environment
+    (confirmed by running it unmodified: it times out the same way,
+    independent of anything built here). In a normal desktop browser with
+    real GPU acceleration, the gate doesn't trigger and the confirmed
+    server-side chain above (record generated → validated → fetched →
+    accepted by the client) is exactly what feeds the renderer.
 
 ## Setup
 
@@ -135,7 +174,13 @@ npx tsx --tsconfig ../OpenFrontIO/tsconfig.json src/verifyRecord.ts /tmp/record.
       (with a real terrain-caching bug found and fixed along the way); a
       windowed win-rate curriculum scheduler. All verified end-to-end,
       including through the full Python↔subprocess↔sim path.
+- [x] Visual playback: `Episode.toGameRecord()` + `ReplayServer.ts` let the
+      real OpenFrontIO browser client load and watch a training episode
+      (`GET /game/:id`, strictly schema-validated, no fallback) — confirmed
+      the client accepts and processes a generated record end-to-end;
+      actual on-screen rendering isn't independently confirmed in this
+      headless dev environment (a pre-existing WebGL software-rendering
+      gate blocks it here — see "Watching a game" above).
 - [ ] Phase 3: PPO network + training loop; beat the Impossible-difficulty
       Nation bot 1v1 (v1 milestone).
-- [ ] Phase 4 (stretch): scale-up, self-play league, full visual playback
-      in the browser client.
+- [ ] Phase 4 (stretch): scale-up, self-play league.
