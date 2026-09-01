@@ -122,6 +122,38 @@ legality.
 
 ## Watching a game
 
+### Quick recipe: watch a specific replay
+
+You already have a `.json` file in `training/replays/` (e.g. from
+`--dump-game-record`, `dump_game_record_dir=...`, or an eval episode dumped
+automatically during training) and just want to watch it:
+
+1. **Make sure `ReplayServer.ts` is running** (serves the record over HTTP
+   on port 8787 — this is a background process that does *not* survive a
+   restart of this environment, so check it first):
+   ```bash
+   curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8787/game/<gameID>
+   # 200 = already running and has the file. Anything else, start it:
+   cd env-bridge
+   npx tsx --tsconfig ../OpenFrontIO/tsconfig.json src/ReplayServer.ts --dir ../training/replays --port 8787
+   ```
+2. **Make sure OpenFrontIO's dev client is running** (also a background
+   process, same caveat):
+   ```bash
+   curl -s -o /dev/null -w "%{http_code}\n" http://localhost:9000
+   # 200 = already running. Anything else, start it:
+   cd OpenFrontIO && npm run dev
+   ```
+3. **Open the URL**, using the record's filename (without `.json`) as the
+   `gameID`:
+   ```
+   http://localhost:9000/game/<gameID>
+   ```
+   e.g. for `training/replays/39500512.json` →
+   `http://localhost:9000/game/39500512`. If you're reaching this
+   environment through a port-forward/tunnel, both 9000 and 8787 need to be
+   forwarded.
+
 - **Quick debugging** (works today): any observation's `tile_grid` (Python)
   / `obs.tileGrid` (Node) is a flat ownership array (0=neutral, 1=agent,
   2=opponent) you can plot directly (e.g. `matplotlib.pyplot.imshow`).
@@ -281,3 +313,62 @@ Key flags: `--num-envs`, `--rollout-length`, `--updates`, `--map`,
 --help` for the full list — learning rate, GAE/clip/entropy coefficients,
 epochs, minibatch size are all exposed for tuning once real training
 starts).
+
+## FAQ
+
+**When does a training run stop?** When `update` reaches `--updates`
+(default 1000 — a live run may be launched with a much larger number, e.g.
+100000, to run effectively indefinitely) or the process is killed
+(Ctrl-C / `kill <pid>`) — safe either way, since it checkpoints every
+`--checkpoint-every` updates and resumes automatically from
+`checkpoints/latest.pt` on the next `python train.py`. There's no
+convergence-based auto-stop; someone (or a future script) has to decide
+"good enough" and stop it, typically once eval win-rate against the target
+difficulty holds up consistently.
+
+**When does a single replayable episode (eval or otherwise) stop?**
+Whichever comes first: (a) `episode.isDone()` in the sim — one side has no
+units/tiles left alive (`GameSetup.ts`'s `Episode.isDone()`), or (b) the
+decision-step budget runs out (`OpenFrontEnv`'s `max_steps`, `train.py`'s
+eval uses `--max-episode-steps`, default 300 decision steps ×
+`ticks_per_step` (default 10) = 3000 simulation ticks). A truncated episode
+(hit the step budget with both sides still alive) has no winner and counts
+as a loss for curriculum purposes (see `record_episode` in
+`curriculum.py`), even though it isn't a "loss" in-game.
+
+**What is the agent's action space?** Three discrete choices per decision
+step (`ACTIONS` in `EnvServer.ts`/`openfront_env.py` — see "Action space"
+above): `noop`, `expand` (attack neutral land bordering AGENT), and
+`attack_opponent` (attack OPPONENT directly — only legal once territories
+share a border and both sides are alive). `legal_actions`/`action_mask`
+are provided every step so illegal choices are never sampled.
+
+**What is the reward formula?** From `EnvServer.ts`'s `step()`:
+`reward = 0.01 * (agent_tiles_now - agent_tiles_before)` every decision
+step (potential-based shaping on AGENT's own owned-tile count — an
+increase gives positive reward, a decrease negative, regardless of what
+OPPONENT does), **plus**, only on the step the episode ends: `+1` if AGENT
+is alive and OPPONENT isn't (a win), `-1` if the reverse (a loss), `+0`
+otherwise (a truncation with both still alive). There's no separate
+reward for gold/troops/build actions yet — territory and the terminal
+win/loss are the entire signal for now.
+
+**How is the agent and its opponent placed initially — is it random?**
+- **AGENT: no, always the same fixed spot.** `Episode.create()`
+  (`GameSetup.ts`) spawns AGENT at the nearest land tile to
+  `(15% of map width, 50% of map height)` — a fixed point on the map's west
+  side, vertically centered — via a spiral search (`findLandTile`) outward
+  from that point. Every episode, every seed, every map: same target
+  point (though the actual nearest-land tile found can differ *by map*,
+  since it depends on that map's coastline).
+- **OPPONENT: seed-dependent, not manually randomized, and not fixed
+  either.** Which real nation from the map's manifest becomes OPPONENT is
+  chosen by `createNationsForGame()` — a PRNG shuffle
+  (`PseudoRandom.shuffleArray`, seeded from the episode's gameID) of the
+  map's manifest nations, taking the first one. Different seeds can (and
+  usually do) draw a different nation — different name, flag, and
+  approximate starting region, since that's baked into the map's manifest
+  entry for that nation. Its *exact* spawn tile is then picked by the
+  game's own `NationExecution` logic, which searches near that nation's
+  manifest-defined coordinates with its own small randomized radius (also
+  seeded — deterministic given the seed, not true randomness).
