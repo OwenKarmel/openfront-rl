@@ -40,13 +40,33 @@ MuZero/EfficientZero, action/observation space, phased milestones).
     subprocess. Single-agent: AGENT is controlled by `step(action)`;
     OPPONENT (the Nation AI) needs no action, it plays itself.
   - `curriculum.py` — `CurriculumScheduler`: windowed win-rate promotion/
-    demotion through Easy → Medium → Hard → Impossible. Scheduling policy
-    only — plug a real training loop's per-episode win/loss into it.
+    demotion through Easy → Medium → Hard → Impossible, now driven by real
+    training via `train.py`.
   - `smoke_test.py`, `curriculum_demo.py`, `dump_random_policy_log.py` —
     round-trip checks and mechanism demos using a random (legal-action-
     masked) policy; none of them are the actual training loop.
-  - PPO/network code: not yet built (Phase 3).
-- `kaggle/` — not yet built (Kaggle burst-training notebooks, Phase 3+).
+  - `models/network.py` — the actor-critic network: a small CNN (strided
+    convs + adaptive pooling, so it works across map sizes unchanged) over
+    the one-hot tile-ownership grid, concatenated with an MLP over the six
+    scalar player-stat features, feeding a shared trunk into masked policy
+    and value heads. Deliberately small (a few hundred thousand params) —
+    the compute budget is one local GTX 1660 plus occasional Kaggle bursts,
+    not a cluster.
+  - `envs/vector_env.py` — a minimal synchronous multi-env wrapper (N
+    `OpenFrontEnv` instances, auto-resetting on episode end) for more
+    diverse rollout data; not yet OS-parallel (see file docstring).
+  - `ppo.py` — the PPO algorithm itself: rollout buffer, GAE, clipped
+    surrogate update. Plain/textbook, no distributed training.
+  - `train.py` — **the actual training loop** (Phase 3): collects rollouts
+    against the real Nation-AI opponent, runs PPO updates, feeds episode
+    outcomes into `CurriculumScheduler`, checkpoints (resumable — safe to
+    stop and restart across, e.g., Kaggle's 12h session cap), and
+    periodically runs a greedy eval episode that dumps a real, verifiable
+    `GameRecord` of how the current policy actually plays (same
+    construction as training — see `GameSetup.ts` — so it's watchable in
+    the real client and verifiable via `npm run replay:game`, not an
+    approximation of what training saw).
+- `kaggle/` — not yet built (Kaggle burst-training notebooks).
 
 ## Why real construction matters (train/deploy fidelity)
 
@@ -229,6 +249,35 @@ npm run replay:game -- ../training/replays/<gameID>.json
       (`GET /game/:id`, strictly schema-validated) with no desync — verified
       both headlessly (stock `replay:game`, IN SYNC) and live against a real
       running dev client (via a real desktop browser, port-forwarded in).
-- [ ] Phase 3: PPO network + training loop; beat the Impossible-difficulty
-      Nation bot 1v1 (v1 milestone).
+- [x] Phase 3 scaffold: `train.py` — a real PPO training loop (small
+      CNN+MLP actor-critic, GAE, clipped surrogate update, multi-env
+      rollouts, curriculum-driven difficulty, resumable checkpointing,
+      periodic verified eval episodes). Verified end-to-end at both smoke
+      scale and realistic default scale (4 envs × 64-step rollouts) on the
+      local GTX 1660: runs, checkpoints, resumes correctly from a saved
+      checkpoint, and produces eval `GameRecord`s that pass
+      `npm run replay:game` IN SYNC even on a full ~3000-tick episode.
+      **Not yet done**: actual training to convergence — this is the
+      infrastructure, not a trained agent. Nothing here has run for more
+      than a few minutes/updates.
+- [ ] v1 milestone: train to consistently beat the Impossible-difficulty
+      Nation bot 1v1 — the actual multi-hour-plus training run(s), likely
+      spanning local + Kaggle sessions per the original compute plan.
 - [ ] Phase 4 (stretch): scale-up, self-play league.
+
+## Training
+
+```bash
+cd training
+python train.py                          # real defaults: 4 envs, 64-step rollouts
+# resumes automatically from checkpoints/latest.pt if present -- safe to
+# Ctrl-C and rerun. Progress logs to checkpoints/train_log.csv, eval
+# episodes (every --eval-every updates) land in replays/ as watchable/
+# verifiable GameRecords -- see "Watching a game" above.
+```
+
+Key flags: `--num-envs`, `--rollout-length`, `--updates`, `--map`,
+`--checkpoint-dir`, `--checkpoint-every`, `--eval-every` (see `train.py
+--help` for the full list — learning rate, GAE/clip/entropy coefficients,
+epochs, minibatch size are all exposed for tuning once real training
+starts).

@@ -1,2 +1,8 @@
 numpy
 gymnasium
+
+# torch: install separately with the right CUDA build for your machine, e.g.:
+#   pip install --index-url https://download.pytorch.org/whl/cu121 torch
+# (plain `pip install torch` also works but may pull a CPU-only or mismatched
+# CUDA build depending on platform -- verify with:
+#   python -c "import torch; print(torch.cuda.is_available())"
