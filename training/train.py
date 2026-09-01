@@ -58,6 +58,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--gae-lambda", type=float, default=0.95)
     p.add_argument("--clip-eps", type=float, default=0.2)
     p.add_argument("--entropy-coef", type=float, default=0.02)
+    p.add_argument(
+        "--target-kl",
+        type=float,
+        default=0.03,
+        help="abort the rest of a PPO update's epochs/minibatches if approx_kl exceeds 1.5x this",
+    )
     p.add_argument("--epochs", type=int, default=4)
     # Deliberately well below the default full-rollout batch size
     # (num_envs * rollout_length = 256) -- a single full-batch gradient step
@@ -177,7 +183,7 @@ def main() -> None:
     if log_is_new:
         log_writer.writerow(
             ["update", "difficulty", "win_rate", "mean_reward", "policy_loss",
-             "value_loss", "entropy", "approx_kl", "episodes", "seconds"]
+             "value_loss", "entropy", "approx_kl", "stopped_early", "episodes", "seconds"]
         )
 
     obs_list, info_list = vec_env.reset()
@@ -238,6 +244,7 @@ def main() -> None:
             entropy_coef=args.entropy_coef,
             epochs=args.epochs,
             minibatch_size=args.minibatch_size,
+            target_kl=args.target_kl,
         )
 
         for won in episode_outcomes:
@@ -249,16 +256,18 @@ def main() -> None:
         win_rate = (sum(episode_outcomes) / len(episode_outcomes)) if episode_outcomes else float("nan")
         mean_reward = reward_sum / (args.rollout_length * args.num_envs)
         elapsed = time.time() - t0
+        early_flag = " EARLY-STOP" if stats["stopped_early"] else ""
         print(
             f"update {update:5d} difficulty={scheduler.difficulty:10s} "
             f"episodes={len(episode_outcomes):3d} win_rate={win_rate:.2f} "
             f"mean_reward={mean_reward:+.4f} policy_loss={stats['policy_loss']:+.4f} "
             f"value_loss={stats['value_loss']:.4f} entropy={stats['entropy']:.3f} "
-            f"kl={stats['approx_kl']:.4f} ({elapsed:.1f}s)"
+            f"kl={stats['approx_kl']:.4f} ({elapsed:.1f}s){early_flag}"
         )
         log_writer.writerow(
             [update, scheduler.difficulty, win_rate, mean_reward, stats["policy_loss"],
-             stats["value_loss"], stats["entropy"], stats["approx_kl"], len(episode_outcomes), elapsed]
+             stats["value_loss"], stats["entropy"], stats["approx_kl"], stats["stopped_early"],
+             len(episode_outcomes), elapsed]
         )
         log_file.flush()
 

@@ -149,21 +149,39 @@ function legalActions(episode: Episode): Action[] {
 
 /**
  * Potential function for reward shaping: AGENT's owned tile count MINUS
- * OPPONENT's. Deliberately relative, not just AGENT's own count: with only
- * AGENT's count, expanding into neutral land and attacking OPPONENT are
- * reward-equivalent per tile gained, but attacking is strictly riskier
- * (contested combat, troop losses) with no offsetting benefit — so the
- * reward-maximizing policy has no incentive to ever fight, only to expand
- * into neutral land forever (confirmed empirically: policy entropy
- * collapsed to ~0 within ~10 updates, converging fast onto "always expand,
- * never attack" — an easy, low-variance local optimum under the old
- * single-sided reward). Subtracting OPPONENT's delta makes damaging them
- * earn reward too, not just growing AGENT's own territory.
+ * OPPONENT's, normalized by the map's total land tiles. Two deliberate
+ * choices here, both found necessary empirically (not just architecturally
+ * motivated):
+ *
+ * 1. Relative, not just AGENT's own count: with only AGENT's count,
+ *    expanding into neutral land and attacking OPPONENT are reward-
+ *    equivalent per tile gained, but attacking is strictly riskier
+ *    (contested combat, troop losses) with no offsetting benefit — so the
+ *    reward-maximizing policy has no incentive to ever fight, only to
+ *    expand into neutral land forever (confirmed empirically: policy
+ *    entropy collapsed to ~0 within ~10 updates under the old single-sided
+ *    reward, converging fast onto "always expand, never attack").
+ * 2. Normalized by total land tiles: raw tile counts on a real production
+ *    map range into the tens of thousands, so *un*normalized deltas (even
+ *    after fix 1) produced huge, map-size-dependent reward swings —
+ *    confirmed empirically again: value_loss spiked into the thousands
+ *    within ~10-20 updates, approx_kl spiked to ~0.27 (healthy PPO stays
+ *    under ~0.02-0.05) in the same window, and entropy collapsed to ~0
+ *    shortly after. Mechanism: huge value-loss gradients backpropagate
+ *    through the trunk the policy head shares (see models/network.py),
+ *    corrupting its features and destabilizing the policy despite PPO's
+ *    ratio clipping, which doesn't protect against the *feature
+ *    representation itself* shifting wildly underneath it. Normalizing by
+ *    numLandTiles() bounds potential to roughly [-1, 1] regardless of map
+ *    size, keeping per-step reward and discounted returns in a small,
+ *    consistent range — the standard reward/return-normalization fix for
+ *    this class of instability.
  */
 function potential(episode: Episode): number {
   const agentTiles = player(episode.game, episode.agentId).numTilesOwned();
   const opponentTiles = player(episode.game, episode.opponentId).numTilesOwned();
-  return agentTiles - opponentTiles;
+  const totalLandTiles = episode.game.map().numLandTiles();
+  return (agentTiles - opponentTiles) / totalLandTiles;
 }
 
 function intentFor(action: Action, opponentId: string): StampedIntent | null {
@@ -229,10 +247,17 @@ class Session {
       }
     }
 
-    // Potential-based shaping (relative tile-count delta -- see potential()),
-    // plus a dominant terminal win/loss term once the episode ends.
+    // Potential-based shaping (relative, map-size-normalized tile-count
+    // delta -- see potential()), plus a terminal win/loss term once the
+    // episode ends. Coefficient recalibrated after normalizing potential()
+    // to roughly [-1, 1] (was 0.01 against *unbounded* raw tile counts,
+    // which produced huge, map-size-dependent returns -- see potential()'s
+    // comment); 5.0 keeps a fully map-dominant swing's cumulative shaping
+    // reward in the same rough order of magnitude as before (bounded now,
+    // not larger) while staying a meaningful dense signal relative to the
+    // terminal ±1.
     const newPotential = potential(episode);
-    let reward = (newPotential - this.prevPotential) * 0.01;
+    let reward = (newPotential - this.prevPotential) * 5.0;
     this.prevPotential = newPotential;
     let winner: "AGENT" | "OPPONENT" | null = null;
     if (done) {

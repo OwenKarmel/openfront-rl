@@ -300,9 +300,32 @@ npm run replay:game -- ../training/replays/<gameID>.json
       — see FAQ), plus reducing PPO's minibatch size below the full
       rollout batch (was accidentally doing one full-batch gradient step
       per epoch instead of several smaller, noisier ones) and a modest
-      entropy-coefficient bump. Confirmed healthier over a 15-update
-      validation run (entropy holding around 0.7-0.86, not collapsing) —
-      a real long run is in progress against this fix.
+      entropy-coefficient bump. Looked healthier over a 15-update
+      validation run, but the *actual* long run collapsed again anyway
+      (entropy back to ~0 by update ~20) — the 15-update check was too
+      short to catch it.
+- [x] Second pass found the real mechanism: right before each collapse,
+      `approx_kl` spiked to ~0.27 (healthy PPO stays under ~0.02-0.05) and
+      `value_loss` spiked into the thousands, together. Cause: `potential()`
+      used *raw, unbounded* tile counts (tens of thousands on a real map) —
+      even after making it relative, a single step's swing could be huge,
+      producing enormous value-loss gradients that backpropagate through
+      the trunk the policy head shares (`models/network.py`), corrupting
+      its features badly enough to blow past PPO's ratio clipping (which
+      only bounds the *ratio*, not the underlying representation shifting
+      under it). Fixed three ways: (1) `potential()` now normalizes by
+      `numLandTiles()`, bounding it to roughly [-1, 1] regardless of map
+      size, with the reward coefficient recalibrated accordingly (0.01 on
+      raw counts → 5.0 on the normalized value); (2) added PPO2-style value
+      clipping (`ppo.py`); (3) added KL-based early stopping — abort the
+      rest of a PPO update if `approx_kl` exceeds 1.5x a target, rather
+      than continuing to grind through an already-destructive update. Over
+      a 40-update validation run (past the ~20-update point where the
+      previous fix still collapsed): value_loss stayed tiny (0.0002-0.02,
+      down from hundreds/thousands), entropy dipped to ~0.44 mid-run but
+      *recovered* to ~0.75-0.78 by the end rather than collapsing
+      permanently, and the early-stop safety net fired a handful of times
+      exactly as intended. Long run restarted against this fix.
 - [ ] v1 milestone: train to consistently beat the Impossible-difficulty
       Nation bot 1v1 — the actual multi-hour-plus training run(s), likely
       spanning local + Kaggle sessions per the original compute plan.
@@ -355,21 +378,28 @@ share a border and both sides are alive). `legal_actions`/`action_mask`
 are provided every step so illegal choices are never sampled.
 
 **What is the reward formula?** From `EnvServer.ts`'s `step()`/`potential()`:
-`reward = 0.01 * Δ(agent_tiles - opponent_tiles)` every decision step —
-potential-based shaping on the *relative* tile-count margin, not just
-AGENT's own count — **plus**, only on the step the episode ends: `+1` if
-AGENT is alive and OPPONENT isn't (a win), `-1` if the reverse (a loss),
-`+0` otherwise (a truncation with both still alive). It's deliberately
-relative: an earlier single-sided version (`0.01 * Δagent_tiles` alone)
-made expanding into neutral land and attacking OPPONENT reward-equivalent
-per tile, with attacking strictly riskier for no extra reward — the
-policy predictably learned to expand into neutral land forever and never
-fight, and its action-distribution entropy collapsed to ~0 within about
-10 training updates as it locked onto that easy local optimum. Subtracting
-OPPONENT's delta makes damaging them earn reward too, giving actual
-pressure to explore `attack_opponent`. There's still no separate reward
-for gold/troops/build actions — territory margin and the terminal
-win/loss are the entire signal for now.
+`reward = 5.0 * Δ((agent_tiles - opponent_tiles) / total_land_tiles)` every
+decision step — potential-based shaping on the *relative, map-size-
+normalized* tile-count margin — **plus**, only on the step the episode
+ends: `+1` if AGENT is alive and OPPONENT isn't (a win), `-1` if the
+reverse (a loss), `+0` otherwise (a truncation with both still alive).
+Both the "relative" and the "normalized" parts were found necessary the
+hard way (see Status), not chosen upfront:
+- **Relative, not just AGENT's own count** — an earlier single-sided
+  version (`Δagent_tiles` alone) made expanding into neutral land and
+  attacking OPPONENT reward-equivalent per tile, with attacking strictly
+  riskier for no extra reward, so the policy learned to expand forever and
+  never fight.
+- **Normalized by `numLandTiles()`** — even after making it relative, raw
+  tile-count deltas on a real map (tens of thousands of tiles) produced
+  huge, unbounded per-step rewards, which produced huge value-function
+  targets, which produced value-loss gradients large enough to destabilize
+  the policy through the network's shared trunk (see `models/network.py`)
+  despite PPO's usual ratio clipping. Normalizing bounds `potential()` to
+  roughly [-1, 1] regardless of map size.
+
+There's still no separate reward for gold/troops/build actions — territory
+margin and the terminal win/loss are the entire signal for now.
 
 **How is the agent and its opponent placed initially — is it random?**
 - **AGENT: no, always the same fixed spot.** `Episode.create()`
