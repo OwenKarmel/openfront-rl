@@ -3,12 +3,14 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { Executor } from "../../OpenFrontIO/src/core/execution/ExecutionManager";
 import {
+  Cell,
   Difficulty,
   Game,
   GameMapSize,
   GameMapType,
   GameMode,
   GameType,
+  Nation,
   PlayerInfo,
   PlayerType,
 } from "../../OpenFrontIO/src/core/game/Game";
@@ -117,11 +119,16 @@ async function resolveMap(mapName: string): Promise<ResolvedMap> {
   };
 }
 
-/** Scans outward in a square spiral from (x0, y0) for the nearest land tile. */
-export function findLandTile(game: Game, x0: number, y0: number): number {
-  const map = game.map();
-  const w = game.width();
-  const h = game.height();
+/**
+ * Scans outward in a square spiral from (x0, y0) for the nearest land tile.
+ * Takes a bare GameMap (not Game) so it works both before game creation
+ * (picking the opponent Nation's spawnCell hint, which the Nation
+ * constructor needs) and after (picking the AGENT's spawn tile) — Game
+ * extends GameMap, so a live Game satisfies this either way.
+ */
+export function findLandTile(map: GameMap, x0: number, y0: number): number {
+  const w = map.width();
+  const h = map.height();
   for (let r = 0; r < Math.max(w, h); r++) {
     for (let dx = -r; dx <= r; dx++) {
       for (let dy = -r; dy <= r; dy++) {
@@ -164,14 +171,24 @@ export class Episode {
   }
 
   /**
-   * Builds the game + runner (map, config, the two Human players) but plays
-   * no turns — shared by create() (which then auto-spawns) and fromRecord()
+   * Builds the game + runner (map, config, the AGENT human player and the
+   * OPPONENT Nation-AI player) but plays no turns — shared by create()
+   * (which then spawns AGENT and lets OPPONENT self-spawn) and fromRecord()
    * (which replays a recorded turn log, spawn intents included, instead).
+   *
+   * OPPONENT is a real built-in Nation AI (NationExecution — the same code
+   * driving Nation bots in production games), not a scripted stand-in: it
+   * decides its own attacks/builds/alliance behavior every tick based on
+   * `difficulty`, exactly like the in-game "Impossible" opponent the whole
+   * project is ultimately trying to beat. GameRunner.init() wires its
+   * Execution automatically once game.config().spawnNations() is true (see
+   * gameConfig.nations below) — see ExecutionManager.nationExecutions().
    */
   private static async build(
     mapName: string,
     seed: string,
     spawnTurns: number,
+    difficulty: Difficulty,
   ): Promise<Episode> {
     const { gameMap, miniGameMap, gameMapType } = await resolveMap(mapName);
 
@@ -180,8 +197,11 @@ export class Episode {
       gameMapSize: GameMapSize.Normal,
       gameMode: GameMode.FFA,
       gameType: GameType.Public,
-      difficulty: Difficulty.Medium,
-      nations: "disabled",
+      difficulty,
+      // Anything but "disabled" — see Config.spawnNations(). Count is moot:
+      // we build the OPPONENT Nation ourselves below instead of letting
+      // createNationsForGame() draw nations from the map manifest.
+      nations: "default",
       donateGold: false,
       donateTroops: false,
       bots: 0,
@@ -198,16 +218,25 @@ export class Episode {
         AGENT_CLIENT_ID,
         AGENT_CLIENT_ID,
       ),
-      new PlayerInfo(
-        "Opponent",
-        PlayerType.Human,
-        OPPONENT_CLIENT_ID,
-        OPPONENT_CLIENT_ID,
+    ];
+    const opponentSpawnCell = new Cell(
+      Math.floor(gameMap.width() * 0.85),
+      Math.floor(gameMap.height() * 0.5),
+    );
+    const nations = [
+      new Nation(
+        opponentSpawnCell,
+        new PlayerInfo(
+          "Opponent",
+          PlayerType.Nation,
+          null,
+          OPPONENT_CLIENT_ID,
+        ),
       ),
     ];
 
     const config = new EnvConfig(gameConfig, new UserSettings(), spawnTurns);
-    const game = createGame(humans, [], gameMap, miniGameMap, config);
+    const game = createGame(humans, nations, gameMap, miniGameMap, config);
 
     const episode = new Episode(
       new GameRunner(game, new Executor(game, seed, undefined), (gu) => {
@@ -232,26 +261,20 @@ export class Episode {
     mapName: string,
     seed: string,
     spawnTurns: number,
+    difficulty: Difficulty,
   ): Promise<Episode> {
-    const episode = await Episode.build(mapName, seed, spawnTurns);
+    const episode = await Episode.build(mapName, seed, spawnTurns, difficulty);
     const game = episode.game;
 
-    // Spawn: both players pick a tile on the far sides of the map, first turn.
-    const w = game.width();
-    const h = game.height();
+    // AGENT picks a spawn tile on the opposite side of the map from the
+    // Nation's spawnCell hint above; OPPONENT self-spawns via NationExecution.
     const agentTile = findLandTile(
       game,
-      Math.floor(w * 0.15),
-      Math.floor(h * 0.5),
-    );
-    const opponentTile = findLandTile(
-      game,
-      Math.floor(w * 0.85),
-      Math.floor(h * 0.5),
+      Math.floor(game.width() * 0.15),
+      Math.floor(game.height() * 0.5),
     );
     episode.runTick([
       { type: "spawn", tile: agentTile, clientID: AGENT_CLIENT_ID },
-      { type: "spawn", tile: opponentTile, clientID: OPPONENT_CLIENT_ID },
     ]);
 
     const maxSpawnTurns = spawnTurns + 5;
@@ -291,6 +314,7 @@ export class Episode {
       record.info.config.gameMap,
       record.info.gameID,
       record.info.envSpawnTurns,
+      record.info.config.difficulty,
     );
 
     let compared = 0;
@@ -363,11 +387,11 @@ export class Episode {
         lobbyCreatedAt: 0,
         config: this.gameConfig,
         envSpawnTurns: this.spawnTurns,
-        players: [AGENT_CLIENT_ID, OPPONENT_CLIENT_ID].map((id) => ({
-          clientID: id,
-          username: id === AGENT_CLIENT_ID ? "Agent" : "Opponent",
-          clanTag: null,
-        })),
+        // OPPONENT is a Nation (added via createGame's `nations` array, not
+        // the wire player list) — only AGENT is a "player" on this shape.
+        players: [
+          { clientID: AGENT_CLIENT_ID, username: "Agent", clanTag: null },
+        ],
       },
       gitCommit: "DEV",
       version: "v0.0.2",

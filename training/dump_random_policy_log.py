@@ -1,5 +1,7 @@
-"""One-off: run the Phase-2 stack (gymnasium env + subprocess env-bridge)
-with a random policy and dump the resulting turn log for inspection."""
+"""One-off: run the env-bridge stack (gymnasium env + subprocess) with a
+random policy against a real Nation-AI opponent, and dump the resulting
+turn log (on a real production map, so it's headlessly replay-verifiable --
+see env-bridge/src/verifyRecord.ts)."""
 
 from __future__ import annotations
 
@@ -9,7 +11,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import numpy as np
-from envs.openfront_env import OpenFrontEnv
+from envs.openfront_env import ACTIONS, OpenFrontEnv
 
 OUT_PATH = "/tmp/random-policy-record.json"
 
@@ -17,8 +19,9 @@ OUT_PATH = "/tmp/random-policy-record.json"
 def main() -> None:
     rng = np.random.default_rng(0)
     env = OpenFrontEnv(
-        map_name="plains",
+        map_name="onion",
         seed="random-policy-log",
+        difficulty="hard",
         max_steps=30,
         ticks_per_step=10,
         dump_record=OUT_PATH,
@@ -28,11 +31,12 @@ def main() -> None:
         print(f"reset: tile_grid={obs['tile_grid'].shape} self_tiles={obs['self_tiles']}")
         total_reward = 0.0
         for i in range(30):
-            action = int(rng.integers(0, env.action_space.n))
+            legal = np.flatnonzero(info["action_mask"])
+            action = int(rng.choice(legal))
             obs, reward, terminated, truncated, info = env.step(action)
             total_reward += reward
             print(
-                f"step {i}: action={['noop','expand'][action]} reward={reward:.4f} "
+                f"step {i}: action={ACTIONS[action]} reward={reward:.4f} "
                 f"self_tiles={obs['self_tiles'][0]:.0f} opp_tiles={obs['opp_tiles'][0]:.0f} "
                 f"ticks={info['ticks']} terminated={terminated} truncated={truncated}"
             )

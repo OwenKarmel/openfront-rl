@@ -2,16 +2,14 @@
 
 Speaks the newline-delimited JSON protocol documented at the top of
 env-bridge/src/EnvServer.ts over a persistent subprocess: one `reset` line
-per episode, one `step` line per decision. This is intentionally the
-smallest possible wrapper needed to prove the whole loop -- Node simulation,
-subprocess IPC, gymnasium API -- works, before any real network/PPO code is
-written.
+per episode, one `step` line per decision.
 
-The env controls a single player, "AGENT". The other player, "OPPONENT", is
-driven by `opponent_policy(obs) -> action:str`, defaulting to a simple
-scripted "always expand" policy. Later curriculum phases swap this for a
-policy that steers a real Nation/bot difficulty, or for a frozen copy of the
-agent's own network (self-play).
+Single-agent: this env controls "AGENT". The opponent, "OPPONENT", is a real
+built-in Nation-AI (NationExecution -- the same code driving Nation bots in
+production games) at `difficulty`, making its own decisions every tick --
+there is nothing to steer it with from Python. Curriculum is just "which
+difficulty this episode uses"; self-play against a frozen copy of the
+agent's own network is a separate, later mode (Phase 3+), not this env.
 """
 
 from __future__ import annotations
@@ -20,7 +18,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import numpy as np
 
@@ -35,13 +33,11 @@ except ImportError as exc:  # pragma: no cover
 ENV_BRIDGE_DIR = Path(__file__).resolve().parents[2] / "env-bridge"
 OPENFRONTIO_TSCONFIG = ENV_BRIDGE_DIR / ".." / "OpenFrontIO" / "tsconfig.json"
 
-ACTIONS = ["noop", "expand"]
+# Must match ACTIONS in EnvServer.ts.
+ACTIONS = ["noop", "expand", "attack_opponent"]
+DIFFICULTIES = ["easy", "medium", "hard", "impossible"]
 AGENT_ID = "AGENT"
 OPPONENT_ID = "OPPONENT"
-
-
-def always_expand(_obs: dict[str, Any]) -> str:
-    return "expand"
 
 
 class OpenFrontEnv(gym.Env):
@@ -51,20 +47,22 @@ class OpenFrontEnv(gym.Env):
         self,
         map_name: str = "plains",
         seed: str = "train",
+        difficulty: str = "medium",
         spawn_turns: int = 3,
         ticks_per_step: int = 10,
         max_steps: int = 200,
-        opponent_policy: Callable[[dict[str, Any]], str] = always_expand,
         node_bin: str = "node",
         dump_record: str | None = None,
     ) -> None:
         super().__init__()
+        if difficulty not in DIFFICULTIES:
+            raise ValueError(f"difficulty must be one of {DIFFICULTIES}, got {difficulty!r}")
         self.map_name = map_name
         self.default_seed = seed
+        self.difficulty = difficulty
         self.spawn_turns = spawn_turns
         self.ticks_per_step = ticks_per_step
         self.max_steps = max_steps
-        self.opponent_policy = opponent_policy
         self._node_bin = node_bin
         self.dump_record = dump_record
 
@@ -143,6 +141,9 @@ class OpenFrontEnv(gym.Env):
             "opp_gold": np.array([p[OPPONENT_ID]["gold"]], dtype=np.float32),
         }
 
+    def _legal_action_mask(self, legal_actions: list[str]) -> np.ndarray:
+        return np.array([a in legal_actions for a in ACTIONS], dtype=bool)
+
     def reset(self, *, seed: int | None = None, options: dict | None = None):
         super().reset(seed=seed)
         self._ensure_process()
@@ -151,6 +152,7 @@ class OpenFrontEnv(gym.Env):
             "cmd": "reset",
             "seed": episode_seed,
             "map": self.map_name,
+            "difficulty": self.difficulty,
             "spawnTurns": self.spawn_turns,
             "ticksPerStep": self.ticks_per_step,
         }
@@ -159,24 +161,26 @@ class OpenFrontEnv(gym.Env):
         raw = self._send(reset_cmd)
         self._step_count = 0
         self._last_obs = raw
-        return self._to_gym_obs(raw), {"legal_actions": raw["legalActions"]}
+        return self._to_gym_obs(raw), {
+            "legal_actions": raw["legalActions"],
+            "action_mask": self._legal_action_mask(raw["legalActions"]),
+        }
 
     def step(self, action: int):
         assert self._last_obs is not None, "call reset() before step()"
-        opp_action = self.opponent_policy(self._last_obs["obs"])
-        raw = self._send(
-            {
-                "cmd": "step",
-                "actions": {AGENT_ID: ACTIONS[action], OPPONENT_ID: opp_action},
-            }
-        )
+        raw = self._send({"cmd": "step", "action": ACTIONS[action]})
         self._step_count += 1
         self._last_obs = raw
         obs = self._to_gym_obs(raw)
-        reward = raw["reward"][AGENT_ID]
+        reward = raw["reward"]
         terminated = bool(raw["done"])
         truncated = self._step_count >= self.max_steps
-        info = {"legal_actions": raw["legalActions"], "ticks": raw["info"]["ticks"]}
+        info = {
+            "legal_actions": raw["legalActions"],
+            "action_mask": self._legal_action_mask(raw["legalActions"]),
+            "ticks": raw["info"]["ticks"],
+            "winner": raw["info"]["winner"],  # "AGENT" / "OPPONENT" / None
+        }
         return obs, reward, terminated, truncated, info
 
     def close(self):

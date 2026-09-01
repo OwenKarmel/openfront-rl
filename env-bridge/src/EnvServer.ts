@@ -1,27 +1,39 @@
 /**
- * Phase-2 env-bridge: a long-lived Node process that drives one headless
- * OpenFrontIO episode at a time and speaks a tiny newline-delimited JSON
- * protocol over stdin/stdout, so a Python `gymnasium.Env` can reset/step it
- * like any other RL environment. See training/envs/openfront_env.py.
+ * Env-bridge: a long-lived Node process that drives one headless OpenFrontIO
+ * episode at a time and speaks a tiny newline-delimited JSON protocol over
+ * stdin/stdout, so a Python `gymnasium.Env` can reset/step it like any other
+ * RL environment. See training/envs/openfront_env.py.
  *
- * Action space (v1, intentionally minimal — just enough to prove the loop
- * works end-to-end; richer intents come once the network has spatial/entity
- * action heads to point them with):
- *   "noop"   — do nothing this decision step
- *   "expand" — attack neutral (unowned) land bordering the player's territory
+ * Single-agent: AGENT is the controlled player; OPPONENT is a real built-in
+ * Nation-AI (NationExecution — the same code driving Nation bots in
+ * production games, difficulty selectable per episode) making its own
+ * decisions every tick. There is nothing to send OPPONENT actions for.
+ *
+ * Action space (still intentionally small — richer intents come once the
+ * network has spatial/entity action heads to point them with, e.g. to pick
+ * an attack's boat destination or a structure's build tile):
+ *   "noop"             — do nothing this decision step
+ *   "expand"           — attack neutral (unowned) land bordering AGENT's territory
+ *   "attack_opponent"  — attack OPPONENT directly across a shared border
  *
  * Decision cadence: one JSON "step" call advances `ticksPerStep` simulation
- * ticks (default 10), applying each player's chosen intent on the first of
- * those ticks — this mirrors how the built-in Nation AI reacts every few
- * dozen ticks rather than every tick, and keeps episode length manageable.
+ * ticks (default 10), applying AGENT's chosen intent on the first of those
+ * ticks — this mirrors how the built-in Nation AI reacts every few dozen
+ * ticks rather than every tick, and keeps episode length manageable. The
+ * Nation AI itself still ticks (and can act) every simulation tick in
+ * between, on its own schedule, regardless of this cadence.
  *
  * Protocol (one JSON object per line each direction):
- *   -> {"cmd":"reset","seed":"...","map":"plains","spawnTurns":3,"ticksPerStep":10,
- *       "dumpRecord":"/path/to/record.json"}
- *   <- {"obs":{...},"legalActions":{...},"done":false}
- *   -> {"cmd":"step","actions":{"AGENT":"expand","OPPONENT":"noop"}}
- *   <- {"obs":{...},"reward":{...},"done":false,"legalActions":{...},"info":{...}}
+ *   -> {"cmd":"reset","seed":"...","map":"plains","difficulty":"impossible",
+ *       "spawnTurns":3,"ticksPerStep":10,"dumpRecord":"/path/to/record.json"}
+ *   <- {"obs":{...},"legalActions":[...],"done":false}
+ *   -> {"cmd":"step","action":"expand"}
+ *   <- {"obs":{...},"reward":0.1,"done":false,"legalActions":[...],
+ *       "info":{"ticks":123,"winner":null}}
  *   -> {"cmd":"close"}
+ *
+ * `info.winner` is "AGENT"/"OPPONENT"/null (still playing, or a truncated-
+ * without-a-winner episode) — set only once `done` is true.
  *
  * `dumpRecord` (optional, on reset) writes every turn of the episode to a
  * replayable JSON file — see Episode.writeReplayRecord — once the episode
@@ -29,29 +41,43 @@
  * first.
  */
 import readline from "readline";
-import { Game, Player } from "../../OpenFrontIO/src/core/game/Game";
+import { Difficulty, Game, Player } from "../../OpenFrontIO/src/core/game/Game";
 import { StampedIntent } from "../../OpenFrontIO/src/core/Schemas";
 import { AGENT_CLIENT_ID, Episode, OPPONENT_CLIENT_ID } from "./GameSetup";
 
-type Action = "noop" | "expand";
-const PLAYERS = [AGENT_CLIENT_ID, OPPONENT_CLIENT_ID] as const;
+const ACTIONS = ["noop", "expand", "attack_opponent"] as const;
+type Action = (typeof ACTIONS)[number];
 
 interface ResetCmd {
   cmd: "reset";
   seed: string;
   map: string;
+  difficulty?: string;
   spawnTurns?: number;
   ticksPerStep?: number;
   dumpRecord?: string;
 }
 interface StepCmd {
   cmd: "step";
-  actions: Record<string, Action>;
+  action: Action;
 }
 interface CloseCmd {
   cmd: "close";
 }
 type Cmd = ResetCmd | StepCmd | CloseCmd;
+
+function parseDifficulty(name: string | undefined): Difficulty {
+  if (name === undefined) return Difficulty.Medium;
+  const key = Object.keys(Difficulty).find(
+    (k) => k.toLowerCase() === name.toLowerCase(),
+  );
+  if (key === undefined) {
+    throw new Error(
+      `unknown difficulty "${name}": expected one of ${Object.keys(Difficulty).join(", ")}`,
+    );
+  }
+  return Difficulty[key as keyof typeof Difficulty];
+}
 
 interface PlayerObs {
   alive: boolean;
@@ -60,7 +86,7 @@ interface PlayerObs {
   gold: number;
 }
 
-function playerByClientId(game: Game, clientId: string): Player {
+function player(game: Game, clientId: string): Player {
   return game.player(clientId);
 }
 
@@ -69,22 +95,21 @@ function tileGrid(game: Game): number[] {
   const map = game.map();
   const w = game.width();
   const h = game.height();
-  const agent = playerByClientId(game, AGENT_CLIENT_ID);
-  const opponent = playerByClientId(game, OPPONENT_CLIENT_ID);
+  const agent = player(game, AGENT_CLIENT_ID);
+  const opponent = player(game, OPPONENT_CLIENT_ID);
   const out = new Array<number>(w * h);
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
       const ref = map.ref(x, y);
       const owner = game.owner(ref);
-      out[y * w + x] =
-        owner === agent ? 1 : owner === opponent ? 2 : 0;
+      out[y * w + x] = owner === agent ? 1 : owner === opponent ? 2 : 0;
     }
   }
   return out;
 }
 
 function playerObs(game: Game, clientId: string): PlayerObs {
-  const p = playerByClientId(game, clientId);
+  const p = player(game, clientId);
   return {
     alive: p.isAlive(),
     tiles: p.numTilesOwned(),
@@ -105,24 +130,42 @@ function observation(game: Game, width: number, height: number) {
   };
 }
 
-function legalActions(episode: Episode): Record<string, Action[]> {
-  const canExpand = !episode.game.inSpawnPhase();
-  const forPlayer = (clientId: string): Action[] => {
-    const alive = playerByClientId(episode.game, clientId).isAlive();
-    if (!alive) return ["noop"];
-    return canExpand ? ["noop", "expand"] : ["noop"];
-  };
-  return { AGENT: forPlayer(AGENT_CLIENT_ID), OPPONENT: forPlayer(OPPONENT_CLIENT_ID) };
+function legalActions(episode: Episode): Action[] {
+  const agent = player(episode.game, AGENT_CLIENT_ID);
+  if (!agent.isAlive()) return ["noop"];
+  if (episode.game.inSpawnPhase()) return ["noop"];
+  const opponent = player(episode.game, OPPONENT_CLIENT_ID);
+  const actions: Action[] = ["noop", "expand"];
+  if (opponent.isAlive() && agent.sharesBorderWith(opponent)) {
+    actions.push("attack_opponent");
+  }
+  return actions;
 }
 
-/** Potential function for reward shaping: owned tiles, one term per player. */
-function potential(game: Game, clientId: string): number {
-  return playerByClientId(game, clientId).numTilesOwned();
+/** Potential function for reward shaping: AGENT's owned tile count. */
+function potential(game: Game): number {
+  return player(game, AGENT_CLIENT_ID).numTilesOwned();
 }
 
-function intentFor(action: Action, clientID: string): StampedIntent | null {
-  if (action === "noop") return null;
-  return { type: "attack", targetID: null, troops: null, clientID };
+function intentFor(action: Action): StampedIntent | null {
+  switch (action) {
+    case "noop":
+      return null;
+    case "expand":
+      return {
+        type: "attack",
+        targetID: null,
+        troops: null,
+        clientID: AGENT_CLIENT_ID,
+      };
+    case "attack_opponent":
+      return {
+        type: "attack",
+        targetID: OPPONENT_CLIENT_ID,
+        troops: null,
+        clientID: AGENT_CLIENT_ID,
+      };
+  }
 }
 
 class Session {
@@ -130,7 +173,7 @@ class Session {
   width = 0;
   height = 0;
   ticksPerStep = 10;
-  prevPotential: Record<string, number> = {};
+  prevPotential = 0;
   dumpRecordPath: string | undefined;
 
   async reset(cmd: ResetCmd): Promise<object> {
@@ -138,14 +181,13 @@ class Session {
       cmd.map,
       cmd.seed,
       cmd.spawnTurns ?? 3,
+      parseDifficulty(cmd.difficulty),
     );
     this.width = this.episode.game.width();
     this.height = this.episode.game.height();
     this.ticksPerStep = cmd.ticksPerStep ?? 10;
     this.dumpRecordPath = cmd.dumpRecord;
-    for (const p of PLAYERS) {
-      this.prevPotential[p] = potential(this.episode.game, p);
-    }
+    this.prevPotential = potential(this.episode.game);
     return {
       obs: observation(this.episode.game, this.width, this.height),
       legalActions: legalActions(this.episode),
@@ -157,12 +199,8 @@ class Session {
     if (!this.episode) throw new Error("step called before reset");
     const episode = this.episode;
 
-    const intents: StampedIntent[] = [];
-    for (const p of PLAYERS) {
-      const action = cmd.actions[p] ?? "noop";
-      const intent = intentFor(action, p);
-      if (intent) intents.push(intent);
-    }
+    const intent = intentFor(cmd.action);
+    const intents: StampedIntent[] = intent ? [intent] : [];
 
     let done = false;
     for (let i = 0; i < this.ticksPerStep; i++) {
@@ -173,21 +211,22 @@ class Session {
       }
     }
 
-    const reward: Record<string, number> = {};
-    for (const p of PLAYERS) {
-      const newPotential = potential(episode.game, p);
-      // Potential-based shaping (tile-count delta), plus a dominant terminal
-      // win/loss term once the episode ends.
-      let r = (newPotential - this.prevPotential[p]) * 0.01;
-      this.prevPotential[p] = newPotential;
-      if (done) {
-        const alive = playerByClientId(episode.game, p).isAlive();
-        const opponentId = p === AGENT_CLIENT_ID ? OPPONENT_CLIENT_ID : AGENT_CLIENT_ID;
-        const opponentAlive = playerByClientId(episode.game, opponentId).isAlive();
-        if (alive && !opponentAlive) r += 1;
-        else if (!alive && opponentAlive) r -= 1;
+    // Potential-based shaping (AGENT tile-count delta), plus a dominant
+    // terminal win/loss term once the episode ends.
+    const newPotential = potential(episode.game);
+    let reward = (newPotential - this.prevPotential) * 0.01;
+    this.prevPotential = newPotential;
+    let winner: "AGENT" | "OPPONENT" | null = null;
+    if (done) {
+      const agentAlive = player(episode.game, AGENT_CLIENT_ID).isAlive();
+      const opponentAlive = player(episode.game, OPPONENT_CLIENT_ID).isAlive();
+      if (agentAlive && !opponentAlive) {
+        reward += 1;
+        winner = "AGENT";
+      } else if (!agentAlive && opponentAlive) {
+        reward -= 1;
+        winner = "OPPONENT";
       }
-      reward[p] = r;
     }
 
     if (done) this.flushRecord();
@@ -197,7 +236,7 @@ class Session {
       reward,
       done,
       legalActions: legalActions(episode),
-      info: { ticks: episode.game.ticks() },
+      info: { ticks: episode.game.ticks(), winner },
     };
   }
 

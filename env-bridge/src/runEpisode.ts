@@ -1,11 +1,13 @@
 /**
- * Phase-1 smoke test / determinism check for the env-bridge.
+ * Smoke test / determinism check for the env-bridge, against a real
+ * built-in Nation-AI opponent (not a scripted stand-in).
  *
  * Drives a full headless OpenFrontIO game through the real intent pipeline
  * (GameRunner + Executor, exactly like the browser client and the perf
- * harness do), with two Human players ("AGENT" and "OPPONENT") on a tiny
- * test map. No policy yet: both players just spawn, then periodically issue
- * an "attack neutral land" intent so territory actually changes over time.
+ * harness do): AGENT is a Human player that spawns and then periodically
+ * expands into neutral land; OPPONENT is a real Nation-AI player
+ * (NationExecution) at the given --difficulty, making its own decisions
+ * every tick exactly as it would in a production game.
  *
  * This exists to prove the plumbing works before any RL code is written:
  *   - a full episode runs to completion without desync/crash
@@ -14,8 +16,10 @@
  * Usage:
  *   npx tsx src/runEpisode.ts [--map plains] [--seed smoke-1] [--ticks 300]
  *                              [--spawn-turns 3] [--act-every 10]
+ *                              [--difficulty medium]
  */
-import { AGENT_CLIENT_ID, Episode, OPPONENT_CLIENT_ID } from "./GameSetup";
+import { AGENT_CLIENT_ID, Episode } from "./GameSetup";
+import { Difficulty } from "../../OpenFrontIO/src/core/game/Game";
 import { StampedIntent } from "../../OpenFrontIO/src/core/Schemas";
 
 interface Options {
@@ -24,7 +28,20 @@ interface Options {
   ticks: number;
   spawnTurns: number;
   actEvery: number;
+  difficulty: Difficulty;
   dumpRecord: string | undefined;
+}
+
+function parseDifficulty(name: string): Difficulty {
+  const key = Object.keys(Difficulty).find(
+    (k) => k.toLowerCase() === name.toLowerCase(),
+  );
+  if (key === undefined) {
+    throw new Error(
+      `unknown difficulty "${name}": expected one of ${Object.keys(Difficulty).join(", ")}`,
+    );
+  }
+  return Difficulty[key as keyof typeof Difficulty];
 }
 
 function parseArgs(argv: string[]): Options {
@@ -34,6 +51,7 @@ function parseArgs(argv: string[]): Options {
     ticks: 300,
     spawnTurns: 3,
     actEvery: 10,
+    difficulty: Difficulty.Medium,
     dumpRecord: undefined,
   };
   for (let i = 0; i < argv.length; i++) {
@@ -59,6 +77,9 @@ function parseArgs(argv: string[]): Options {
       case "--act-every":
         opts.actEvery = parseInt(next(), 10);
         break;
+      case "--difficulty":
+        opts.difficulty = parseDifficulty(next());
+        break;
       case "--dump-record":
         opts.dumpRecord = next();
         break;
@@ -73,25 +94,28 @@ interface EpisodeResult {
   ticks: number;
   finalHash: string | undefined;
   finalHashTick: number | undefined;
+  winner: string;
   players: { name: string; alive: boolean; tiles: number; troops: number; gold: number }[];
 }
 
 async function runEpisode(opts: Options): Promise<EpisodeResult> {
   console.debug = () => {}; // silence per-tick debug logging
 
-  const episode = await Episode.create(opts.map, opts.seed, opts.spawnTurns);
+  const episode = await Episode.create(
+    opts.map,
+    opts.seed,
+    opts.spawnTurns,
+    opts.difficulty,
+  );
 
-  const expandIntent = (clientID: string): StampedIntent => ({
+  const expandIntent: StampedIntent = {
     type: "attack",
     targetID: null,
     troops: null,
-    clientID,
-  });
+    clientID: AGENT_CLIENT_ID,
+  };
   for (let i = 0; i < opts.ticks; i++) {
-    const intents: StampedIntent[] =
-      i % opts.actEvery === 0
-        ? [expandIntent(AGENT_CLIENT_ID), expandIntent(OPPONENT_CLIENT_ID)]
-        : [];
+    const intents = i % opts.actEvery === 0 ? [expandIntent] : [];
     if (!episode.runTick(intents) || episode.isDone()) break;
   }
 
@@ -104,6 +128,7 @@ async function runEpisode(opts: Options): Promise<EpisodeResult> {
     ticks: episode.game.ticks(),
     finalHash: episode.lastHash?.hash?.toString(),
     finalHashTick: episode.lastHash?.tick,
+    winner: JSON.stringify(episode.lastWinner ?? null),
     players: episode.game.players().map((p) => ({
       name: p.name(),
       alive: p.isAlive(),
@@ -117,7 +142,7 @@ async function runEpisode(opts: Options): Promise<EpisodeResult> {
 function printResult(label: string, r: EpisodeResult): void {
   console.log(`\n--- ${label} ---`);
   console.log(
-    `ticks=${r.ticks} finalHash=${r.finalHash ?? "n/a"} (tick ${r.finalHashTick ?? "n/a"})`,
+    `ticks=${r.ticks} finalHash=${r.finalHash ?? "n/a"} (tick ${r.finalHashTick ?? "n/a"}) winner=${r.winner}`,
   );
   for (const p of r.players) {
     console.log(
@@ -130,7 +155,7 @@ async function main(): Promise<void> {
   const opts = parseArgs(process.argv.slice(2));
   console.log(
     `Running episode: map=${opts.map} seed=${opts.seed} ticks=${opts.ticks} ` +
-      `spawnTurns=${opts.spawnTurns} actEvery=${opts.actEvery}`,
+      `spawnTurns=${opts.spawnTurns} actEvery=${opts.actEvery} difficulty=${opts.difficulty}`,
   );
 
   const run1 = await runEpisode(opts);

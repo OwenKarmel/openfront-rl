@@ -16,18 +16,47 @@ MuZero/EfficientZero, action/observation space, phased milestones).
   (`GameRunner` + `Executor`, the same pipeline the browser client and
   server use) via Node, so an RL agent can control a player through the
   same `Intent` protocol as a human.
-  - `src/GameSetup.ts` — shared episode setup/teardown (`Episode` class).
-  - `src/runEpisode.ts` — Phase-1 smoke test / determinism check, and a
+  - `src/GameSetup.ts` — shared episode setup/teardown (`Episode` class):
+    builds AGENT (a controllable Human player) and OPPONENT (a real
+    built-in Nation-AI player, `NationExecution`, at a selectable
+    `Difficulty`) on either a tiny test map or a real production map.
+  - `src/EnvConfig.ts` — deterministic combat config (fixed attack
+    attrition, zero spawn immunity) with a settable short spawn phase, so
+    RL episodes are reproducible and don't burn ticks on setup.
+  - `src/runEpisode.ts` — headless smoke test / determinism check, with a
     `--dump-record <path>` flag to write a replayable turn log.
-  - `src/EnvServer.ts` — Phase-2 long-lived process speaking a newline-JSON
+  - `src/EnvServer.ts` — long-lived process speaking a newline-JSON
     reset/step protocol over stdin/stdout (see file header for the wire
-    format). Minimal action space so far: `noop` / `expand`.
+    format and action space).
+  - `src/verifyRecord.ts` — headless replay verification for a dumped turn
+    log (re-simulates it and diffs hash checkpoints).
 - `training/` — Python.
   - `envs/openfront_env.py` — `gymnasium.Env` wrapping `EnvServer.ts` over a
-    subprocess.
-  - `smoke_test.py` — random-policy round-trip check of the whole stack.
-  - PPO/network/curriculum code: not yet built (Phase 3).
+    subprocess. Single-agent: AGENT is controlled by `step(action)`;
+    OPPONENT (the Nation AI) needs no action, it plays itself.
+  - `curriculum.py` — `CurriculumScheduler`: windowed win-rate promotion/
+    demotion through Easy → Medium → Hard → Impossible. Scheduling policy
+    only — plug a real training loop's per-episode win/loss into it.
+  - `smoke_test.py`, `curriculum_demo.py`, `dump_random_policy_log.py` —
+    round-trip checks and mechanism demos using a random (legal-action-
+    masked) policy; none of them are the actual training loop.
+  - PPO/network code: not yet built (Phase 3).
 - `kaggle/` — not yet built (Kaggle burst-training notebooks, Phase 3+).
+
+## Action space
+
+`env-bridge/src/EnvServer.ts`'s `ACTIONS`, mirrored in
+`training/envs/openfront_env.py`'s `ACTIONS`:
+
+- `noop` — do nothing this decision step
+- `expand` — attack neutral (unowned) land bordering AGENT's territory
+- `attack_opponent` — attack OPPONENT directly (only legal once they share a border)
+
+Intentionally still small: richer intents (boat attacks, structure builds,
+alliances) need a spatial/entity action head to *target* them, which is
+Phase 3 network work, not env-bridge plumbing. `legal_actions`/`action_mask`
+are provided every `reset()`/`step()` so a policy never needs to guess
+legality.
 
 ## Watching a game
 
@@ -66,41 +95,47 @@ MuZero/EfficientZero, action/observation space, phased milestones).
 git clone --recurse-submodules <this-repo-url>
 cd openfront-rl/OpenFrontIO && npm ci && cd ..
 cd env-bridge && npm install
+cd ../training && pip install -r requirements.txt
 ```
 
 Requires Node (any recent LTS — developed against v24) and network access
 for the initial installs.
 
-## Phase 1: env-bridge smoke test
+## Try it
 
 ```bash
+# TypeScript: episode vs. a real Nation-AI opponent, determinism check
 cd env-bridge
-npm run smoke -- --map plains --seed smoke-1 --ticks 200
+npm run smoke -- --map plains --seed smoke-1 --ticks 300 --difficulty hard
+
+# Python: gymnasium round-trip against the same real opponent
+cd ../training
+python smoke_test.py
+
+# Curriculum scheduler mechanism demo (random policy — expect it to stay
+# at "easy"; only a real policy earns promotions)
+python curriculum_demo.py
+
+# Headless replay verification on a real map
+cd ../env-bridge
+npx tsx --tsconfig ../OpenFrontIO/tsconfig.json src/runEpisode.ts \
+  --map onion --difficulty impossible --dump-record /tmp/record.json
+npx tsx --tsconfig ../OpenFrontIO/tsconfig.json src/verifyRecord.ts /tmp/record.json
 ```
-
-Runs a full headless game with two Human players ("AGENT", "OPPONENT") on a
-tiny test map from `OpenFrontIO/tests/testdata/maps/`, both spawning and then
-periodically attacking neutral land, then re-runs it with the same seed and
-asserts the final game-state hash is byte-identical. This is the foundation
-the actual env (reset/step API, observation/action encoding) will be built
-on in Phase 2 — it proves the headless pipeline is deterministic and crash-free
-before any RL code is written.
-
-Flags: `--map <name>` (any dir under `OpenFrontIO/tests/testdata/maps/`,
-smallest is `ocean_and_land`), `--seed <string>`, `--ticks <n>`,
-`--spawn-turns <n>`, `--act-every <n>`.
 
 ## Status
 
 - [x] Phase 1: env-bridge scaffold, headless episode runner, determinism
-      verified on `plains` and `ocean_and_land`.
-- [x] Phase 2 (core plumbing): `EnvServer.ts` reset/step protocol +
-      `openfront_env.py` gymnasium wrapper, verified end-to-end with a
-      random policy (`training/smoke_test.py`). Action space is still just
-      `noop`/`expand` against a scripted "always expand" opponent — no real
-      Nation/bot difficulty wired in yet, no PPO network yet.
-- [ ] Phase 2 remainder: wire a real Nation-AI opponent (Easy → Impossible)
-      into `EnvServer.ts`/`Episode`, richer action space, curriculum.
+      verified.
+- [x] Phase 2: `EnvServer.ts` reset/step protocol + `openfront_env.py`
+      gymnasium wrapper; a real built-in Nation-AI opponent (selectable
+      Easy/Medium/Hard/Impossible, the same `NationExecution` code driving
+      production games) wired in as OPPONENT; a 3-action space with legal-
+      action masking; headless replay verification on real production maps
+      (with a real terrain-caching bug found and fixed along the way); a
+      windowed win-rate curriculum scheduler. All verified end-to-end,
+      including through the full Python↔subprocess↔sim path.
 - [ ] Phase 3: PPO network + training loop; beat the Impossible-difficulty
       Nation bot 1v1 (v1 milestone).
-- [ ] Phase 4 (stretch): scale-up, self-play league.
+- [ ] Phase 4 (stretch): scale-up, self-play league, full visual playback
+      in the browser client.
