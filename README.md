@@ -361,14 +361,21 @@ convergence-based auto-stop; someone (or a future script) has to decide
 difficulty holds up consistently.
 
 **When does a single replayable episode (eval or otherwise) stop?**
-Whichever comes first: (a) `episode.isDone()` in the sim — one side has no
-units/tiles left alive (`GameSetup.ts`'s `Episode.isDone()`), or (b) the
-decision-step budget runs out (`OpenFrontEnv`'s `max_steps`, `train.py`'s
-eval uses `--max-episode-steps`, default 300 decision steps ×
-`ticks_per_step` (default 10) = 3000 simulation ticks). A truncated episode
-(hit the step budget with both sides still alive) has no winner and counts
-as a loss for curriculum purposes (see `record_episode` in
-`curriculum.py`), even though it isn't a "loss" in-game.
+`episode.isDone()` in the sim — one side has no units/tiles left alive
+(`GameSetup.ts`'s `Episode.isDone()`): a real win for whichever side is
+still standing, or a real loss for AGENT if it's the one eliminated.
+`OpenFrontEnv`'s `max_steps` (`train.py`'s `--max-episode-steps`, default
+20000 decision steps × `ticks_per_step` (default 10) = 200000 simulation
+ticks) is a safety net only, guarding against a genuine stalemate (e.g. an
+AGENT that never attacks and a too-passive OPPONENT) hanging forever — it is
+not meant to be hit in normal play and previously was: an earlier, much
+smaller cap (300 decision steps / 3000 ticks) was routinely cutting both
+training and eval episodes short before either side actually won or lost,
+which also meant curriculum's win-rate tracking was largely driven by
+truncation-as-loss rather than real outcomes. A truncated episode (the rare
+case of actually hitting the safety cap) still has no winner and still
+counts as a loss for curriculum purposes (see `record_episode` in
+`curriculum.py`).
 
 **What is the agent's action space?** Three discrete choices per decision
 step (`ACTIONS` in `EnvServer.ts`/`openfront_env.py` — see "Action space"
@@ -400,6 +407,35 @@ hard way (see Status), not chosen upfront:
 
 There's still no separate reward for gold/troops/build actions — territory
 margin and the terminal win/loss are the entire signal for now.
+
+**What observation does the agent see at each timestep?** `observation()` in
+`EnvServer.ts` returns two parts, both recomputed fresh from the real live
+game state on every decision step (never cached/approximated):
+
+- **`tile_grid`** — a `(height, width)` integer array covering the *entire
+  map*, one entry per tile: `0` = unowned/water, `1` = owned by AGENT, `2` =
+  owned by OPPONENT (`tileGrid()` in `EnvServer.ts`). No fog of war — this is
+  full ground-truth ownership, not just what AGENT could plausibly "see" in
+  a real game. On the Python/network side (`train.py`'s `obs_to_batch`,
+  `models/network.py`'s `_features`) this is one-hot encoded to 3 channels
+  and fed through a small CNN.
+- **Six scalar player stats** — `self_tiles`, `self_troops`, `self_gold`
+  (AGENT) and `opp_tiles`, `opp_troops`, `opp_gold` (OPPONENT), each a raw
+  live count/amount from `playerObs()` (`p.numTilesOwned()`, `p.troops()`,
+  `p.gold()`). Fed through `log1p` before the network's scalar MLP branch to
+  tame gold's huge dynamic range. No `alive` flag reaches the network
+  directly, though `alive` is present in the raw JSON and used server-side to
+  decide `legalActions`/episode termination.
+
+Alongside the observation, every step also carries `legal_actions`/
+`action_mask` (see action space above) — not part of the observation the
+network's CNN/MLP branches consume, but still information available to the
+agent each step, since it's what makes illegal actions unsampleable.
+
+Not currently observed: terrain type/elevation beyond ownership, unit
+positions/movement, build menu state, or anything about the opponent's
+intentions — the agent only ever sees the ownership grid and the six scalar
+totals above.
 
 **How is the agent and its opponent placed initially — is it random?**
 - **AGENT: no, always the same fixed spot.** `Episode.create()`

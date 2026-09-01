@@ -51,7 +51,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num-envs", type=int, default=4)
     p.add_argument("--rollout-length", type=int, default=64)
     p.add_argument("--ticks-per-step", type=int, default=10)
-    p.add_argument("--max-episode-steps", type=int, default=300)
+    # Safety cap only -- see OpenFrontEnv's max_steps docstring. Episodes
+    # (training and eval alike) should end via a real win/loss
+    # (Episode.isDone()), not by running out of decision steps.
+    p.add_argument("--max-episode-steps", type=int, default=20000)
     p.add_argument("--updates", type=int, default=1000)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--gamma", type=float, default=0.99)

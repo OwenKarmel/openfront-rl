@@ -49,7 +49,13 @@ class OpenFrontEnv(gym.Env):
         seed: str = "train",
         difficulty: str = "medium",
         ticks_per_step: int = 10,
-        max_steps: int = 200,
+        # A safety cap against a genuine stalemate hanging forever (e.g. an
+        # AGENT that never attacks and an OPPONENT too weak/passive to reach
+        # it), NOT meant to be hit in normal play -- real episodes should end
+        # via Episode.isDone() (AGENT or OPPONENT eliminated), not truncation.
+        # A too-small cap was previously cutting games short before either
+        # side actually won or lost.
+        max_steps: int = 20000,
         node_bin: str = "node",
         dump_game_record_dir: str | None = None,
     ) -> None:
