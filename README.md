@@ -31,23 +31,34 @@ MuZero/EfficientZero, action/observation space, phased milestones).
 
 ## Watching a game
 
-Two tiers, both working today:
-
-- **Quick debugging**: any observation's `tile_grid` (Python) /
-  `obs.tileGrid` (Node) is a flat ownership array (0=neutral, 1=agent,
+- **Quick debugging** (works today): any observation's `tile_grid` (Python)
+  / `obs.tileGrid` (Node) is a flat ownership array (0=neutral, 1=agent,
   2=opponent) you can plot directly (e.g. `matplotlib.pyplot.imshow`).
-- **Replayable turn log**: `runEpisode.ts --dump-record <path>` writes every
-  turn played to a JSON file shaped like an OpenFrontIO `GameRecord`, which
-  `npm run replay:game -- <path>` (from `OpenFrontIO/`) re-runs headlessly
-  and verifies hash-for-hash.
-  - **Known gap**: episodes currently run on tiny files under
-    `tests/testdata/maps/`, which aren't a real `GameMapType`, so the
-    dumped record's `config.gameMap` is a placeholder OpenFrontIO's own
-    replay/client tooling can't resolve to matching terrain. Watching a
-    training episode in the actual browser client (full visual playback,
-    including from a Kaggle run) needs episodes to run on a real (ideally
-    tiny) production map under `resources/maps/` instead — not yet wired
-    up.
+- **Headless replay verification** (works today): pass a real map —
+  `--map onion` (smallest production map) instead of a `tests/testdata/`
+  fixture — to `runEpisode.ts`/`OpenFrontEnv`, plus `--dump-record <path>` /
+  `dump_record=<path>`, to write a turn log with real hash checkpoints.
+  Verify it with `env-bridge`'s own `npx tsx src/verifyRecord.ts <path>`
+  (re-simulates the turns through a fresh episode and diffs hashes).
+  - **Not** OpenFrontIO's own `npm run replay:game`: that script
+    reconstructs players via `random.nextID()` and a production `Config`,
+    neither of which matches how env-bridge builds episodes (fixed
+    `AGENT`/`OPPONENT` ids, `EnvConfig`'s deterministic combat) — the two
+    diverge from tick 0 even though both are internally deterministic. Our
+    own turn logs verify correctly with `verifyRecord.ts` instead.
+- **Full visual playback in the actual browser client** (investigated, not
+  built): the client only ever loads a `GameRecord` one way —
+  `JoinLobbyModal.checkArchivedGame()` does `GET {apiBase}/game/{gameID}`
+  and requires the response to pass `GameRecordSchema.safeParse` *strictly*
+  (unlike the headless replay tool, there's no lenient fallback), plus a
+  `gitCommit` match (or a DEV-build client, which skips that check). Getting
+  a training episode on screen in the real client would need: (1) a tiny
+  local HTTP server serving our dumped record at that route, with
+  `getApiBase()` pointed at it, and (2) the record actually filled out to
+  the full schema — real `GameEndInfo`/`PlayerRecord`/stats fields, not the
+  loose shape `writeReplayRecord()` produces today. Not started; a bigger
+  lift than headless verification was, and orthogonal to the training
+  milestone, so scoped separately.
 
 ## Setup
 
