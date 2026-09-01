@@ -23,11 +23,19 @@ class VecEnv:
     def __init__(self, env_fns: list[Callable[[], OpenFrontEnv]]):
         self.envs = [fn() for fn in env_fns]
         self.n = len(self.envs)
+        # One counter per env slot, strided by self.n so no two (env, episode)
+        # pairs across the vector ever collide on a seed. Must keep advancing
+        # on every reset -- including auto-resets in step() -- otherwise each
+        # slot replays a single fixed seed for its entire lifetime (same
+        # terrain/opponent spawn every episode; the agent only ever sees `n`
+        # distinct scenarios across the whole run instead of a fresh one each
+        # episode).
+        self._seed_counters = list(range(self.n))
 
     def reset(self) -> tuple[list[dict], list[dict]]:
         obs, infos = [], []
         for i, env in enumerate(self.envs):
-            o, info = env.reset(seed=i)
+            o, info = env.reset(seed=self._seed_counters[i])
             obs.append(o)
             infos.append(info)
         return obs, infos
@@ -47,7 +55,8 @@ class VecEnv:
                 # acted on next, since that's what the training loop picks
                 # the next action from.
                 episode_info = info
-                o, info = env.reset(seed=None)
+                self._seed_counters[i] += self.n
+                o, info = env.reset(seed=self._seed_counters[i])
                 info["episode_info"] = episode_info
             obs.append(o)
             rewards.append(r)
