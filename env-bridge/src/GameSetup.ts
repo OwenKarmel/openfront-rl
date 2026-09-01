@@ -2,41 +2,44 @@ import crypto from "crypto";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import { Config } from "../../OpenFrontIO/src/core/configuration/Config";
 import { Executor } from "../../OpenFrontIO/src/core/execution/ExecutionManager";
 import {
-  Cell,
   Difficulty,
   Game,
   GameMapSize,
   GameMapType,
   GameMode,
   GameType,
-  Nation,
   PlayerInfo,
   PlayerType,
 } from "../../OpenFrontIO/src/core/game/Game";
-import { createGame } from "../../OpenFrontIO/src/core/game/GameImpl";
 import { GameMap } from "../../OpenFrontIO/src/core/game/GameMap";
+import { createGame } from "../../OpenFrontIO/src/core/game/GameImpl";
 import {
   GameUpdateType,
   HashUpdate,
 } from "../../OpenFrontIO/src/core/game/GameUpdates";
+import { createNationsForGame } from "../../OpenFrontIO/src/core/game/NationCreation";
 import {
+  AdditionalNation,
   genTerrainFromBin,
   MapManifest,
+  Nation as ManifestNation,
 } from "../../OpenFrontIO/src/core/game/TerrainMapLoader";
-import { UserSettings } from "../../OpenFrontIO/src/core/game/UserSettings";
 import { GameRunner } from "../../OpenFrontIO/src/core/GameRunner";
+import { PseudoRandom } from "../../OpenFrontIO/src/core/PseudoRandom";
 import {
   GameConfig,
   GameRecord,
+  GameStartInfo,
   PlayerRecord,
   StampedIntent,
   Turn,
   Winner,
 } from "../../OpenFrontIO/src/core/Schemas";
+import { simpleHash } from "../../OpenFrontIO/src/core/Util";
 import { createPartialGameRecord } from "../../OpenFrontIO/src/core/Util";
-import { EnvConfig } from "./EnvConfig";
 import { NodeGameMapLoader } from "../../OpenFrontIO/tests/perf/fullgame/NodeGameMapLoader";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -49,43 +52,35 @@ const PRODUCTION_MAPS_DIR = path.join(
   "../../OpenFrontIO/resources/maps",
 );
 
-// Exactly 8 alphanumeric chars each — Schemas.ts's ID/MappedID (used for
-// player clientIDs and gameIDs throughout, including StampedIntent.clientID
-// on every recorded turn) requires `GAME_ID_REGEX = /^[A-Za-z0-9]{8}$/`.
-// Only matters for toGameRecord()'s output (the real client strictly
-// schema-validates it); writeReplayRecord()/verifyRecord.ts don't care, but
-// using valid IDs everywhere avoids needing two different ID schemes.
+// Exactly 8 alphanumeric chars — Schemas.ts's GAME_ID_REGEX requires this
+// for gameIDs. Never used to seed anything (only the internal small id
+// PseudoRandom.nextID() returns feeds determinism — see wireGameID below),
+// so a fixed constant is fine.
 export const AGENT_CLIENT_ID = "AGENTAAA";
-export const OPPONENT_CLIENT_ID = "OPPONENT";
-
-/**
- * Deterministically derives a schema-valid 8-char alphanumeric gameID (see
- * GAME_ID_REGEX) from an arbitrary episode seed string, so a training
- * episode's own seed (e.g. "onion-42", not 8 chars, has a hyphen) can still
- * be used as OpenFrontIO's wire gameID in toGameRecord()/ReplayServer.ts.
- */
-export function wireGameID(seed: string): string {
-  return crypto.createHash("sha256").update(seed).digest("hex").slice(0, 8);
-}
 
 interface ResolvedMap {
   gameMap: GameMap;
   miniGameMap: GameMap;
-  /** The real GameMapType when mapName resolves to a production map under
-   *  resources/maps/, or the Asia placeholder for a tests/testdata/ fixture
-   *  (those aren't a real GameMapType, so OpenFrontIO's own replay/client
-   *  tooling can't resolve matching terrain for them from gameConfig alone —
-   *  fine for training, not for producing a watchable/replayable record). */
+  nations: ManifestNation[];
+  additionalNations: AdditionalNation[];
+  /**
+   * The real GameMapType when mapName resolves to a production map under
+   * resources/maps/, or the Asia placeholder for a tests/testdata/ fixture
+   * (those aren't a real GameMapType, and have no manifest nations, so
+   * they're only usable for fast wiring smoke-tests — never for training
+   * or eval episodes, which need a real map for both correct nation
+   * construction and for OpenFrontIO's own replay/client tooling to
+   * resolve matching terrain from gameConfig alone).
+   */
   gameMapType: GameMapType;
 }
 
 /**
- * Resolves `mapName` to terrain data. Tries tests/testdata/maps/<mapName>
- * first (tiny fixtures, fast — the default for training throughput), then
- * falls back to resources/maps/<mapName> (real production maps, matching a
- * GameMapType) — larger and slower, but their gameConfig.gameMap is real,
- * so episodes on them are replayable/watchable with OpenFrontIO's own
- * tooling. See training-map vs. replay-map guidance in the README.
+ * Resolves `mapName` to terrain + manifest data. Tries
+ * tests/testdata/maps/<mapName> first (tiny fixtures, no real GameMapType
+ * or manifest nations — smoke-test only), then resources/maps/<mapName>
+ * (real production maps, matching a GameMapType, with real manifest
+ * nations) — the only maps that should back a training or eval episode.
  */
 async function resolveMap(mapName: string): Promise<ResolvedMap> {
   const testMapDir = path.join(TESTDATA_MAPS, mapName);
@@ -100,6 +95,8 @@ async function resolveMap(mapName: string): Promise<ResolvedMap> {
     return {
       gameMap: await genTerrainFromBin(manifest.map, mapBinBuffer),
       miniGameMap: await genTerrainFromBin(manifest.map4x, miniMapBinBuffer),
+      nations: manifest.nations ?? [],
+      additionalNations: manifest.additionalNations ?? [],
       gameMapType: GameMapType.Asia, // placeholder — not a real map
     };
   }
@@ -135,17 +132,13 @@ async function resolveMap(mapName: string): Promise<ResolvedMap> {
       manifest.map4x,
       await mapData.map4xBin(),
     ),
+    nations: manifest.nations ?? [],
+    additionalNations: manifest.additionalNations ?? [],
     gameMapType,
   };
 }
 
-/**
- * Scans outward in a square spiral from (x0, y0) for the nearest land tile.
- * Takes a bare GameMap (not Game) so it works both before game creation
- * (picking the opponent Nation's spawnCell hint, which the Nation
- * constructor needs) and after (picking the AGENT's spawn tile) — Game
- * extends GameMap, so a live Game satisfies this either way.
- */
+/** Scans outward in a square spiral from (x0, y0) for the nearest land tile. */
 export function findLandTile(map: GameMap, x0: number, y0: number): number {
   const w = map.width();
   const h = map.height();
@@ -164,65 +157,97 @@ export function findLandTile(map: GameMap, x0: number, y0: number): number {
   throw new Error("no land tile found on map");
 }
 
+/**
+ * Deterministically derives a schema-valid 8-char alphanumeric gameID (see
+ * GAME_ID_REGEX in Schemas.ts) from an arbitrary episode seed string (e.g.
+ * "onion-42" — not 8 chars, has a hyphen). This is the ONE gameID used
+ * everywhere for a given episode: it seeds the live simulation's PRNG
+ * *and* is what gets written into the dumped GameRecord — using two
+ * different values for those (as an earlier version of this file did) means
+ * the client reseeds its own PRNG from a different value than the
+ * simulation actually ran on and immediately diverges.
+ */
+export function wireGameID(seed: string): string {
+  return crypto.createHash("sha256").update(seed).digest("hex").slice(0, 8);
+}
+
 export class Episode {
   runner: GameRunner;
   game: Game;
+  /**
+   * Internal PlayerID game-state lookups need (game.player(id),
+   * sharesBorderWith, etc.) — NOT the same as AGENT_CLIENT_ID, which is the
+   * wire clientID intents are stamped with (Executor resolves those via
+   * playerByClientID separately). Production derives this via
+   * PseudoRandom.nextID(), same as here, so it's not a fixed constant.
+   */
+  agentId: string;
+  /** Resolved once, after construction: game.nations()[0]'s internal player id. */
+  opponentId: string;
   lastHash: HashUpdate | undefined;
   lastWinner: Winner | undefined;
   fatalError: string | undefined;
   /** Every turn played, in order — enough to reconstruct/replay the episode. */
   turns: Turn[] = [];
   private turnNumber = 0;
-  private seed: string;
+  private gameID: string;
   private gameConfig: GameConfig;
-  private spawnTurns: number;
   private readonly startTimeMs = Date.now();
 
   private constructor(
     runner: GameRunner,
-    seed: string,
+    gameID: string,
     gameConfig: GameConfig,
-    spawnTurns: number,
+    agentId: string,
+    opponentId: string,
   ) {
     this.runner = runner;
     this.game = runner.game;
-    this.seed = seed;
+    this.gameID = gameID;
     this.gameConfig = gameConfig;
-    this.spawnTurns = spawnTurns;
+    this.agentId = agentId;
+    this.opponentId = opponentId;
   }
 
   /**
-   * Builds the game + runner (map, config, the AGENT human player and the
-   * OPPONENT Nation-AI player) but plays no turns — shared by create()
-   * (which then spawns AGENT and lets OPPONENT self-spawn) and fromRecord()
-   * (which replays a recorded turn log, spawn intents included, instead).
+   * Builds the game + runner (map, config, the AGENT human player, and one
+   * Nation-AI opponent drawn from the map's real manifest) but plays no
+   * turns — create() then spawns AGENT and lets OPPONENT self-spawn.
    *
-   * OPPONENT is a real built-in Nation AI (NationExecution — the same code
-   * driving Nation bots in production games), not a scripted stand-in: it
-   * decides its own attacks/builds/alliance behavior every tick based on
-   * `difficulty`, exactly like the in-game "Impossible" opponent the whole
-   * project is ultimately trying to beat. GameRunner.init() wires its
-   * Execution automatically once game.config().spawnNations() is true (see
-   * gameConfig.nations below) — see ExecutionManager.nationExecutions().
+   * Mirrors OpenFrontIO's own createGameRunner() (src/core/GameRunner.ts)
+   * step-for-step — the literal function the real client uses for both
+   * live play and loading an archived GameRecord — rather than
+   * hand-approximating it, so a dumped episode reconstructs identically
+   * (map, Config, player/nation ids, PRNG draw order) wherever it's loaded.
+   * Not a direct call to createGameRunner()/loadTerrainMap() because that
+   * caches the parsed (and mutable) GameMapImpl across calls — see
+   * resolveMap().
    */
   private static async build(
     mapName: string,
     seed: string,
-    spawnTurns: number,
     difficulty: Difficulty,
   ): Promise<Episode> {
-    const { gameMap, miniGameMap, gameMapType } = await resolveMap(mapName);
+    const gameID = wireGameID(seed);
+    const { gameMap, miniGameMap, nations, additionalNations, gameMapType } =
+      await resolveMap(mapName);
 
     const gameConfig: GameConfig = {
       gameMap: gameMapType,
       gameMapSize: GameMapSize.Normal,
       gameMode: GameMode.FFA,
-      gameType: GameType.Public,
+      // The real mode a solo player uses against AI in production
+      // (SinglePlayerModal.startGame()) — not cosmetic: it's what makes
+      // Config.numSpawnPhaseTurns() return the real 100-tick value (vs.
+      // 300 for Public) and what makes GameRunner.init() skip adding a
+      // SpawnTimerExecution a real solo game never has either.
+      gameType: GameType.Singleplayer,
       difficulty,
-      // Anything but "disabled" — see Config.spawnNations(). Count is moot:
-      // we build the OPPONENT Nation ourselves below instead of letting
-      // createNationsForGame() draw nations from the map manifest.
-      nations: "default",
+      // Numeric, not "default": exactly one Nation-AI opponent, matching
+      // this project's v1 scope (beat one bot 1v1). createNationsForGame
+      // draws it (deterministically, given the seed) from the map's real
+      // manifest nations below.
+      nations: 1,
       donateGold: false,
       donateTroops: false,
       bots: 0,
@@ -232,35 +257,46 @@ export class Episode {
       randomSpawn: false,
     };
 
-    const humans = [
-      new PlayerInfo(
-        "Agent",
-        PlayerType.Human,
-        AGENT_CLIENT_ID,
-        AGENT_CLIENT_ID,
-      ),
-    ];
-    const opponentSpawnCell = new Cell(
-      Math.floor(gameMap.width() * 0.85),
-      Math.floor(gameMap.height() * 0.5),
-    );
-    const nations = [
-      new Nation(
-        opponentSpawnCell,
-        new PlayerInfo(
-          "Opponent",
-          PlayerType.Nation,
-          null,
-          OPPONENT_CLIENT_ID,
-        ),
-      ),
-    ];
+    const gameStart: GameStartInfo = {
+      gameID,
+      lobbyCreatedAt: 0,
+      config: gameConfig,
+      players: [
+        {
+          clientID: AGENT_CLIENT_ID,
+          username: "Agent",
+          clanTag: null,
+        },
+      ],
+    };
 
-    const config = new EnvConfig(gameConfig, new UserSettings(), spawnTurns);
-    const game = createGame(humans, nations, gameMap, miniGameMap, config);
+    // Exact construction order from createGameRunner() (GameRunner.ts) —
+    // order matters, since both draws come from the same PRNG stream.
+    const random = new PseudoRandom(simpleHash(gameID));
+    const humans = gameStart.players.map(
+      (p) =>
+        new PlayerInfo(
+          p.username,
+          PlayerType.Human,
+          p.clientID,
+          random.nextID(),
+        ),
+    );
+    const nationList = createNationsForGame(
+      gameStart,
+      nations,
+      additionalNations,
+      humans.length,
+      random,
+    );
+
+    const config = new Config(gameConfig, null, false);
+    const game = createGame(humans, nationList, gameMap, miniGameMap, config);
+    const agentId = humans[0].id;
+    const opponentId = game.nations()[0].playerInfo.id;
 
     const episode = new Episode(
-      new GameRunner(game, new Executor(game, seed, undefined), (gu) => {
+      new GameRunner(game, new Executor(game, gameID, undefined), (gu) => {
         if ("errMsg" in gu) {
           episode.fatalError = `${gu.errMsg}\n${gu.stack ?? ""}`;
           return;
@@ -270,9 +306,10 @@ export class Episode {
         const wins = gu.updates[GameUpdateType.Win] as { winner: Winner }[];
         if (wins.length > 0) episode.lastWinner = wins[wins.length - 1].winner;
       }),
-      seed,
+      gameID,
       gameConfig,
-      spawnTurns,
+      agentId,
+      opponentId,
     );
     episode.runner.init();
     return episode;
@@ -281,14 +318,13 @@ export class Episode {
   static async create(
     mapName: string,
     seed: string,
-    spawnTurns: number,
     difficulty: Difficulty,
   ): Promise<Episode> {
-    const episode = await Episode.build(mapName, seed, spawnTurns, difficulty);
+    const episode = await Episode.build(mapName, seed, difficulty);
     const game = episode.game;
 
-    // AGENT picks a spawn tile on the opposite side of the map from the
-    // Nation's spawnCell hint above; OPPONENT self-spawns via NationExecution.
+    // AGENT picks a spawn tile on one side of the map; OPPONENT self-spawns
+    // via NationExecution, near its manifest-derived spawnCell.
     const agentTile = findLandTile(
       game,
       Math.floor(game.width() * 0.15),
@@ -298,7 +334,12 @@ export class Episode {
       { type: "spawn", tile: agentTile, clientID: AGENT_CLIENT_ID },
     ]);
 
-    const maxSpawnTurns = spawnTurns + 5;
+    // Real numSpawnPhaseTurns() (100 for Singleplayer) — not shortened.
+    // Nothing strategic happens during it beyond idle waiting (EnvServer.ts
+    // already forces legalActions() = ["noop"] while inSpawnPhase()), so
+    // this only costs cheap headless executeNextTick() calls, not real
+    // agent-decision overhead.
+    const maxSpawnTurns = episode.game.config().numSpawnPhaseTurns() + 10;
     while (episode.game.inSpawnPhase()) {
       if (episode.turnNumber > maxSpawnTurns) {
         throw new Error(
@@ -309,52 +350,6 @@ export class Episode {
     }
 
     return episode;
-  }
-
-  /**
-   * Replays a record written by writeReplayRecord() through a *fresh* game
-   * built the same way create() builds one (same EnvConfig/spawnTurns/player
-   * construction — see writeReplayRecord for why this can't reuse
-   * OpenFrontIO's own ReplayGame.ts unmodified), and checks every recorded
-   * turn.hash against the freshly recomputed hash at that tick.
-   */
-  static async fromRecord(record: {
-    info: { gameID: string; config: GameConfig; envSpawnTurns: number };
-    turns: Turn[];
-  }): Promise<{
-    episode: Episode;
-    compared: number;
-    matches: number;
-    firstMismatch: number | null;
-  }> {
-    // Must reuse the exact original seed: SpawnExecution seeds its own
-    // PseudoRandom from simpleHash(playerInfo.id) + simpleHash(gameID), which
-    // shapes the conquered spawn area even for an explicit target tile — a
-    // different seed here would diverge the very first hash checkpoint.
-    const episode = await Episode.build(
-      record.info.config.gameMap,
-      record.info.gameID,
-      record.info.envSpawnTurns,
-      record.info.config.difficulty,
-    );
-
-    let compared = 0;
-    let matches = 0;
-    let firstMismatch: number | null = null;
-    for (const turn of record.turns) {
-      const ok = episode.runTick(turn.intents);
-      if (!ok) break;
-      if (turn.hash !== undefined && turn.hash !== null) {
-        compared++;
-        const computed = episode.turns[episode.turns.length - 1].hash;
-        if (computed === turn.hash) {
-          matches++;
-        } else if (firstMismatch === null) {
-          firstMismatch = turn.turnNumber;
-        }
-      }
-    }
-    return { episode, compared, matches, firstMismatch };
   }
 
   /** Advances one tick, applying the given intents this turn. Throws on a fatal sim error. */
@@ -371,8 +366,8 @@ export class Episode {
     // GameImpl emits a Hash update every 10 ticks (see GameImpl.executeNextTick),
     // stamped with the pre-increment tick count — game.ticks() has already
     // moved one past it by the time executeNextTick() returns here. Stamp it
-    // onto this turn so a dumped record carries the same hashes ReplayGame.ts
-    // checks the recomputed simulation against.
+    // onto this turn so a dumped record carries the same hashes
+    // OpenFrontIO's replay tooling checks the recomputed simulation against.
     if (
       this.lastHash !== undefined &&
       this.lastHash.tick === this.game.ticks() - 1
@@ -382,9 +377,9 @@ export class Episode {
     return ok;
   }
 
-  /** The gameID toGameRecord() writes into the record — visit /game/<this> in the client. */
+  /** The gameID this episode ran on — also what's written into toGameRecord(). */
   wireGameID(): string {
-    return wireGameID(this.seed);
+    return this.gameID;
   }
 
   isDone(): boolean {
@@ -395,47 +390,17 @@ export class Episode {
   }
 
   /**
-   * Writes a JSON turn log of the episode so far. Verify it headlessly with
-   * `Episode.fromRecord()` (see verifyRecord.ts) — deliberately NOT meant to
-   * be loaded by OpenFrontIO's own `npm run replay:game`: that script always
-   * reconstructs players via `random.nextID()` and a production `Config`,
-   * neither of which matches how env-bridge builds an episode (fixed
-   * "AGENT"/"OPPONENT" ids, EnvConfig's deterministic combat), so the two
-   * would diverge from tick 0 even though both are internally deterministic.
-   * `info`/`turns` are still GameRecord-*shaped* (same field names) so this
-   * stays close to something OpenFrontIO's tooling could consume if the
-   * player-construction mismatch is ever closed.
-   */
-  writeReplayRecord(filePath: string): void {
-    const record = {
-      info: {
-        gameID: this.seed,
-        lobbyCreatedAt: 0,
-        config: this.gameConfig,
-        envSpawnTurns: this.spawnTurns,
-        // OPPONENT is a Nation (added via createGame's `nations` array, not
-        // the wire player list) — only AGENT is a "player" on this shape.
-        players: [
-          { clientID: AGENT_CLIENT_ID, username: "Agent", clanTag: null },
-        ],
-      },
-      gitCommit: "DEV",
-      version: "v0.0.2",
-      turns: this.turns,
-    };
-    fs.writeFileSync(filePath, JSON.stringify(record));
-  }
-
-  /**
    * Builds a strictly schema-valid GameRecord (GameRecordSchema in
    * Schemas.ts) using the same `createPartialGameRecord` helper the real
-   * server uses to archive games. Unlike writeReplayRecord()'s loose shape,
-   * this is what the actual OpenFrontIO browser client requires: its only
-   * path for loading an archived game (JoinLobbyModal.checkArchivedGame)
-   * does `GET {apiBase}/game/{gameID}` and runs the strict
-   * `GameRecordSchema.safeParse` on the response with no fallback — see
-   * ReplayServer.ts, which serves records built by this method so a
-   * training episode can actually be watched in the real client.
+   * server uses to archive games. This is what the actual OpenFrontIO
+   * browser client requires: its only path for loading an archived game
+   * (JoinLobbyModal.checkArchivedGame) does `GET {apiBase}/game/{gameID}`
+   * and runs the strict `GameRecordSchema.safeParse` on the response with
+   * no fallback — see ReplayServer.ts, which serves records built by this
+   * method so a training/eval episode can be watched in the real client.
+   * Since construction now matches createGameRunner() exactly, this same
+   * record also verifies correctly with OpenFrontIO's own unmodified
+   * `npm run replay:game`.
    */
   toGameRecord(): GameRecord {
     const players: PlayerRecord[] = [
@@ -448,7 +413,7 @@ export class Episode {
       },
     ];
     const partial = createPartialGameRecord(
-      wireGameID(this.seed),
+      this.gameID,
       this.gameConfig,
       players,
       this.turns,

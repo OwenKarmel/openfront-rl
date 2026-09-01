@@ -1,7 +1,7 @@
 """One-off: run the env-bridge stack (gymnasium env + subprocess) with a
-random policy against a real Nation-AI opponent, and dump the resulting
-turn log (on a real production map, so it's headlessly replay-verifiable --
-see env-bridge/src/verifyRecord.ts)."""
+random policy against a real Nation-AI opponent, and dump a full GameRecord
+-- watchable in the real OpenFrontIO client (ReplayServer.ts) and
+verifiable headlessly with OpenFrontIO's own `npm run replay:game`."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import numpy as np
 from envs.openfront_env import ACTIONS, OpenFrontEnv
 
-OUT_PATH = "/tmp/random-policy-record.json"
+OUT_DIR = "/home/developer/openfront-rl/training/replays"
 
 
 def main() -> None:
@@ -24,7 +24,7 @@ def main() -> None:
         difficulty="hard",
         max_steps=30,
         ticks_per_step=10,
-        dump_record=OUT_PATH,
+        dump_game_record_dir=OUT_DIR,
     )
     try:
         obs, info = env.reset(seed=1)
@@ -44,7 +44,7 @@ def main() -> None:
                 break
         print(f"\ntotal_reward={total_reward:.4f}")
     finally:
-        env.close()  # flushes the turn-log record even if the episode didn't terminate
+        env.close()  # flushes the GameRecord dump even if the episode didn't terminate
 
 
 if __name__ == "__main__":

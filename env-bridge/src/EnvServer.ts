@@ -6,8 +6,9 @@
  *
  * Single-agent: AGENT is the controlled player; OPPONENT is a real built-in
  * Nation-AI (NationExecution — the same code driving Nation bots in
- * production games, difficulty selectable per episode) making its own
- * decisions every tick. There is nothing to send OPPONENT actions for.
+ * production games, difficulty selectable per episode, drawn from the map's
+ * real manifest — see GameSetup.ts) making its own decisions every tick.
+ * There is nothing to send OPPONENT actions for.
  *
  * Action space (still intentionally small — richer intents come once the
  * network has spatial/entity action heads to point them with, e.g. to pick
@@ -24,8 +25,8 @@
  * between, on its own schedule, regardless of this cadence.
  *
  * Protocol (one JSON object per line each direction):
- *   -> {"cmd":"reset","seed":"...","map":"plains","difficulty":"impossible",
- *       "spawnTurns":3,"ticksPerStep":10,"dumpRecord":"/path/to/record.json"}
+ *   -> {"cmd":"reset","seed":"...","map":"onion","difficulty":"impossible",
+ *       "ticksPerStep":10,"dumpGameRecordDir":"/path/to/replays"}
  *   <- {"obs":{...},"legalActions":[...],"done":false}
  *   -> {"cmd":"step","action":"expand"}
  *   <- {"obs":{...},"reward":0.1,"done":false,"legalActions":[...],
@@ -35,19 +36,19 @@
  * `info.winner` is "AGENT"/"OPPONENT"/null (still playing, or a truncated-
  * without-a-winner episode) — set only once `done` is true.
  *
- * `dumpRecord` (optional, on reset) writes every turn of the episode to a
- * replayable JSON file — see Episode.writeReplayRecord — once the episode
- * ends (done:true from step) or the session is closed, whichever comes
- * first. `dumpGameRecordDir` similarly writes a full, strictly schema-valid
- * GameRecord (Episode.toGameRecord()) to <dir>/<wireGameID>.json, watchable
- * in the real OpenFrontIO client via ReplayServer.ts — see README.
+ * `dumpGameRecordDir` (optional, on reset) writes a full, strictly
+ * schema-valid GameRecord (Episode.toGameRecord()) to
+ * <dir>/<wireGameID>.json once the episode ends (done:true from step) or
+ * the session is closed, whichever comes first — watchable in the real
+ * OpenFrontIO client via ReplayServer.ts, and verifiable headlessly with
+ * OpenFrontIO's own `npm run replay:game` — see README.
  */
 import fs from "fs";
 import path from "path";
 import readline from "readline";
 import { Difficulty, Game, Player } from "../../OpenFrontIO/src/core/game/Game";
 import { StampedIntent } from "../../OpenFrontIO/src/core/Schemas";
-import { AGENT_CLIENT_ID, Episode, OPPONENT_CLIENT_ID } from "./GameSetup";
+import { AGENT_CLIENT_ID, Episode } from "./GameSetup";
 
 const ACTIONS = ["noop", "expand", "attack_opponent"] as const;
 type Action = (typeof ACTIONS)[number];
@@ -57,9 +58,7 @@ interface ResetCmd {
   seed: string;
   map: string;
   difficulty?: string;
-  spawnTurns?: number;
   ticksPerStep?: number;
-  dumpRecord?: string;
   dumpGameRecordDir?: string;
 }
 interface StepCmd {
@@ -91,17 +90,18 @@ interface PlayerObs {
   gold: number;
 }
 
-function player(game: Game, clientId: string): Player {
-  return game.player(clientId);
+function player(game: Game, playerId: string): Player {
+  return game.player(playerId);
 }
 
 /** Ownership grid: 0 = unowned/water, 1 = AGENT, 2 = OPPONENT. */
-function tileGrid(game: Game): number[] {
+function tileGrid(episode: Episode): number[] {
+  const game = episode.game;
   const map = game.map();
   const w = game.width();
   const h = game.height();
-  const agent = player(game, AGENT_CLIENT_ID);
-  const opponent = player(game, OPPONENT_CLIENT_ID);
+  const agent = player(game, episode.agentId);
+  const opponent = player(game, episode.opponentId);
   const out = new Array<number>(w * h);
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
@@ -113,8 +113,8 @@ function tileGrid(game: Game): number[] {
   return out;
 }
 
-function playerObs(game: Game, clientId: string): PlayerObs {
-  const p = player(game, clientId);
+function playerObs(game: Game, playerId: string): PlayerObs {
+  const p = player(game, playerId);
   return {
     alive: p.isAlive(),
     tiles: p.numTilesOwned(),
@@ -123,23 +123,23 @@ function playerObs(game: Game, clientId: string): PlayerObs {
   };
 }
 
-function observation(game: Game, width: number, height: number) {
+function observation(episode: Episode, width: number, height: number) {
   return {
     width,
     height,
-    tileGrid: tileGrid(game),
+    tileGrid: tileGrid(episode),
     players: {
-      AGENT: playerObs(game, AGENT_CLIENT_ID),
-      OPPONENT: playerObs(game, OPPONENT_CLIENT_ID),
+      AGENT: playerObs(episode.game, episode.agentId),
+      OPPONENT: playerObs(episode.game, episode.opponentId),
     },
   };
 }
 
 function legalActions(episode: Episode): Action[] {
-  const agent = player(episode.game, AGENT_CLIENT_ID);
+  const agent = player(episode.game, episode.agentId);
   if (!agent.isAlive()) return ["noop"];
   if (episode.game.inSpawnPhase()) return ["noop"];
-  const opponent = player(episode.game, OPPONENT_CLIENT_ID);
+  const opponent = player(episode.game, episode.opponentId);
   const actions: Action[] = ["noop", "expand"];
   if (opponent.isAlive() && agent.sharesBorderWith(opponent)) {
     actions.push("attack_opponent");
@@ -148,11 +148,11 @@ function legalActions(episode: Episode): Action[] {
 }
 
 /** Potential function for reward shaping: AGENT's owned tile count. */
-function potential(game: Game): number {
-  return player(game, AGENT_CLIENT_ID).numTilesOwned();
+function potential(episode: Episode): number {
+  return player(episode.game, episode.agentId).numTilesOwned();
 }
 
-function intentFor(action: Action): StampedIntent | null {
+function intentFor(action: Action, opponentId: string): StampedIntent | null {
   switch (action) {
     case "noop":
       return null;
@@ -166,7 +166,7 @@ function intentFor(action: Action): StampedIntent | null {
     case "attack_opponent":
       return {
         type: "attack",
-        targetID: OPPONENT_CLIENT_ID,
+        targetID: opponentId,
         troops: null,
         clientID: AGENT_CLIENT_ID,
       };
@@ -179,24 +179,21 @@ class Session {
   height = 0;
   ticksPerStep = 10;
   prevPotential = 0;
-  dumpRecordPath: string | undefined;
   dumpGameRecordDir: string | undefined;
 
   async reset(cmd: ResetCmd): Promise<object> {
     this.episode = await Episode.create(
       cmd.map,
       cmd.seed,
-      cmd.spawnTurns ?? 3,
       parseDifficulty(cmd.difficulty),
     );
     this.width = this.episode.game.width();
     this.height = this.episode.game.height();
     this.ticksPerStep = cmd.ticksPerStep ?? 10;
-    this.dumpRecordPath = cmd.dumpRecord;
     this.dumpGameRecordDir = cmd.dumpGameRecordDir;
-    this.prevPotential = potential(this.episode.game);
+    this.prevPotential = potential(this.episode);
     return {
-      obs: observation(this.episode.game, this.width, this.height),
+      obs: observation(this.episode, this.width, this.height),
       legalActions: legalActions(this.episode),
       done: this.episode.isDone(),
     };
@@ -206,7 +203,7 @@ class Session {
     if (!this.episode) throw new Error("step called before reset");
     const episode = this.episode;
 
-    const intent = intentFor(cmd.action);
+    const intent = intentFor(cmd.action, episode.opponentId);
     const intents: StampedIntent[] = intent ? [intent] : [];
 
     let done = false;
@@ -220,13 +217,13 @@ class Session {
 
     // Potential-based shaping (AGENT tile-count delta), plus a dominant
     // terminal win/loss term once the episode ends.
-    const newPotential = potential(episode.game);
+    const newPotential = potential(episode);
     let reward = (newPotential - this.prevPotential) * 0.01;
     this.prevPotential = newPotential;
     let winner: "AGENT" | "OPPONENT" | null = null;
     if (done) {
-      const agentAlive = player(episode.game, AGENT_CLIENT_ID).isAlive();
-      const opponentAlive = player(episode.game, OPPONENT_CLIENT_ID).isAlive();
+      const agentAlive = player(episode.game, episode.agentId).isAlive();
+      const opponentAlive = player(episode.game, episode.opponentId).isAlive();
       if (agentAlive && !opponentAlive) {
         reward += 1;
         winner = "AGENT";
@@ -239,7 +236,7 @@ class Session {
     if (done) this.flushRecord();
 
     return {
-      obs: observation(episode.game, this.width, this.height),
+      obs: observation(episode, this.width, this.height),
       reward,
       done,
       legalActions: legalActions(episode),
@@ -247,12 +244,8 @@ class Session {
     };
   }
 
-  /** Writes any pending replay/GameRecord dumps requested on reset. */
+  /** Writes a pending GameRecord dump requested on reset. */
   flushRecord(): void {
-    if (this.episode && this.dumpRecordPath) {
-      this.episode.writeReplayRecord(this.dumpRecordPath);
-      this.dumpRecordPath = undefined;
-    }
     if (this.episode && this.dumpGameRecordDir) {
       fs.mkdirSync(this.dumpGameRecordDir, { recursive: true });
       const gameID = this.episode.wireGameID();

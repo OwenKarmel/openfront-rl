@@ -19,7 +19,7 @@ from envs.openfront_env import ACTIONS, OpenFrontEnv
 def main() -> None:
     rng = np.random.default_rng(0)
     env = OpenFrontEnv(
-        map_name="plains", seed="smoke-py", difficulty="hard", max_steps=15, ticks_per_step=10
+        map_name="onion", seed="smoke-py", difficulty="hard", max_steps=15, ticks_per_step=10
     )
     try:
         obs, info = env.reset(seed=1)

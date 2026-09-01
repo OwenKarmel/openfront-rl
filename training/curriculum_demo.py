@@ -30,7 +30,7 @@ def main() -> None:
     for episode in range(NUM_EPISODES):
         difficulty = scheduler.difficulty
         env = OpenFrontEnv(
-            map_name="plains",
+            map_name="onion",
             seed=f"curriculum-{episode}",
             difficulty=difficulty,
             max_steps=40,

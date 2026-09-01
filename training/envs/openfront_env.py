@@ -45,14 +45,12 @@ class OpenFrontEnv(gym.Env):
 
     def __init__(
         self,
-        map_name: str = "plains",
+        map_name: str = "onion",
         seed: str = "train",
         difficulty: str = "medium",
-        spawn_turns: int = 3,
         ticks_per_step: int = 10,
         max_steps: int = 200,
         node_bin: str = "node",
-        dump_record: str | None = None,
         dump_game_record_dir: str | None = None,
     ) -> None:
         super().__init__()
@@ -61,11 +59,9 @@ class OpenFrontEnv(gym.Env):
         self.map_name = map_name
         self.default_seed = seed
         self.difficulty = difficulty
-        self.spawn_turns = spawn_turns
         self.ticks_per_step = ticks_per_step
         self.max_steps = max_steps
         self._node_bin = node_bin
-        self.dump_record = dump_record
         self.dump_game_record_dir = dump_game_record_dir
 
         self._proc: subprocess.Popen | None = None
@@ -155,11 +151,8 @@ class OpenFrontEnv(gym.Env):
             "seed": episode_seed,
             "map": self.map_name,
             "difficulty": self.difficulty,
-            "spawnTurns": self.spawn_turns,
             "ticksPerStep": self.ticks_per_step,
         }
-        if self.dump_record is not None:
-            reset_cmd["dumpRecord"] = self.dump_record
         if self.dump_game_record_dir is not None:
             reset_cmd["dumpGameRecordDir"] = self.dump_game_record_dir
         raw = self._send(reset_cmd)

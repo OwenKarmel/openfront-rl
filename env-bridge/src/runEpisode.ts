@@ -4,24 +4,26 @@
  *
  * Drives a full headless OpenFrontIO game through the real intent pipeline
  * (GameRunner + Executor, exactly like the browser client and the perf
- * harness do): AGENT is a Human player that spawns and then periodically
- * expands into neutral land; OPPONENT is a real Nation-AI player
- * (NationExecution) at the given --difficulty, making its own decisions
- * every tick exactly as it would in a production game.
+ * harness do), built the same way OpenFrontIO's own createGameRunner()
+ * builds one (real Config, real GameType.Singleplayer, a Nation-AI opponent
+ * drawn from the map's real manifest — see GameSetup.ts): AGENT is a Human
+ * player that spawns and then periodically expands into neutral land;
+ * OPPONENT is that Nation-AI player at the given --difficulty, making its
+ * own decisions every tick exactly as it would in a production game.
  *
  * This exists to prove the plumbing works before any RL code is written:
  *   - a full episode runs to completion without desync/crash
  *   - the same seed produces byte-identical game-state hashes every time
  *
  * Usage:
- *   npx tsx src/runEpisode.ts [--map plains] [--seed smoke-1] [--ticks 300]
- *                              [--spawn-turns 3] [--act-every 10]
- *                              [--difficulty medium]
+ *   npx tsx src/runEpisode.ts [--map onion] [--seed smoke-1] [--ticks 300]
+ *                              [--act-every 10] [--difficulty medium]
  *                              [--dump-game-record ../training/replays]
  *
  * --dump-game-record <dir> writes a full GameRecord (Episode.toGameRecord())
- * to <dir>/<wireGameID>.json, servable by ReplayServer.ts for watching in
- * the actual OpenFrontIO client — see README "Watching a game".
+ * to <dir>/<wireGameID>.json — verify it with OpenFrontIO's own
+ * `npm run replay:game -- <path>`, or watch it in a real browser via
+ * ReplayServer.ts — see README "Watching a game".
  */
 import fs from "fs";
 import path from "path";
@@ -33,10 +35,8 @@ interface Options {
   map: string;
   seed: string;
   ticks: number;
-  spawnTurns: number;
   actEvery: number;
   difficulty: Difficulty;
-  dumpRecord: string | undefined;
   dumpGameRecord: string | undefined;
 }
 
@@ -54,13 +54,11 @@ function parseDifficulty(name: string): Difficulty {
 
 function parseArgs(argv: string[]): Options {
   const opts: Options = {
-    map: "plains",
+    map: "onion",
     seed: "smoke-1",
     ticks: 300,
-    spawnTurns: 3,
     actEvery: 10,
     difficulty: Difficulty.Medium,
-    dumpRecord: undefined,
     dumpGameRecord: undefined,
   };
   for (let i = 0; i < argv.length; i++) {
@@ -80,17 +78,11 @@ function parseArgs(argv: string[]): Options {
       case "--ticks":
         opts.ticks = parseInt(next(), 10);
         break;
-      case "--spawn-turns":
-        opts.spawnTurns = parseInt(next(), 10);
-        break;
       case "--act-every":
         opts.actEvery = parseInt(next(), 10);
         break;
       case "--difficulty":
         opts.difficulty = parseDifficulty(next());
-        break;
-      case "--dump-record":
-        opts.dumpRecord = next();
         break;
       case "--dump-game-record":
         opts.dumpGameRecord = next();
@@ -113,12 +105,7 @@ interface EpisodeResult {
 async function runEpisode(opts: Options): Promise<EpisodeResult> {
   console.debug = () => {}; // silence per-tick debug logging
 
-  const episode = await Episode.create(
-    opts.map,
-    opts.seed,
-    opts.spawnTurns,
-    opts.difficulty,
-  );
+  const episode = await Episode.create(opts.map, opts.seed, opts.difficulty);
 
   const expandIntent: StampedIntent = {
     type: "attack",
@@ -131,18 +118,15 @@ async function runEpisode(opts: Options): Promise<EpisodeResult> {
     if (!episode.runTick(intents) || episode.isDone()) break;
   }
 
-  if (opts.dumpRecord) {
-    episode.writeReplayRecord(opts.dumpRecord);
-    console.log(`Wrote replay record to ${opts.dumpRecord}`);
-  }
   if (opts.dumpGameRecord) {
     fs.mkdirSync(opts.dumpGameRecord, { recursive: true });
     const gameID = episode.wireGameID();
     const outFile = path.join(opts.dumpGameRecord, `${gameID}.json`);
     fs.writeFileSync(outFile, JSON.stringify(episode.toGameRecord()));
     console.log(
-      `Wrote GameRecord to ${outFile} — with ReplayServer.ts running, ` +
-        `watch it at http://localhost:<vite-port>/game/${gameID}`,
+      `Wrote GameRecord to ${outFile} — verify with ` +
+        `\`npm run replay:game -- ${outFile}\` (from OpenFrontIO/), or watch ` +
+        `it at http://localhost:<vite-port>/game/${gameID} with ReplayServer.ts running.`,
     );
   }
 
@@ -177,7 +161,7 @@ async function main(): Promise<void> {
   const opts = parseArgs(process.argv.slice(2));
   console.log(
     `Running episode: map=${opts.map} seed=${opts.seed} ticks=${opts.ticks} ` +
-      `spawnTurns=${opts.spawnTurns} actEvery=${opts.actEvery} difficulty=${opts.difficulty}`,
+      `actEvery=${opts.actEvery} difficulty=${opts.difficulty}`,
   );
 
   const run1 = await runEpisode(opts);

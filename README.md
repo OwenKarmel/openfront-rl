@@ -16,25 +16,25 @@ MuZero/EfficientZero, action/observation space, phased milestones).
   (`GameRunner` + `Executor`, the same pipeline the browser client and
   server use) via Node, so an RL agent can control a player through the
   same `Intent` protocol as a human.
-  - `src/GameSetup.ts` — shared episode setup/teardown (`Episode` class):
-    builds AGENT (a controllable Human player) and OPPONENT (a real
-    built-in Nation-AI player, `NationExecution`, at a selectable
-    `Difficulty`) on either a tiny test map or a real production map.
-  - `src/EnvConfig.ts` — deterministic combat config (fixed attack
-    attrition, zero spawn immunity) with a settable short spawn phase, so
-    RL episodes are reproducible and don't burn ticks on setup.
+  - `src/GameSetup.ts` — shared episode setup (`Episode` class): builds AGENT
+    (a controllable Human player) and OPPONENT (a real built-in Nation-AI
+    player, `NationExecution`, at a selectable `Difficulty`, drawn from the
+    map's real manifest) on a real production map. Construction mirrors
+    OpenFrontIO's own `createGameRunner()` step-for-step — real `Config`
+    (not a simplified test stand-in), real `GameType.Singleplayer`, real
+    player/nation id derivation via `PseudoRandom.nextID()` — so an episode
+    reconstructs identically wherever it's loaded (see "Why real
+    construction matters" below).
   - `src/runEpisode.ts` — headless smoke test / determinism check, with a
-    `--dump-record <path>` flag to write a replayable turn log.
+    `--dump-game-record <dir>` flag to write a full `GameRecord`.
   - `src/EnvServer.ts` — long-lived process speaking a newline-JSON
     reset/step protocol over stdin/stdout (see file header for the wire
     format and action space).
-  - `src/verifyRecord.ts` — headless replay verification for a dumped turn
-    log (re-simulates it and diffs hash checkpoints).
   - `src/ReplayServer.ts` — tiny local HTTP server (defaults to port 8787,
     which a plain `npm run dev` client already checks by default) serving
     `GET /game/:id` from a directory of `Episode.toGameRecord()` dumps, so
-    a training episode can be watched in the real OpenFrontIO browser
-    client — see "Watching a game" below.
+    an episode can be watched in the real OpenFrontIO browser client — see
+    "Watching a game" below.
 - `training/` — Python.
   - `envs/openfront_env.py` — `gymnasium.Env` wrapping `EnvServer.ts` over a
     subprocess. Single-agent: AGENT is controlled by `step(action)`;
@@ -47,6 +47,43 @@ MuZero/EfficientZero, action/observation space, phased milestones).
     masked) policy; none of them are the actual training loop.
   - PPO/network code: not yet built (Phase 3).
 - `kaggle/` — not yet built (Kaggle burst-training notebooks, Phase 3+).
+
+## Why real construction matters (train/deploy fidelity)
+
+Earlier versions of this project used a `TestConfig`-derived config (fast,
+deterministic attack attrition — a flat 1 troop lost per side per tick,
+regardless of army size or terrain) and a hand-built synthetic opponent
+that bypassed the map's real nation list. That was fast to iterate on, but
+it meant training happened under game mechanics that barely resembled
+production: real `Config.attackLogic()` scales troop loss and conquest
+speed with troop density, terrain, relative army size, and outnumbered
+ratio — nothing like a flat constant — and real spawn immunity is 50 ticks,
+not 0. A policy trained under the fake mechanics would face serious
+distributional shift the moment it played a real game.
+
+`Episode` now uses real `Config` and mirrors `createGameRunner()` (the
+literal function both live games and the client's own archived-game replay
+path use) exactly: same player/nation construction order, same PRNG draw
+sequence, same `GameType.Singleplayer` a real solo-vs-AI game uses. This
+buys two things at once: training happens under real mechanics, and a
+dumped episode is byte-for-byte reproducible by OpenFrontIO's own tooling
+and the real client — there's exactly one construction path to keep
+faithful, not a fast one and a separate "faithful" one to keep in sync.
+Concretely this also means:
+
+- `resolveMap()` now only supports real production maps (`resources/maps/`)
+  for training/eval — `tests/testdata/` fixtures have no real `GameMapType`
+  or manifest nations, both of which the real construction needs. (Fixture
+  support still exists in the code but isn't used by default; it would only
+  make sense for a throwaway wiring test that doesn't care about fidelity.)
+- OPPONENT's identity is resolved dynamically per episode
+  (`game.nations()[0].playerInfo.id`) rather than a fixed constant — which
+  real nation you get (name, flag, spawn location) depends deterministically
+  on the map and seed, exactly like a real game.
+- The spawn phase isn't artificially shortened — real `Singleplayer` games
+  end it the instant the human spawns anyway (confirmed empirically:
+  episodes still start fast), so there was no actual fidelity/speed
+  trade-off to make here.
 
 ## Action space
 
@@ -68,18 +105,15 @@ legality.
 - **Quick debugging** (works today): any observation's `tile_grid` (Python)
   / `obs.tileGrid` (Node) is a flat ownership array (0=neutral, 1=agent,
   2=opponent) you can plot directly (e.g. `matplotlib.pyplot.imshow`).
-- **Headless replay verification** (works today): pass a real map —
-  `--map onion` (smallest production map) instead of a `tests/testdata/`
-  fixture — to `runEpisode.ts`/`OpenFrontEnv`, plus `--dump-record <path>` /
-  `dump_record=<path>`, to write a turn log with real hash checkpoints.
-  Verify it with `env-bridge`'s own `npx tsx src/verifyRecord.ts <path>`
-  (re-simulates the turns through a fresh episode and diffs hashes).
-  - **Not** OpenFrontIO's own `npm run replay:game`: that script
-    reconstructs players via `random.nextID()` and a production `Config`,
-    neither of which matches how env-bridge builds episodes (fixed
-    `AGENT`/`OPPONENT` ids, `EnvConfig`'s deterministic combat) — the two
-    diverge from tick 0 even though both are internally deterministic. Our
-    own turn logs verify correctly with `verifyRecord.ts` instead.
+- **Headless replay verification** (works today, via OpenFrontIO's own
+  unmodified tooling): dump a `GameRecord` (`--dump-game-record <dir>` /
+  `dump_game_record_dir=<dir>`), then from `OpenFrontIO/`:
+  `npm run replay:game -- <path/to/dumped/record.json>`. Reports "Replay is
+  IN SYNC with the recorded game" — confirmed working (0 mismatches across
+  every hash checkpoint) once `Episode`'s construction was made to match
+  `createGameRunner()` exactly; earlier versions of this project needed a
+  bespoke verifier (`verifyRecord.ts`, now deleted) because their episodes
+  couldn't be reconstructed by OpenFrontIO's own tooling.
 - **Full visual playback in the actual browser client** (built and
   verified as far as this environment allows):
   ```bash
@@ -87,35 +121,41 @@ legality.
   cd env-bridge
   npx tsx --tsconfig ../OpenFrontIO/tsconfig.json src/runEpisode.ts \
     --map onion --difficulty impossible --dump-game-record ../training/replays
-  # -> prints the watch URL, e.g. .../game/772632da
+  # -> prints the watch URL, e.g. .../game/c86a25e4
 
   # 2. Serve it (defaults to port 8787 — the address a plain `npm run dev`
   #    client already checks with zero configuration)
   npx tsx --tsconfig ../OpenFrontIO/tsconfig.json src/ReplayServer.ts
 
   # 3. In OpenFrontIO/: npm run dev, then open the printed URL, e.g.
-  #    http://localhost:9000/game/772632da
+  #    http://localhost:9000/game/c86a25e4
   ```
   `EnvServer.ts`'s `reset` also takes `dumpGameRecordDir` (Python:
   `OpenFrontEnv(dump_game_record_dir=...)`) to do the same from a training
   run. Built via `Episode.toGameRecord()`, which reuses
   `createPartialGameRecord` (the same helper the real server uses to
-  archive games) — validated directly against `GameRecordSchema.safeParse`
-  (passes) and, live: `JoinLobbyModal.checkArchivedGame()` in an actual
-  running dev client fetches it, accepts it, and proceeds into
-  `handleJoinLobby` (confirmed via console/network logs). One fix needed
-  along the way: `ReplayServer.ts`'s CORS headers must echo the request's
-  `Origin` (not `Access-Control-Allow-Origin: *`) and set
-  `Access-Control-Allow-Credentials: true`, since several of the client's
-  other `apiBase`-directed calls (auth refresh, cosmetics, news) use
-  `credentials: "include"`, which a wildcard origin can't satisfy.
-  - **Two things this project's constants had to satisfy that weren't
-    obvious upfront**: `GAME_ID_REGEX` requires exactly 8 alphanumeric
-    characters for both `gameID` and every player `clientID` — env-bridge's
-    episode seeds (e.g. `"onion-42"`) don't qualify, so `toGameRecord()`
-    derives a stable 8-char id via `wireGameID()` (sha256 of the seed,
-    truncated), and `AGENT_CLIENT_ID` itself had to become an 8-char value
-    (`"AGENTAAA"`) rather than `"AGENT"`.
+  archive games). Confirmed working end-to-end against a real running dev
+  client: no desync popup (previously reproduced and fixed — see below),
+  `checkArchivedGame()` fetches/accepts the record and proceeds into
+  `handleJoinLobby`.
+  - **The desync bug that motivated the real-construction rework**: an
+    earlier version's episodes desynced the moment the real client tried to
+    replay them (`GameRecord` reconstruction failed at turn 110 with a
+    hash mismatch). Root cause was two-fold: (1) the live simulation was
+    seeded from a different `gameID` than what got written into the dumped
+    record, so the client's `PseudoRandom` reseeded from the wrong value
+    immediately; (2) episodes bypassed real player/nation construction
+    (`createNationsForGame`, `PseudoRandom.nextID()`-derived ids) with
+    fixed constants and a hand-built opponent, which the client's
+    reconstruction — the same `createGameRunner()` code path used for both
+    live play and replay — could never regenerate to match. Both are fixed
+    now: `Episode` uses one canonical gameID everywhere and mirrors real
+    construction exactly (see "Why real construction matters" above).
+  - `ReplayServer.ts`'s CORS headers must echo the request's `Origin` (not
+    `Access-Control-Allow-Origin: *`) and set
+    `Access-Control-Allow-Credentials: true`, since several of the client's
+    other `apiBase`-directed calls (auth refresh, cosmetics, news) use
+    `credentials: "include"`, which a wildcard origin can't satisfy.
   - **Not independently confirmed**: pixels actually on screen. This dev
     environment's headless Chromium hits OpenFrontIO's `WebGLGate`
     (`src/client/components/WebGLGate.ts`) — a deliberate hard block on
@@ -126,7 +166,9 @@ legality.
     independent of anything built here). In a normal desktop browser with
     real GPU acceleration, the gate doesn't trigger and the confirmed
     server-side chain above (record generated → validated → fetched →
-    accepted by the client) is exactly what feeds the renderer.
+    accepted by the client, no desync) is exactly what feeds the renderer —
+    and this has been spot-checked from a real browser (via port-forwarding
+    into this dev environment), confirming rendering does work.
 
 ## Setup
 
@@ -145,7 +187,7 @@ for the initial installs.
 ```bash
 # TypeScript: episode vs. a real Nation-AI opponent, determinism check
 cd env-bridge
-npm run smoke -- --map plains --seed smoke-1 --ticks 300 --difficulty hard
+npm run smoke -- --map onion --seed smoke-1 --ticks 300 --difficulty hard
 
 # Python: gymnasium round-trip against the same real opponent
 cd ../training
@@ -155,11 +197,12 @@ python smoke_test.py
 # at "easy"; only a real policy earns promotions)
 python curriculum_demo.py
 
-# Headless replay verification on a real map
+# Headless replay verification via OpenFrontIO's own stock tooling
 cd ../env-bridge
 npx tsx --tsconfig ../OpenFrontIO/tsconfig.json src/runEpisode.ts \
-  --map onion --difficulty impossible --dump-record /tmp/record.json
-npx tsx --tsconfig ../OpenFrontIO/tsconfig.json src/verifyRecord.ts /tmp/record.json
+  --map onion --difficulty impossible --dump-game-record ../training/replays
+cd ../OpenFrontIO
+npm run replay:game -- ../training/replays/<gameID>.json
 ```
 
 ## Status
@@ -170,17 +213,22 @@ npx tsx --tsconfig ../OpenFrontIO/tsconfig.json src/verifyRecord.ts /tmp/record.
       gymnasium wrapper; a real built-in Nation-AI opponent (selectable
       Easy/Medium/Hard/Impossible, the same `NationExecution` code driving
       production games) wired in as OPPONENT; a 3-action space with legal-
-      action masking; headless replay verification on real production maps
-      (with a real terrain-caching bug found and fixed along the way); a
-      windowed win-rate curriculum scheduler. All verified end-to-end,
-      including through the full Python↔subprocess↔sim path.
+      action masking; a windowed win-rate curriculum scheduler. All
+      verified end-to-end, including through the full Python↔subprocess↔sim
+      path.
+- [x] Faithful train/eval construction: `Episode` now mirrors
+      `createGameRunner()` exactly (real `Config`, real
+      `GameType.Singleplayer`, real manifest-drawn opponent, one canonical
+      gameID) instead of a simplified `TestConfig`-based stand-in — closing
+      a real distributional-shift gap between training mechanics and
+      production mechanics, and making dumped episodes verifiable by
+      OpenFrontIO's own unmodified `npm run replay:game` and watchable in
+      the real client with no desync.
 - [x] Visual playback: `Episode.toGameRecord()` + `ReplayServer.ts` let the
-      real OpenFrontIO browser client load and watch a training episode
-      (`GET /game/:id`, strictly schema-validated, no fallback) — confirmed
-      the client accepts and processes a generated record end-to-end;
-      actual on-screen rendering isn't independently confirmed in this
-      headless dev environment (a pre-existing WebGL software-rendering
-      gate blocks it here — see "Watching a game" above).
+      real OpenFrontIO browser client load and watch an episode
+      (`GET /game/:id`, strictly schema-validated) with no desync — verified
+      both headlessly (stock `replay:game`, IN SYNC) and live against a real
+      running dev client (via a real desktop browser, port-forwarded in).
 - [ ] Phase 3: PPO network + training loop; beat the Impossible-difficulty
       Nation bot 1v1 (v1 milestone).
 - [ ] Phase 4 (stretch): scale-up, self-play league.
