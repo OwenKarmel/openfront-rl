@@ -56,6 +56,7 @@ class OpenFrontEnv(gym.Env):
         max_steps: int = 200,
         opponent_policy: Callable[[dict[str, Any]], str] = always_expand,
         node_bin: str = "node",
+        dump_record: str | None = None,
     ) -> None:
         super().__init__()
         self.map_name = map_name
@@ -65,6 +66,7 @@ class OpenFrontEnv(gym.Env):
         self.max_steps = max_steps
         self.opponent_policy = opponent_policy
         self._node_bin = node_bin
+        self.dump_record = dump_record
 
         self._proc: subprocess.Popen | None = None
         self._step_count = 0
@@ -145,15 +147,16 @@ class OpenFrontEnv(gym.Env):
         super().reset(seed=seed)
         self._ensure_process()
         episode_seed = f"{self.default_seed}-{seed}" if seed is not None else self.default_seed
-        raw = self._send(
-            {
-                "cmd": "reset",
-                "seed": episode_seed,
-                "map": self.map_name,
-                "spawnTurns": self.spawn_turns,
-                "ticksPerStep": self.ticks_per_step,
-            }
-        )
+        reset_cmd: dict[str, Any] = {
+            "cmd": "reset",
+            "seed": episode_seed,
+            "map": self.map_name,
+            "spawnTurns": self.spawn_turns,
+            "ticksPerStep": self.ticks_per_step,
+        }
+        if self.dump_record is not None:
+            reset_cmd["dumpRecord"] = self.dump_record
+        raw = self._send(reset_cmd)
         self._step_count = 0
         self._last_obs = raw
         return self._to_gym_obs(raw), {"legal_actions": raw["legalActions"]}

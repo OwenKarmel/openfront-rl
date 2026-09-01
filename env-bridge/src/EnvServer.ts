@@ -16,11 +16,17 @@
  * dozen ticks rather than every tick, and keeps episode length manageable.
  *
  * Protocol (one JSON object per line each direction):
- *   -> {"cmd":"reset","seed":"...","map":"plains","spawnTurns":3,"ticksPerStep":10}
+ *   -> {"cmd":"reset","seed":"...","map":"plains","spawnTurns":3,"ticksPerStep":10,
+ *       "dumpRecord":"/path/to/record.json"}
  *   <- {"obs":{...},"legalActions":{...},"done":false}
  *   -> {"cmd":"step","actions":{"AGENT":"expand","OPPONENT":"noop"}}
  *   <- {"obs":{...},"reward":{...},"done":false,"legalActions":{...},"info":{...}}
  *   -> {"cmd":"close"}
+ *
+ * `dumpRecord` (optional, on reset) writes every turn of the episode to a
+ * replayable JSON file — see Episode.writeReplayRecord — once the episode
+ * ends (done:true from step) or the session is closed, whichever comes
+ * first.
  */
 import readline from "readline";
 import { Game, Player } from "../../OpenFrontIO/src/core/game/Game";
@@ -36,6 +42,7 @@ interface ResetCmd {
   map: string;
   spawnTurns?: number;
   ticksPerStep?: number;
+  dumpRecord?: string;
 }
 interface StepCmd {
   cmd: "step";
@@ -124,6 +131,7 @@ class Session {
   height = 0;
   ticksPerStep = 10;
   prevPotential: Record<string, number> = {};
+  dumpRecordPath: string | undefined;
 
   async reset(cmd: ResetCmd): Promise<object> {
     this.episode = await Episode.create(
@@ -134,6 +142,7 @@ class Session {
     this.width = this.episode.game.width();
     this.height = this.episode.game.height();
     this.ticksPerStep = cmd.ticksPerStep ?? 10;
+    this.dumpRecordPath = cmd.dumpRecord;
     for (const p of PLAYERS) {
       this.prevPotential[p] = potential(this.episode.game, p);
     }
@@ -181,6 +190,8 @@ class Session {
       reward[p] = r;
     }
 
+    if (done) this.flushRecord();
+
     return {
       obs: observation(episode.game, this.width, this.height),
       reward,
@@ -188,6 +199,14 @@ class Session {
       legalActions: legalActions(episode),
       info: { ticks: episode.game.ticks() },
     };
+  }
+
+  /** Writes the pending replay record (if any dumpRecord path was set on reset). */
+  flushRecord(): void {
+    if (this.episode && this.dumpRecordPath) {
+      this.episode.writeReplayRecord(this.dumpRecordPath);
+      this.dumpRecordPath = undefined;
+    }
   }
 }
 
@@ -214,6 +233,7 @@ async function main(): Promise<void> {
         const res = session.step(cmd);
         process.stdout.write(JSON.stringify(res) + "\n");
       } else if (cmd.cmd === "close") {
+        session.flushRecord();
         process.exit(0);
       } else {
         process.stdout.write(
