@@ -15,41 +15,8 @@
  *   npx tsx src/runEpisode.ts [--map plains] [--seed smoke-1] [--ticks 300]
  *                              [--spawn-turns 3] [--act-every 10]
  */
-import fs from "fs";
-import path from "path";
-import { fileURLToPath } from "url";
-import { Executor } from "../../OpenFrontIO/src/core/execution/ExecutionManager";
-import {
-  Difficulty,
-  GameMapSize,
-  GameMapType,
-  GameMode,
-  GameType,
-  PlayerInfo,
-  PlayerType,
-} from "../../OpenFrontIO/src/core/game/Game";
-import { createGame } from "../../OpenFrontIO/src/core/game/GameImpl";
-import {
-  GameUpdateType,
-  HashUpdate,
-} from "../../OpenFrontIO/src/core/game/GameUpdates";
-import {
-  genTerrainFromBin,
-  MapManifest,
-} from "../../OpenFrontIO/src/core/game/TerrainMapLoader";
-import { UserSettings } from "../../OpenFrontIO/src/core/game/UserSettings";
-import { GameRunner } from "../../OpenFrontIO/src/core/GameRunner";
-import { GameConfig, StampedIntent, Turn } from "../../OpenFrontIO/src/core/Schemas";
-import { EnvConfig } from "./EnvConfig";
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const TESTDATA_MAPS = path.join(
-  __dirname,
-  "../../OpenFrontIO/tests/testdata/maps",
-);
-
-const AGENT_CLIENT_ID = "AGENT";
-const OPPONENT_CLIENT_ID = "OPPONENT";
+import { AGENT_CLIENT_ID, Episode, OPPONENT_CLIENT_ID } from "./GameSetup";
+import { StampedIntent } from "../../OpenFrontIO/src/core/Schemas";
 
 interface Options {
   map: string;
@@ -57,6 +24,7 @@ interface Options {
   ticks: number;
   spawnTurns: number;
   actEvery: number;
+  dumpRecord: string | undefined;
 }
 
 function parseArgs(argv: string[]): Options {
@@ -66,6 +34,7 @@ function parseArgs(argv: string[]): Options {
     ticks: 300,
     spawnTurns: 3,
     actEvery: 10,
+    dumpRecord: undefined,
   };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -90,6 +59,9 @@ function parseArgs(argv: string[]): Options {
       case "--act-every":
         opts.actEvery = parseInt(next(), 10);
         break;
+      case "--dump-record":
+        opts.dumpRecord = next();
+        break;
       default:
         throw new Error(`unknown argument: ${arg}`);
     }
@@ -104,126 +76,11 @@ interface EpisodeResult {
   players: { name: string; alive: boolean; tiles: number; troops: number; gold: number }[];
 }
 
-/** Scans outward in a square spiral from (x0, y0) for the nearest land tile. */
-function findLandTile(
-  game: ReturnType<typeof createGame>,
-  x0: number,
-  y0: number,
-): number {
-  const map = game.map();
-  const w = game.width();
-  const h = game.height();
-  for (let r = 0; r < Math.max(w, h); r++) {
-    for (let dx = -r; dx <= r; dx++) {
-      for (let dy = -r; dy <= r; dy++) {
-        if (Math.max(Math.abs(dx), Math.abs(dy)) !== r) continue;
-        const x = x0 + dx;
-        const y = y0 + dy;
-        if (x < 0 || x >= w || y < 0 || y >= h) continue;
-        const ref = map.ref(x, y);
-        if (map.isLand(ref)) return ref;
-      }
-    }
-  }
-  throw new Error("no land tile found on map");
-}
-
 async function runEpisode(opts: Options): Promise<EpisodeResult> {
   console.debug = () => {}; // silence per-tick debug logging
 
-  const mapDir = path.join(TESTDATA_MAPS, opts.map);
-  const mapBinBuffer = fs.readFileSync(path.join(mapDir, "map.bin"));
-  const miniMapBinBuffer = fs.readFileSync(path.join(mapDir, "map4x.bin"));
-  const manifest = JSON.parse(
-    fs.readFileSync(path.join(mapDir, "manifest.json"), "utf8"),
-  ) as MapManifest;
+  const episode = await Episode.create(opts.map, opts.seed, opts.spawnTurns);
 
-  const gameMap = await genTerrainFromBin(manifest.map, mapBinBuffer);
-  const miniGameMap = await genTerrainFromBin(manifest.map4x, miniMapBinBuffer);
-
-  const gameConfig: GameConfig = {
-    // Placeholder: irrelevant once terrain is loaded directly from testdata,
-    // but the field is required by the schema.
-    gameMap: GameMapType.Asia,
-    gameMapSize: GameMapSize.Normal,
-    gameMode: GameMode.FFA,
-    gameType: GameType.Public,
-    difficulty: Difficulty.Medium,
-    nations: "disabled",
-    donateGold: false,
-    donateTroops: false,
-    bots: 0,
-    infiniteGold: false,
-    infiniteTroops: false,
-    instantBuild: false,
-    randomSpawn: false,
-  };
-
-  const humans = [
-    new PlayerInfo("Agent", PlayerType.Human, AGENT_CLIENT_ID, AGENT_CLIENT_ID),
-    new PlayerInfo(
-      "Opponent",
-      PlayerType.Human,
-      OPPONENT_CLIENT_ID,
-      OPPONENT_CLIENT_ID,
-    ),
-  ];
-
-  const config = new EnvConfig(gameConfig, new UserSettings(), opts.spawnTurns);
-  const game = createGame(humans, [], gameMap, miniGameMap, config);
-
-  let lastHash: HashUpdate | undefined;
-  let fatalError: string | undefined;
-  const runner = new GameRunner(
-    game,
-    new Executor(game, opts.seed, undefined),
-    (gu) => {
-      if ("errMsg" in gu) {
-        fatalError = `${gu.errMsg}\n${gu.stack ?? ""}`;
-        return;
-      }
-      const hashes = gu.updates[GameUpdateType.Hash] as HashUpdate[];
-      if (hashes.length > 0) {
-        lastHash = hashes[hashes.length - 1];
-      }
-    },
-  );
-  runner.init();
-
-  let turnNumber = 0;
-  const runTick = (intents: StampedIntent[] = []): boolean => {
-    const turn: Turn = { turnNumber: turnNumber++, intents };
-    runner.addTurn(turn);
-    const ok = runner.executeNextTick();
-    if (fatalError !== undefined) {
-      throw new Error(`game errored at tick ${game.ticks()}:\n${fatalError}`);
-    }
-    return ok;
-  };
-
-  // Spawn: both players pick tiles on the very first turn.
-  const w = game.width();
-  const h = game.height();
-  const agentTile = findLandTile(game, Math.floor(w * 0.15), Math.floor(h * 0.5));
-  const opponentTile = findLandTile(
-    game,
-    Math.floor(w * 0.85),
-    Math.floor(h * 0.5),
-  );
-  runTick([
-    { type: "spawn", tile: agentTile, clientID: AGENT_CLIENT_ID },
-    { type: "spawn", tile: opponentTile, clientID: OPPONENT_CLIENT_ID },
-  ]);
-
-  const maxSpawnTurns = opts.spawnTurns + 5;
-  while (game.inSpawnPhase()) {
-    if (turnNumber > maxSpawnTurns) {
-      throw new Error(`spawn phase did not end after ${maxSpawnTurns} turns`);
-    }
-    runTick();
-  }
-
-  // Main phase: periodically expand into neutral land so territory changes.
   const expandIntent = (clientID: string): StampedIntent => ({
     type: "attack",
     targetID: null,
@@ -235,14 +92,19 @@ async function runEpisode(opts: Options): Promise<EpisodeResult> {
       i % opts.actEvery === 0
         ? [expandIntent(AGENT_CLIENT_ID), expandIntent(OPPONENT_CLIENT_ID)]
         : [];
-    if (!runTick(intents)) break;
+    if (!episode.runTick(intents) || episode.isDone()) break;
+  }
+
+  if (opts.dumpRecord) {
+    episode.writeReplayRecord(opts.dumpRecord);
+    console.log(`Wrote replay record to ${opts.dumpRecord}`);
   }
 
   return {
-    ticks: game.ticks(),
-    finalHash: lastHash?.hash?.toString(),
-    finalHashTick: lastHash?.tick,
-    players: game.players().map((p) => ({
+    ticks: episode.game.ticks(),
+    finalHash: episode.lastHash?.hash?.toString(),
+    finalHashTick: episode.lastHash?.tick,
+    players: episode.game.players().map((p) => ({
       name: p.name(),
       alive: p.isAlive(),
       tiles: p.numTilesOwned(),

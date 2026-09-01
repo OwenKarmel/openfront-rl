@@ -15,10 +15,39 @@ MuZero/EfficientZero, action/observation space, phased milestones).
 - `env-bridge/` — TypeScript. Drives the real headless simulation
   (`GameRunner` + `Executor`, the same pipeline the browser client and
   server use) via Node, so an RL agent can control a player through the
-  same `Intent` protocol as a human. `src/runEpisode.ts` is currently a
-  Phase-1 smoke test / determinism check (no policy yet — see below).
-- `training/`, `kaggle/` — not yet built (Phase 2+: PyTorch PPO, self-play
-  league, Kaggle burst-training notebooks).
+  same `Intent` protocol as a human.
+  - `src/GameSetup.ts` — shared episode setup/teardown (`Episode` class).
+  - `src/runEpisode.ts` — Phase-1 smoke test / determinism check, and a
+    `--dump-record <path>` flag to write a replayable turn log.
+  - `src/EnvServer.ts` — Phase-2 long-lived process speaking a newline-JSON
+    reset/step protocol over stdin/stdout (see file header for the wire
+    format). Minimal action space so far: `noop` / `expand`.
+- `training/` — Python.
+  - `envs/openfront_env.py` — `gymnasium.Env` wrapping `EnvServer.ts` over a
+    subprocess.
+  - `smoke_test.py` — random-policy round-trip check of the whole stack.
+  - PPO/network/curriculum code: not yet built (Phase 3).
+- `kaggle/` — not yet built (Kaggle burst-training notebooks, Phase 3+).
+
+## Watching a game
+
+Two tiers, both working today:
+
+- **Quick debugging**: any observation's `tile_grid` (Python) /
+  `obs.tileGrid` (Node) is a flat ownership array (0=neutral, 1=agent,
+  2=opponent) you can plot directly (e.g. `matplotlib.pyplot.imshow`).
+- **Replayable turn log**: `runEpisode.ts --dump-record <path>` writes every
+  turn played to a JSON file shaped like an OpenFrontIO `GameRecord`, which
+  `npm run replay:game -- <path>` (from `OpenFrontIO/`) re-runs headlessly
+  and verifies hash-for-hash.
+  - **Known gap**: episodes currently run on tiny files under
+    `tests/testdata/maps/`, which aren't a real `GameMapType`, so the
+    dumped record's `config.gameMap` is a placeholder OpenFrontIO's own
+    replay/client tooling can't resolve to matching terrain. Watching a
+    training episode in the actual browser client (full visual playback,
+    including from a Kaggle run) needs episodes to run on a real (ideally
+    tiny) production map under `resources/maps/` instead — not yet wired
+    up.
 
 ## Setup
 
@@ -54,7 +83,13 @@ smallest is `ocean_and_land`), `--seed <string>`, `--ticks <n>`,
 
 - [x] Phase 1: env-bridge scaffold, headless episode runner, determinism
       verified on `plains` and `ocean_and_land`.
-- [ ] Phase 2: Gym-like reset/step API + Python wrapper, curriculum vs.
-      Easy/Medium/Hard bots.
-- [ ] Phase 3: beat the Impossible-difficulty Nation bot 1v1 (v1 milestone).
+- [x] Phase 2 (core plumbing): `EnvServer.ts` reset/step protocol +
+      `openfront_env.py` gymnasium wrapper, verified end-to-end with a
+      random policy (`training/smoke_test.py`). Action space is still just
+      `noop`/`expand` against a scripted "always expand" opponent — no real
+      Nation/bot difficulty wired in yet, no PPO network yet.
+- [ ] Phase 2 remainder: wire a real Nation-AI opponent (Easy → Impossible)
+      into `EnvServer.ts`/`Episode`, richer action space, curriculum.
+- [ ] Phase 3: PPO network + training loop; beat the Impossible-difficulty
+      Nation bot 1v1 (v1 milestone).
 - [ ] Phase 4 (stretch): scale-up, self-play league.
