@@ -1,0 +1,12 @@
+{
+  "name": "env-bridge",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "smoke": "tsx --tsconfig ../OpenFrontIO/tsconfig.json src/runEpisode.ts"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}
