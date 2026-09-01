@@ -147,9 +147,23 @@ function legalActions(episode: Episode): Action[] {
   return actions;
 }
 
-/** Potential function for reward shaping: AGENT's owned tile count. */
+/**
+ * Potential function for reward shaping: AGENT's owned tile count MINUS
+ * OPPONENT's. Deliberately relative, not just AGENT's own count: with only
+ * AGENT's count, expanding into neutral land and attacking OPPONENT are
+ * reward-equivalent per tile gained, but attacking is strictly riskier
+ * (contested combat, troop losses) with no offsetting benefit — so the
+ * reward-maximizing policy has no incentive to ever fight, only to expand
+ * into neutral land forever (confirmed empirically: policy entropy
+ * collapsed to ~0 within ~10 updates, converging fast onto "always expand,
+ * never attack" — an easy, low-variance local optimum under the old
+ * single-sided reward). Subtracting OPPONENT's delta makes damaging them
+ * earn reward too, not just growing AGENT's own territory.
+ */
 function potential(episode: Episode): number {
-  return player(episode.game, episode.agentId).numTilesOwned();
+  const agentTiles = player(episode.game, episode.agentId).numTilesOwned();
+  const opponentTiles = player(episode.game, episode.opponentId).numTilesOwned();
+  return agentTiles - opponentTiles;
 }
 
 function intentFor(action: Action, opponentId: string): StampedIntent | null {
@@ -215,8 +229,8 @@ class Session {
       }
     }
 
-    // Potential-based shaping (AGENT tile-count delta), plus a dominant
-    // terminal win/loss term once the episode ends.
+    // Potential-based shaping (relative tile-count delta -- see potential()),
+    // plus a dominant terminal win/loss term once the episode ends.
     const newPotential = potential(episode);
     let reward = (newPotential - this.prevPotential) * 0.01;
     this.prevPotential = newPotential;

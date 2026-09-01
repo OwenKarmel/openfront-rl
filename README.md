@@ -290,8 +290,19 @@ npm run replay:game -- ../training/replays/<gameID>.json
       checkpoint, and produces eval `GameRecord`s that pass
       `npm run replay:game` IN SYNC even on a full ~3000-tick episode.
       **Not yet done**: actual training to convergence — this is the
-      infrastructure, not a trained agent. Nothing here has run for more
-      than a few minutes/updates.
+      infrastructure, not a trained agent.
+- [x] First real training run caught a genuine bug fast: the original
+      single-sided reward (`0.01 * Δagent_tiles`) gave no incentive to ever
+      attack OPPONENT (expanding into neutral land was reward-equivalent
+      per tile and strictly safer), and policy entropy collapsed to ~0
+      within ~10 updates as it locked onto "expand forever, never fight."
+      Fixed by making the reward relative (`Δ(agent_tiles - opponent_tiles)`
+      — see FAQ), plus reducing PPO's minibatch size below the full
+      rollout batch (was accidentally doing one full-batch gradient step
+      per epoch instead of several smaller, noisier ones) and a modest
+      entropy-coefficient bump. Confirmed healthier over a 15-update
+      validation run (entropy holding around 0.7-0.86, not collapsing) —
+      a real long run is in progress against this fix.
 - [ ] v1 milestone: train to consistently beat the Impossible-difficulty
       Nation bot 1v1 — the actual multi-hour-plus training run(s), likely
       spanning local + Kaggle sessions per the original compute plan.
@@ -343,14 +354,21 @@ above): `noop`, `expand` (attack neutral land bordering AGENT), and
 share a border and both sides are alive). `legal_actions`/`action_mask`
 are provided every step so illegal choices are never sampled.
 
-**What is the reward formula?** From `EnvServer.ts`'s `step()`:
-`reward = 0.01 * (agent_tiles_now - agent_tiles_before)` every decision
-step (potential-based shaping on AGENT's own owned-tile count — an
-increase gives positive reward, a decrease negative, regardless of what
-OPPONENT does), **plus**, only on the step the episode ends: `+1` if AGENT
-is alive and OPPONENT isn't (a win), `-1` if the reverse (a loss), `+0`
-otherwise (a truncation with both still alive). There's no separate
-reward for gold/troops/build actions yet — territory and the terminal
+**What is the reward formula?** From `EnvServer.ts`'s `step()`/`potential()`:
+`reward = 0.01 * Δ(agent_tiles - opponent_tiles)` every decision step —
+potential-based shaping on the *relative* tile-count margin, not just
+AGENT's own count — **plus**, only on the step the episode ends: `+1` if
+AGENT is alive and OPPONENT isn't (a win), `-1` if the reverse (a loss),
+`+0` otherwise (a truncation with both still alive). It's deliberately
+relative: an earlier single-sided version (`0.01 * Δagent_tiles` alone)
+made expanding into neutral land and attacking OPPONENT reward-equivalent
+per tile, with attacking strictly riskier for no extra reward — the
+policy predictably learned to expand into neutral land forever and never
+fight, and its action-distribution entropy collapsed to ~0 within about
+10 training updates as it locked onto that easy local optimum. Subtracting
+OPPONENT's delta makes damaging them earn reward too, giving actual
+pressure to explore `attack_opponent`. There's still no separate reward
+for gold/troops/build actions — territory margin and the terminal
 win/loss are the entire signal for now.
 
 **How is the agent and its opponent placed initially — is it random?**

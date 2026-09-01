@@ -57,9 +57,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--gamma", type=float, default=0.99)
     p.add_argument("--gae-lambda", type=float, default=0.95)
     p.add_argument("--clip-eps", type=float, default=0.2)
-    p.add_argument("--entropy-coef", type=float, default=0.01)
+    p.add_argument("--entropy-coef", type=float, default=0.02)
     p.add_argument("--epochs", type=int, default=4)
-    p.add_argument("--minibatch-size", type=int, default=256)
+    # Deliberately well below the default full-rollout batch size
+    # (num_envs * rollout_length = 256) -- a single full-batch gradient step
+    # per epoch converges (and can collapse policy entropy) much faster than
+    # several smaller, noisier minibatch steps do; this was a real
+    # contributor to an observed near-total entropy collapse within ~10
+    # updates in an earlier run.
+    p.add_argument("--minibatch-size", type=int, default=64)
     p.add_argument("--curriculum-window", type=int, default=20)
     p.add_argument("--checkpoint-dir", default=str(Path(__file__).parent / "checkpoints"))
     p.add_argument("--checkpoint-every", type=int, default=20, help="updates between checkpoints")
