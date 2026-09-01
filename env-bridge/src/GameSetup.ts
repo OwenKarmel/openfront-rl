@@ -13,6 +13,7 @@ import {
   PlayerType,
 } from "../../OpenFrontIO/src/core/game/Game";
 import { createGame } from "../../OpenFrontIO/src/core/game/GameImpl";
+import { GameMap } from "../../OpenFrontIO/src/core/game/GameMap";
 import {
   GameUpdateType,
   HashUpdate,
@@ -30,15 +31,91 @@ import {
   Winner,
 } from "../../OpenFrontIO/src/core/Schemas";
 import { EnvConfig } from "./EnvConfig";
+import { NodeGameMapLoader } from "../../OpenFrontIO/tests/perf/fullgame/NodeGameMapLoader";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const TESTDATA_MAPS = path.join(
   __dirname,
   "../../OpenFrontIO/tests/testdata/maps",
 );
+const PRODUCTION_MAPS_DIR = path.join(
+  __dirname,
+  "../../OpenFrontIO/resources/maps",
+);
 
 export const AGENT_CLIENT_ID = "AGENT";
 export const OPPONENT_CLIENT_ID = "OPPONENT";
+
+interface ResolvedMap {
+  gameMap: GameMap;
+  miniGameMap: GameMap;
+  /** The real GameMapType when mapName resolves to a production map under
+   *  resources/maps/, or the Asia placeholder for a tests/testdata/ fixture
+   *  (those aren't a real GameMapType, so OpenFrontIO's own replay/client
+   *  tooling can't resolve matching terrain for them from gameConfig alone —
+   *  fine for training, not for producing a watchable/replayable record). */
+  gameMapType: GameMapType;
+}
+
+/**
+ * Resolves `mapName` to terrain data. Tries tests/testdata/maps/<mapName>
+ * first (tiny fixtures, fast — the default for training throughput), then
+ * falls back to resources/maps/<mapName> (real production maps, matching a
+ * GameMapType) — larger and slower, but their gameConfig.gameMap is real,
+ * so episodes on them are replayable/watchable with OpenFrontIO's own
+ * tooling. See training-map vs. replay-map guidance in the README.
+ */
+async function resolveMap(mapName: string): Promise<ResolvedMap> {
+  const testMapDir = path.join(TESTDATA_MAPS, mapName);
+  if (fs.existsSync(testMapDir)) {
+    const mapBinBuffer = fs.readFileSync(path.join(testMapDir, "map.bin"));
+    const miniMapBinBuffer = fs.readFileSync(
+      path.join(testMapDir, "map4x.bin"),
+    );
+    const manifest = JSON.parse(
+      fs.readFileSync(path.join(testMapDir, "manifest.json"), "utf8"),
+    ) as MapManifest;
+    return {
+      gameMap: await genTerrainFromBin(manifest.map, mapBinBuffer),
+      miniGameMap: await genTerrainFromBin(manifest.map4x, miniMapBinBuffer),
+      gameMapType: GameMapType.Asia, // placeholder — not a real map
+    };
+  }
+
+  const key = Object.keys(GameMapType).find(
+    (k) => k.toLowerCase() === mapName.toLowerCase(),
+  );
+  if (key === undefined) {
+    throw new Error(
+      `unknown map "${mapName}": no tests/testdata/maps/${mapName}/ fixture ` +
+        `and no matching GameMapType under resources/maps/`,
+    );
+  }
+  const gameMapType = GameMapType[key as keyof typeof GameMapType];
+
+  // Deliberately not TerrainMapLoader's loadTerrainMap(): it caches the
+  // parsed GameMapImpl itself (module-level, keyed by map+size), and each
+  // GameMapImpl's mutable per-tile ownership state is allocated once at
+  // construction — reusing the cached object across two episodes leaks one
+  // episode's conquered territory into the next (confirmed: a second
+  // episode on the same map in one process desynced from tick 0, with both
+  // players unable to spawn onto tiles the first episode already owned).
+  // Re-parsing from the raw map bytes each episode keeps every episode's
+  // ownership state isolated; only the raw bytes/manifest read is worth
+  // caching here, and Node's own fs layer already caches small file reads.
+  const mapData = new NodeGameMapLoader(PRODUCTION_MAPS_DIR).getMapData(
+    gameMapType,
+  );
+  const manifest = await mapData.manifest();
+  return {
+    gameMap: await genTerrainFromBin(manifest.map, await mapData.mapBin()),
+    miniGameMap: await genTerrainFromBin(
+      manifest.map4x,
+      await mapData.map4xBin(),
+    ),
+    gameMapType,
+  };
+}
 
 /** Scans outward in a square spiral from (x0, y0) for the nearest land tile. */
 export function findLandTile(game: Game, x0: number, y0: number): number {
@@ -71,31 +148,35 @@ export class Episode {
   private turnNumber = 0;
   private seed: string;
   private gameConfig: GameConfig;
+  private spawnTurns: number;
 
-  private constructor(runner: GameRunner, seed: string, gameConfig: GameConfig) {
+  private constructor(
+    runner: GameRunner,
+    seed: string,
+    gameConfig: GameConfig,
+    spawnTurns: number,
+  ) {
     this.runner = runner;
     this.game = runner.game;
     this.seed = seed;
     this.gameConfig = gameConfig;
+    this.spawnTurns = spawnTurns;
   }
 
-  static async create(
+  /**
+   * Builds the game + runner (map, config, the two Human players) but plays
+   * no turns — shared by create() (which then auto-spawns) and fromRecord()
+   * (which replays a recorded turn log, spawn intents included, instead).
+   */
+  private static async build(
     mapName: string,
     seed: string,
     spawnTurns: number,
   ): Promise<Episode> {
-    const mapDir = path.join(TESTDATA_MAPS, mapName);
-    const mapBinBuffer = fs.readFileSync(path.join(mapDir, "map.bin"));
-    const miniMapBinBuffer = fs.readFileSync(path.join(mapDir, "map4x.bin"));
-    const manifest = JSON.parse(
-      fs.readFileSync(path.join(mapDir, "manifest.json"), "utf8"),
-    ) as MapManifest;
-
-    const gameMap = await genTerrainFromBin(manifest.map, mapBinBuffer);
-    const miniGameMap = await genTerrainFromBin(manifest.map4x, miniMapBinBuffer);
+    const { gameMap, miniGameMap, gameMapType } = await resolveMap(mapName);
 
     const gameConfig: GameConfig = {
-      gameMap: GameMapType.Asia, // placeholder; terrain is loaded directly above
+      gameMap: gameMapType,
       gameMapSize: GameMapSize.Normal,
       gameMode: GameMode.FFA,
       gameType: GameType.Public,
@@ -141,8 +222,19 @@ export class Episode {
       }),
       seed,
       gameConfig,
+      spawnTurns,
     );
     episode.runner.init();
+    return episode;
+  }
+
+  static async create(
+    mapName: string,
+    seed: string,
+    spawnTurns: number,
+  ): Promise<Episode> {
+    const episode = await Episode.build(mapName, seed, spawnTurns);
+    const game = episode.game;
 
     // Spawn: both players pick a tile on the far sides of the map, first turn.
     const w = game.width();
@@ -175,6 +267,51 @@ export class Episode {
     return episode;
   }
 
+  /**
+   * Replays a record written by writeReplayRecord() through a *fresh* game
+   * built the same way create() builds one (same EnvConfig/spawnTurns/player
+   * construction — see writeReplayRecord for why this can't reuse
+   * OpenFrontIO's own ReplayGame.ts unmodified), and checks every recorded
+   * turn.hash against the freshly recomputed hash at that tick.
+   */
+  static async fromRecord(record: {
+    info: { gameID: string; config: GameConfig; envSpawnTurns: number };
+    turns: Turn[];
+  }): Promise<{
+    episode: Episode;
+    compared: number;
+    matches: number;
+    firstMismatch: number | null;
+  }> {
+    // Must reuse the exact original seed: SpawnExecution seeds its own
+    // PseudoRandom from simpleHash(playerInfo.id) + simpleHash(gameID), which
+    // shapes the conquered spawn area even for an explicit target tile — a
+    // different seed here would diverge the very first hash checkpoint.
+    const episode = await Episode.build(
+      record.info.config.gameMap,
+      record.info.gameID,
+      record.info.envSpawnTurns,
+    );
+
+    let compared = 0;
+    let matches = 0;
+    let firstMismatch: number | null = null;
+    for (const turn of record.turns) {
+      const ok = episode.runTick(turn.intents);
+      if (!ok) break;
+      if (turn.hash !== undefined && turn.hash !== null) {
+        compared++;
+        const computed = episode.turns[episode.turns.length - 1].hash;
+        if (computed === turn.hash) {
+          matches++;
+        } else if (firstMismatch === null) {
+          firstMismatch = turn.turnNumber;
+        }
+      }
+    }
+    return { episode, compared, matches, firstMismatch };
+  }
+
   /** Advances one tick, applying the given intents this turn. Throws on a fatal sim error. */
   runTick(intents: StampedIntent[] = []): boolean {
     const turn: Turn = { turnNumber: this.turnNumber++, intents };
@@ -185,6 +322,17 @@ export class Episode {
       throw new Error(
         `game errored at tick ${this.game.ticks()}:\n${this.fatalError}`,
       );
+    }
+    // GameImpl emits a Hash update every 10 ticks (see GameImpl.executeNextTick),
+    // stamped with the pre-increment tick count — game.ticks() has already
+    // moved one past it by the time executeNextTick() returns here. Stamp it
+    // onto this turn so a dumped record carries the same hashes ReplayGame.ts
+    // checks the recomputed simulation against.
+    if (
+      this.lastHash !== undefined &&
+      this.lastHash.tick === this.game.ticks() - 1
+    ) {
+      turn.hash = this.lastHash.hash;
     }
     return ok;
   }
@@ -197,12 +345,16 @@ export class Episode {
   }
 
   /**
-   * Writes a GameRecord-shaped JSON of every turn played so far, loadable
-   * with OpenFrontIO's own `npm run replay:game -- <path>` (headless replay
-   * + hash verification against the hashes recorded here). Not a strictly
-   * schema-valid GameRecord (no end-of-game stats), but ReplayGame.ts falls
-   * back to replaying an object shape like this "as-is" when strict parsing
-   * fails — good enough to inspect/verify what an episode actually did.
+   * Writes a JSON turn log of the episode so far. Verify it headlessly with
+   * `Episode.fromRecord()` (see verifyRecord.ts) — deliberately NOT meant to
+   * be loaded by OpenFrontIO's own `npm run replay:game`: that script always
+   * reconstructs players via `random.nextID()` and a production `Config`,
+   * neither of which matches how env-bridge builds an episode (fixed
+   * "AGENT"/"OPPONENT" ids, EnvConfig's deterministic combat), so the two
+   * would diverge from tick 0 even though both are internally deterministic.
+   * `info`/`turns` are still GameRecord-*shaped* (same field names) so this
+   * stays close to something OpenFrontIO's tooling could consume if the
+   * player-construction mismatch is ever closed.
    */
   writeReplayRecord(filePath: string): void {
     const record = {
@@ -210,6 +362,7 @@ export class Episode {
         gameID: this.seed,
         lobbyCreatedAt: 0,
         config: this.gameConfig,
+        envSpawnTurns: this.spawnTurns,
         players: [AGENT_CLIENT_ID, OPPONENT_CLIENT_ID].map((id) => ({
           clientID: id,
           username: id === AGENT_CLIENT_ID ? "Agent" : "Opponent",
