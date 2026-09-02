@@ -10,12 +10,13 @@
  * real manifest — see GameSetup.ts) making its own decisions every tick.
  * There is nothing to send OPPONENT actions for.
  *
- * Action space (still intentionally small — richer intents come once the
- * network has spatial/entity action heads to point them with, e.g. to pick
- * an attack's boat destination or a structure's build tile):
+ * Action space (still intentionally small — richer intents like structure
+ * builds and diplomacy come later, per the action-space-expansion plan):
  *   "noop"             — do nothing this decision step
  *   "expand"           — attack neutral (unowned) land bordering AGENT's territory
  *   "attack_opponent"  — attack OPPONENT directly across a shared border
+ *   "boat_attack"      — send a transport ship across water to invade OPPONENT's
+ *                         territory (needs macroX/macroY — see StepCmd)
  *
  * Decision cadence: one JSON "step" call advances `ticksPerStep` simulation
  * ticks (default 10), applying AGENT's chosen intent on the first of those
@@ -49,6 +50,26 @@ import readline from "readline";
 import { Difficulty, Game, Player, UnitType } from "../../OpenFrontIO/src/core/game/Game";
 import { StampedIntent } from "../../OpenFrontIO/src/core/Schemas";
 import { AGENT_CLIENT_ID, Episode } from "./GameSetup";
+
+// boat_attack's target macro-cell is a cheap heuristic (see
+// tileGridAndBoatMask() below), not the real canBuildTransportShip check --
+// an unreachable pick is an expected, harmless outcome by design (the real
+// engine still validates and no-ops it), not a bug to investigate every
+// time. TransportShipExecution.init() logs it via console.warn on every
+// occurrence (OpenFrontIO/src/core/execution/TransportShipExecution.ts,
+// "cannot send ship to ... cannot find target/start tile"), which floods
+// train_stdout.log at training volume. Filtered here at the env-bridge
+// boundary -- not in OpenFrontIO's own source, so this stays a training-
+// harness concern, not an engine change -- rather than in Python, since
+// Node's console.warn already writes straight to stderr before it ever
+// reaches the Python subprocess.
+const originalConsoleWarn = console.warn;
+console.warn = (...args: unknown[]) => {
+  if (typeof args[0] === "string" && args[0].includes("cannot send ship to")) {
+    return;
+  }
+  originalConsoleWarn(...args);
+};
 
 const ACTIONS = ["noop", "expand", "attack_opponent", "boat_attack"] as const;
 type Action = (typeof ACTIONS)[number];
