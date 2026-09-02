@@ -94,15 +94,25 @@ function player(game: Game, playerId: string): Player {
   return game.player(playerId);
 }
 
-/** Ownership grid: 0 = unowned/water, 1 = AGENT, 2 = OPPONENT. */
-function tileGrid(episode: Episode): number[] {
+/**
+ * Ownership grid: 0 = unowned/water, 1 = AGENT, 2 = OPPONENT. Returned as a
+ * Uint8Array (base64-encoded on the wire by observation() below), not a
+ * plain number[] -- profiling found that for a 512x512 map, JSON-encoding
+ * this as 262144 individual array elements produced a ~524KB line and cost
+ * ~10ms of Python-side json.loads plus ~5ms of numpy postprocessing *per
+ * decision step* (measured: ~15ms of a ~22ms step, i.e. the dominant cost,
+ * well above the actual simulation-tick time). A single base64 string
+ * decodes via one C-level call on both ends instead of parsing 262144 JSON
+ * tokens.
+ */
+function tileGrid(episode: Episode): Uint8Array {
   const game = episode.game;
   const map = game.map();
   const w = game.width();
   const h = game.height();
   const agent = player(game, episode.agentId);
   const opponent = player(game, episode.opponentId);
-  const out = new Array<number>(w * h);
+  const out = new Uint8Array(w * h);
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
       const ref = map.ref(x, y);
@@ -127,7 +137,8 @@ function observation(episode: Episode, width: number, height: number) {
   return {
     width,
     height,
-    tileGrid: tileGrid(episode),
+    // Base64 of the raw Uint8Array bytes -- see tileGrid()'s comment.
+    tileGridB64: Buffer.from(tileGrid(episode).buffer).toString("base64"),
     players: {
       AGENT: playerObs(episode.game, episode.agentId),
       OPPONENT: playerObs(episode.game, episode.opponentId),

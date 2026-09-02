@@ -14,6 +14,7 @@ agent's own network is a separate, later mode (Phase 3+), not this env.
 
 from __future__ import annotations
 
+import base64
 import json
 import subprocess
 import sys
@@ -164,7 +165,12 @@ class OpenFrontEnv(gym.Env):
 
     def _to_gym_obs(self, raw: dict[str, Any]) -> dict[str, Any]:
         w, h = raw["obs"]["width"], raw["obs"]["height"]
-        grid = np.array(raw["obs"]["tileGrid"], dtype=np.int8).reshape(h, w)
+        # Wire format is base64 of raw Uint8Array bytes, not a JSON number
+        # array -- see EnvServer.ts's tileGrid()/observation() comment.
+        # frombuffer + a single b64decode call is far cheaper than parsing
+        # tens/hundreds of thousands of individual JSON tokens per step.
+        grid_bytes = base64.b64decode(raw["obs"]["tileGridB64"])
+        grid = np.frombuffer(grid_bytes, dtype=np.uint8).reshape(h, w).astype(np.int8)
         p = raw["obs"]["players"]
         return {
             "tile_grid": grid,
