@@ -48,7 +48,6 @@ import path from "path";
 import readline from "readline";
 import { Difficulty, Game, Player, UnitType } from "../../OpenFrontIO/src/core/game/Game";
 import { StampedIntent } from "../../OpenFrontIO/src/core/Schemas";
-import { canBuildTransportShip } from "../../OpenFrontIO/src/core/game/TransportShipUtils";
 import { AGENT_CLIENT_ID, Episode } from "./GameSetup";
 
 const ACTIONS = ["noop", "expand", "attack_opponent", "boat_attack"] as const;
@@ -58,9 +57,10 @@ type Action = (typeof ACTIONS)[number];
 // destination) picks a cell from, independent of the actual map's pixel
 // dimensions -- same size-invariance trick the network's AdaptiveAvgPool2d
 // already relies on. Full tile-resolution targeting would be far more
-// precision than the game needs (canBuildTransportShip below already snaps
-// to the nearest legal shore) and would make the per-step legality mask
-// below cost far more to compute/transmit.
+// precision than the game needs (the engine's own TransportShipExecution
+// already snaps to the nearest legal shore when a BoatAttackIntent
+// executes) and would make the per-step legality mask below cost far more
+// to compute/transmit.
 const MACRO_GRID = 32;
 
 interface ResetCmd {
@@ -110,53 +110,13 @@ function player(game: Game, playerId: string): Player {
 }
 
 /**
- * Ownership grid: 0 = neutral land, 1 = AGENT, 2 = OPPONENT, 3 = water.
- * Water used to be lumped into the same "0" bucket as neutral land, which
- * made a naval/boat-destination action unlearnable (the agent couldn't
- * distinguish "unclaimed land I could expand into" from "open sea") --
- * split out as its own class now that boat_attack needs it (see
- * boatTargetMacroMask()). Returned as a Uint8Array (base64-encoded on the
- * wire by observation() below), not a plain number[] -- profiling found
- * that for a 512x512 map, JSON-encoding this as 262144 individual array
- * elements produced a ~524KB line and cost ~10ms of Python-side json.loads
- * plus ~5ms of numpy postprocessing *per decision step* (measured: ~15ms of
- * a ~22ms step, i.e. the dominant cost, well above the actual
- * simulation-tick time). A single base64 string decodes via one C-level
- * call on both ends instead of parsing 262144 JSON tokens.
- */
-function tileGrid(episode: Episode): Uint8Array {
-  const game = episode.game;
-  const map = game.map();
-  const w = game.width();
-  const h = game.height();
-  const agent = player(game, episode.agentId);
-  const opponent = player(game, episode.opponentId);
-  const out = new Uint8Array(w * h);
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      const ref = map.ref(x, y);
-      if (map.isWater(ref)) {
-        out[y * w + x] = 3;
-        continue;
-      }
-      const owner = game.owner(ref);
-      out[y * w + x] = owner === agent ? 1 : owner === opponent ? 2 : 0;
-    }
-  }
-  return out;
-}
-
-/**
  * Translates a (macroX, macroY) cell in the fixed MACRO_GRID x MACRO_GRID
  * grid into one concrete tile: the map-pixel center of that cell's
- * rectangle, clamped in bounds. Used both to resolve a sampled boat_attack
- * action into a real BoatAttackIntent.dst, and (in boatTargetMacroMask
- * below) as the one representative tile each macro-cell's legality is
- * checked against -- an approximation (a cell could contain a legal tile
- * that isn't its center) traded for O(MACRO_GRID^2) legality checks per
- * step instead of O(tiles). canBuildTransportShip resolves the actual
- * landing shore itself from whatever tile it's given, so this doesn't need
- * to land exactly on a shore tile.
+ * rectangle, clamped in bounds. Used to resolve a sampled boat_attack
+ * action into a real BoatAttackIntent.dst -- canBuildTransportShip (called
+ * internally by the engine's own TransportShipExecution when the intent is
+ * processed) resolves the actual landing shore itself from whatever tile
+ * it's given, so this doesn't need to land exactly on a shore tile.
  */
 function macroCellToTile(episode: Episode, macroX: number, macroY: number): number {
   const map = episode.game.map();
@@ -168,27 +128,70 @@ function macroCellToTile(episode: Episode, macroX: number, macroY: number): numb
 }
 
 /**
- * Per-macro-cell boat-destination legality, packed as MACRO_GRID*MACRO_GRID
- * bits (1024 bits = 128 bytes for the default 32x32 grid), base64-encoded
- * on the wire like tileGrid(). Computed once per step and reused for both
- * legalActions() (is boat_attack legal AT ALL this step) and the
- * boat_target_mask observation field (WHICH cells) -- avoids running the
- * O(MACRO_GRID^2) canBuildTransportShip sweep twice.
+ * Ownership grid (0=neutral land, 1=AGENT, 2=OPPONENT, 3=water) AND the
+ * boat-destination macro-mask, computed together in one pass over every
+ * tile. Water used to be lumped into the same "0" bucket as neutral land,
+ * which made a naval/boat-destination action unlearnable (the agent
+ * couldn't distinguish "unclaimed land I could expand into" from "open
+ * sea") -- split out as its own class now that boat_attack needs it.
+ *
+ * The boat mask is a CHEAP heuristic (any OPPONENT-owned tile in the
+ * macro-cell -> legal), not the real canBuildTransportShip check -- an
+ * earlier version called canBuildTransportShip on one representative tile
+ * per macro-cell (1024 calls/step). That measured fine in isolation (an
+ * all-noop policy keeps the per-attacker water-reachability cache warm),
+ * but under a real rollout's constant tile churn (expand/attack/boat
+ * actions changing the agent's border every few ticks) that cache
+ * invalidates constantly, and each of the 1024 calls does its own bounded
+ * BFS plus an A* search -- ~200s/update, ~10x worse than the pre-naval
+ * baseline. The engine's own TransportShipExecution still validates the
+ * real reachability when a BoatAttackIntent actually executes (an
+ * unreachable pick is a harmless no-op, not a crash -- this mask is only a
+ * training-time hint, never the authority), so a cheap O(tiles) proxy
+ * folded into the grid's existing pass is the right tradeoff: correctness
+ * is unaffected, and this eliminates the extra cost entirely rather than
+ * just shrinking it.
+ *
+ * Returned as Uint8Arrays (base64-encoded on the wire by observation()
+ * below), not plain number[]s -- profiling found that for a 512x512 map,
+ * JSON-encoding the grid as 262144 individual array elements produced a
+ * ~524KB line and cost ~10ms of Python-side json.loads plus ~5ms of numpy
+ * postprocessing *per decision step* (measured: ~15ms of a ~22ms step, i.e.
+ * the dominant cost, well above the actual simulation-tick time). A single
+ * base64 string decodes via one C-level call on both ends instead of
+ * parsing hundreds of thousands of JSON tokens.
  */
-function boatTargetMacroMask(episode: Episode): Uint8Array {
-  const agent = player(episode.game, episode.agentId);
-  const numBits = MACRO_GRID * MACRO_GRID;
-  const out = new Uint8Array(Math.ceil(numBits / 8));
-  for (let my = 0; my < MACRO_GRID; my++) {
-    for (let mx = 0; mx < MACRO_GRID; mx++) {
-      const tile = macroCellToTile(episode, mx, my);
-      if (canBuildTransportShip(episode.game, agent, tile) !== false) {
+function tileGridAndBoatMask(episode: Episode): { grid: Uint8Array; boatMask: Uint8Array } {
+  const game = episode.game;
+  const map = game.map();
+  const w = game.width();
+  const h = game.height();
+  const agent = player(game, episode.agentId);
+  const opponent = player(game, episode.opponentId);
+  const grid = new Uint8Array(w * h);
+  const boatMask = new Uint8Array(Math.ceil((MACRO_GRID * MACRO_GRID) / 8));
+  for (let y = 0; y < h; y++) {
+    const my = Math.min(MACRO_GRID - 1, Math.floor((y * MACRO_GRID) / h));
+    for (let x = 0; x < w; x++) {
+      const ref = map.ref(x, y);
+      if (map.isWater(ref)) {
+        grid[y * w + x] = 3;
+        continue;
+      }
+      const owner = game.owner(ref);
+      if (owner === agent) {
+        grid[y * w + x] = 1;
+      } else if (owner === opponent) {
+        grid[y * w + x] = 2;
+        const mx = Math.min(MACRO_GRID - 1, Math.floor((x * MACRO_GRID) / w));
         const bitIdx = my * MACRO_GRID + mx;
-        out[bitIdx >> 3] |= 1 << (bitIdx & 7);
+        boatMask[bitIdx >> 3] |= 1 << (bitIdx & 7);
+      } else {
+        grid[y * w + x] = 0;
       }
     }
   }
-  return out;
+  return { grid, boatMask };
 }
 
 function playerObs(game: Game, playerId: string): PlayerObs {
@@ -205,13 +208,14 @@ function observation(
   episode: Episode,
   width: number,
   height: number,
+  grid: Uint8Array,
   boatMask: Uint8Array,
 ) {
   return {
     width,
     height,
-    // Base64 of the raw Uint8Array bytes -- see tileGrid()'s comment.
-    tileGridB64: Buffer.from(tileGrid(episode).buffer).toString("base64"),
+    // Base64 of the raw Uint8Array bytes -- see tileGridAndBoatMask()'s comment.
+    tileGridB64: Buffer.from(grid.buffer).toString("base64"),
     boatTargetMacroMaskB64: Buffer.from(boatMask.buffer).toString("base64"),
     players: {
       AGENT: playerObs(episode.game, episode.agentId),
@@ -338,9 +342,9 @@ class Session {
     this.ticksPerStep = cmd.ticksPerStep ?? 10;
     this.dumpGameRecordDir = cmd.dumpGameRecordDir;
     this.prevPotential = potential(this.episode);
-    const boatMask = boatTargetMacroMask(this.episode);
+    const { grid, boatMask } = tileGridAndBoatMask(this.episode);
     return {
-      obs: observation(this.episode, this.width, this.height, boatMask),
+      obs: observation(this.episode, this.width, this.height, grid, boatMask),
       legalActions: legalActions(this.episode, boatMask),
       done: this.episode.isDone(),
     };
@@ -389,9 +393,9 @@ class Session {
 
     if (done) this.flushRecord();
 
-    const boatMask = boatTargetMacroMask(episode);
+    const { grid, boatMask } = tileGridAndBoatMask(episode);
     return {
-      obs: observation(episode, this.width, this.height, boatMask),
+      obs: observation(episode, this.width, this.height, grid, boatMask),
       reward,
       done,
       legalActions: legalActions(episode, boatMask),
