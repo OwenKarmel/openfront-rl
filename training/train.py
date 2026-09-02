@@ -68,13 +68,25 @@ def parse_args() -> argparse.Namespace:
         help="abort the rest of a PPO update's epochs/minibatches if approx_kl exceeds 1.5x this",
     )
     p.add_argument("--epochs", type=int, default=4)
-    # Deliberately well below the default full-rollout batch size
-    # (num_envs * rollout_length = 256) -- a single full-batch gradient step
-    # per epoch converges (and can collapse policy entropy) much faster than
+    # Kept well below the full-rollout batch size (num_envs * rollout_length,
+    # 1200 at the current defaults) -- a single full-batch gradient step per
+    # epoch converges (and can collapse policy entropy) much faster than
     # several smaller, noisier minibatch steps do; this was a real
     # contributor to an observed near-total entropy collapse within ~10
-    # updates in an earlier run.
-    p.add_argument("--minibatch-size", type=int, default=64)
+    # updates in an earlier run (see archive/run_2026-09-02_easy-plateau...).
+    # nvtop showed GPU utilization pinned at ~4% during training -- the
+    # bottleneck is the CPU-bound Node env-bridge simulation, not GPU
+    # compute -- so there's some headroom to size minibatches up from the
+    # original 64. Tried 256 first: it pushed this 6GB card's VRAM to
+    # ~94.5% (5809/6144 MiB, nvidia-smi) with only ~330MB of headroom left
+    # (risky against a transient spike, e.g. an eval episode's forward pass
+    # running alongside a training update) and, contrary to the goal, made
+    # each update *slower* (51.4s vs ~35s at minibatch=64) rather than
+    # better using idle GPU time -- the CNN's conv layers are apparently
+    # memory-bandwidth-bound enough at that size to lose more to memory
+    # pressure than they gain from fewer/bigger steps. 128 is the settled
+    # middle ground.
+    p.add_argument("--minibatch-size", type=int, default=128)
     p.add_argument("--curriculum-window", type=int, default=20)
     p.add_argument("--checkpoint-dir", default=str(Path(__file__).parent / "checkpoints"))
     p.add_argument("--checkpoint-every", type=int, default=20, help="updates between checkpoints")

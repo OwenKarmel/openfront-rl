@@ -111,11 +111,13 @@ class OpenFrontEnv(gym.Env):
             bufsize=1,
         )
 
-    def _send(self, cmd: dict[str, Any]) -> dict[str, Any]:
+    def _write(self, cmd: dict[str, Any]) -> None:
         assert self._proc is not None and self._proc.stdin is not None
         self._proc.stdin.write(json.dumps(cmd) + "\n")
         self._proc.stdin.flush()
-        assert self._proc.stdout is not None
+
+    def _read_reply(self) -> dict[str, Any]:
+        assert self._proc is not None and self._proc.stdout is not None
         while True:
             line = self._proc.stdout.readline()
             if line == "":
@@ -130,6 +132,35 @@ class OpenFrontEnv(gym.Env):
             if "error" in reply:
                 raise RuntimeError(f"env-bridge error: {reply['error']}")
             return reply
+
+    def _send(self, cmd: dict[str, Any]) -> dict[str, Any]:
+        self._write(cmd)
+        return self._read_reply()
+
+    def step_send(self, action: int) -> None:
+        """Write half of step() only -- lets a caller (VecEnv) dispatch a
+        step to every env's Node subprocess before blocking on any of their
+        replies, so the ticks_per_step simulation ticks across N envs run
+        concurrently (separate OS processes/cores) instead of one at a
+        time. Must be paired with a later step_recv()."""
+        self._write({"cmd": "step", "action": ACTIONS[action]})
+
+    def step_recv(self) -> tuple[dict[str, Any], float, bool, bool, dict[str, Any]]:
+        """Read half of step() -- see step_send()."""
+        raw = self._read_reply()
+        self._step_count += 1
+        self._last_obs = raw
+        obs = self._to_gym_obs(raw)
+        reward = raw["reward"]
+        terminated = bool(raw["done"])
+        truncated = self._step_count >= self.max_steps
+        info = {
+            "legal_actions": raw["legalActions"],
+            "action_mask": self._legal_action_mask(raw["legalActions"]),
+            "ticks": raw["info"]["ticks"],
+            "winner": raw["info"]["winner"],
+        }
+        return obs, reward, terminated, truncated, info
 
     def _to_gym_obs(self, raw: dict[str, Any]) -> dict[str, Any]:
         w, h = raw["obs"]["width"], raw["obs"]["height"]
@@ -171,20 +202,8 @@ class OpenFrontEnv(gym.Env):
 
     def step(self, action: int):
         assert self._last_obs is not None, "call reset() before step()"
-        raw = self._send({"cmd": "step", "action": ACTIONS[action]})
-        self._step_count += 1
-        self._last_obs = raw
-        obs = self._to_gym_obs(raw)
-        reward = raw["reward"]
-        terminated = bool(raw["done"])
-        truncated = self._step_count >= self.max_steps
-        info = {
-            "legal_actions": raw["legalActions"],
-            "action_mask": self._legal_action_mask(raw["legalActions"]),
-            "ticks": raw["info"]["ticks"],
-            "winner": raw["info"]["winner"],  # "AGENT" / "OPPONENT" / None
-        }
-        return obs, reward, terminated, truncated, info
+        self.step_send(action)
+        return self.step_recv()
 
     def close(self):
         if self._proc is not None:

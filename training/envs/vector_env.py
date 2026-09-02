@@ -43,10 +43,23 @@ class VecEnv:
     def step(
         self, actions: np.ndarray
     ) -> tuple[list[dict], np.ndarray, np.ndarray, np.ndarray, list[dict]]:
-        """actions: (n,) int array. Auto-resets any env that just terminated/truncated."""
+        """actions: (n,) int array. Auto-resets any env that just terminated/truncated.
+
+        Dispatches all N envs' step commands before blocking on any reply
+        (step_send/step_recv, see OpenFrontEnv) so their ticks_per_step
+        simulation ticks -- each env is a separate Node subprocess -- run
+        concurrently on separate cores instead of one env's whole round
+        trip finishing before the next one is even asked to start. This was
+        a real, visible bottleneck: nvtop showed long flat stretches
+        between GPU forward/backward pulses, matching this loop running
+        envs strictly sequentially.
+        """
+        for env, action in zip(self.envs, actions):
+            env.step_send(int(action))
+
         obs, rewards, terms, truncs, infos = [], [], [], [], []
-        for i, (env, action) in enumerate(zip(self.envs, actions)):
-            o, r, term, trunc, info = env.step(int(action))
+        for i, env in enumerate(self.envs):
+            o, r, term, trunc, info = env.step_recv()
             if term or trunc:
                 # `winner`/final `ticks` from the just-finished episode are
                 # worth keeping (e.g. for win-rate logging), so preserve them
