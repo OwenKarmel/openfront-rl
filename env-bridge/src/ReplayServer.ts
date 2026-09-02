@@ -92,16 +92,25 @@ function main(): void {
     }
 
     const gameID = match[1];
-    const filePath = path.join(opts.dir, `${gameID}.json`);
-    if (!filePath.startsWith(opts.dir) || !fs.existsSync(filePath)) {
-      console.log(`GET /game/${gameID} -> 404 (no ${filePath})`);
+    if (!/^[A-Za-z0-9]+$/.test(gameID)) {
+      res.writeHead(400).end();
+      return;
+    }
+    // Dumped filenames are `<timestamp>_<gameID>.json` (chronologically
+    // sortable -- see EnvServer.ts's flushRecord()), plus bare
+    // `<gameID>.json` for older files predating that change -- match either.
+    const fileName = fs
+      .readdirSync(opts.dir)
+      .find((f) => f === `${gameID}.json` || f.endsWith(`_${gameID}.json`));
+    if (fileName === undefined) {
+      console.log(`GET /game/${gameID} -> 404 (no match in ${opts.dir})`);
       res.writeHead(404).end();
       return;
     }
 
-    console.log(`GET /game/${gameID} -> 200`);
+    console.log(`GET /game/${gameID} -> 200 (${fileName})`);
     res.setHeader("Content-Type", "application/json");
-    res.writeHead(200).end(fs.readFileSync(filePath));
+    res.writeHead(200).end(fs.readFileSync(path.join(opts.dir, fileName)));
   });
 
   server.listen(opts.port, () => {

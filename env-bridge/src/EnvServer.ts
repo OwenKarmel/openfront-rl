@@ -424,12 +424,22 @@ class Session {
     };
   }
 
-  /** Writes a pending GameRecord dump requested on reset. */
+  /**
+   * Writes a pending GameRecord dump requested on reset. Filename is
+   * `<timestamp>_<gameID>.json`, not just `<gameID>.json` -- gameID is a
+   * sha256-derived hash (wireGameID()), so bare-gameID filenames sort
+   * essentially randomly in a directory listing, not chronologically. The
+   * gameID must still be recoverable from the filename (ReplayServer.ts's
+   * GET /game/:gameID route needs it, and so does the real client's PRNG
+   * reseeding, which is keyed on this exact gameID -- see wireGameID()'s
+   * comment), so it stays as a suffix rather than being dropped.
+   */
   flushRecord(): void {
     if (this.episode && this.dumpGameRecordDir) {
       fs.mkdirSync(this.dumpGameRecordDir, { recursive: true });
       const gameID = this.episode.wireGameID();
-      const outFile = path.join(this.dumpGameRecordDir, `${gameID}.json`);
+      const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+      const outFile = path.join(this.dumpGameRecordDir, `${timestamp}_${gameID}.json`);
       fs.writeFileSync(outFile, JSON.stringify(this.episode.toGameRecord()));
       console.log(`Wrote GameRecord to ${outFile} (watch at /game/${gameID})`);
       this.dumpGameRecordDir = undefined;
