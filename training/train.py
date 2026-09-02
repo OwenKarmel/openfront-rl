@@ -201,7 +201,8 @@ def main() -> None:
     if log_is_new:
         log_writer.writerow(
             ["update", "difficulty", "win_rate", "mean_reward", "policy_loss",
-             "value_loss", "entropy", "approx_kl", "stopped_early", "episodes", "seconds"]
+             "value_loss", "entropy", "approx_kl", "stopped_early", "episodes", "seconds",
+             "type_entropy", *[f"type_prob_{a}" for a in ACTIONS]]
         )
 
     obs_list, info_list = vec_env.reset()
@@ -253,6 +254,14 @@ def main() -> None:
             _, _, last_values_t = net(tile_grid_t, scalars_t, tile_mask_t, mask_t)
             last_values = last_values_t.cpu().numpy()
 
+            # Type-head-only entropy/probabilities -- see network.py's
+            # type_diagnostics() docstring. Reuses the same post-rollout
+            # batch as the bootstrap value above, so this is a free extra
+            # forward pass, not an extra environment interaction.
+            type_probs_t, type_entropy_t = net.type_diagnostics(tile_grid_t, scalars_t, tile_mask_t, mask_t)
+            type_probs = type_probs_t.cpu().numpy()
+            type_entropy = float(type_entropy_t.item())
+
         stats = ppo_update(
             net,
             optimizer,
@@ -278,17 +287,19 @@ def main() -> None:
         mean_reward = reward_sum / (args.rollout_length * args.num_envs)
         elapsed = time.time() - t0
         early_flag = " EARLY-STOP" if stats["stopped_early"] else ""
+        type_probs_str = " ".join(f"{a}={p:.2f}" for a, p in zip(ACTIONS, type_probs))
         print(
             f"update {update:5d} difficulty={scheduler.difficulty:10s} "
             f"episodes={len(episode_outcomes):3d} win_rate={win_rate:.2f} "
             f"mean_reward={mean_reward:+.4f} policy_loss={stats['policy_loss']:+.4f} "
             f"value_loss={stats['value_loss']:.4f} entropy={stats['entropy']:.3f} "
-            f"kl={stats['approx_kl']:.4f} ({elapsed:.1f}s){early_flag}"
+            f"kl={stats['approx_kl']:.4f} ({elapsed:.1f}s){early_flag}\n"
+            f"  type_probs[{type_probs_str}] type_entropy={type_entropy:.3f}"
         )
         log_writer.writerow(
             [update, scheduler.difficulty, win_rate, mean_reward, stats["policy_loss"],
              stats["value_loss"], stats["entropy"], stats["approx_kl"], stats["stopped_early"],
-             len(episode_outcomes), elapsed]
+             len(episode_outcomes), elapsed, type_entropy, *type_probs]
         )
         log_file.flush()
 

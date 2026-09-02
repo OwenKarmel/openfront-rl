@@ -163,3 +163,24 @@ class ActorCritic(nn.Module):
         log_prob = type_dist.log_prob(action_type) + is_boat * tile_dist.log_prob(tile_idx)
         entropy = type_dist.entropy() + is_boat * tile_dist.entropy()
         return log_prob, entropy, value
+
+    @torch.no_grad()
+    def type_diagnostics(
+        self,
+        tile_grid: torch.Tensor,
+        scalars: torch.Tensor,
+        tile_target_mask: torch.Tensor,
+        action_mask: torch.Tensor,
+    ):
+        """Type-head-only entropy/probabilities, decoupled from the combined
+        type+tile entropy the PPO loss uses. The logged training `entropy`
+        is dominated by the tile head's much larger range (up to ~ln(1024))
+        whenever boat_attack is sampled, which can mask whether the type
+        head's own preference among {noop, expand, attack_opponent,
+        boat_attack} is actually sharpening -- e.g. a persistent eval-time
+        bias toward noop could be invisible in the aggregate entropy number.
+        Returns (type_probs_mean: (NUM_ACTIONS,), type_entropy_mean: scalar)."""
+        type_logits, _, _ = self.forward(tile_grid, scalars, tile_target_mask, action_mask)
+        probs = F.softmax(type_logits, dim=-1)
+        dist = torch.distributions.Categorical(probs=probs)
+        return probs.mean(dim=0), dist.entropy().mean()
