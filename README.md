@@ -163,13 +163,15 @@ automatically during training) and just want to watch it:
    ```
 3. **Open the URL**, using the record's `gameID` (the part of the filename
    *after* the last underscore, without `.json` — filenames are
-   `<timestamp>_<gameID>.json` so `ls training/replays/` sorts
-   chronologically; ReplayServer.ts looks the file up by that `gameID`
-   suffix, so you don't need the timestamp part):
+   `<timestamp>_<gameID>.json`, timestamp in Eastern local time (see
+   `easternTimestamp()` in `EnvServer.ts` — the host's own clock stays UTC,
+   this only affects the filename's readability) so `ls training/replays/`
+   sorts chronologically; ReplayServer.ts looks the file up by that
+   `gameID` suffix, so you don't need the timestamp part):
    ```
    http://localhost:9000/game/<gameID>
    ```
-   e.g. for `training/replays/2026-09-02T14-20-27-000Z_39500512.json` →
+   e.g. for `training/replays/2026-09-02T10-20-27-000_39500512.json` →
    `http://localhost:9000/game/39500512`. If you're reaching this
    environment through a port-forward/tunnel, both 9000 and 8787 need to be
    forwarded.

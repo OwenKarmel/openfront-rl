@@ -71,6 +71,31 @@ console.warn = (...args: unknown[]) => {
   originalConsoleWarn(...args);
 };
 
+/**
+ * Filesystem-safe, chronologically-sortable Eastern-time timestamp (e.g.
+ * "2026-09-02T10-30-27-146"), used for dumped replay filenames -- see
+ * flushRecord(). Formats via the IANA "America/New_York" zone rather than a
+ * fixed UTC offset, so this is correct across the EST/EDT DST transition
+ * automatically (the host machine's own clock stays UTC throughout -- this
+ * only affects how a timestamp is *displayed* in a filename, never any
+ * timing-sensitive game/PRNG logic, which stays on the host's real clock).
+ */
+function easternTimestamp(date: Date): string {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/New_York",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(date);
+  const get = (type: string) => parts.find((p) => p.type === type)?.value ?? "00";
+  const ms = String(date.getMilliseconds()).padStart(3, "0");
+  return `${get("year")}-${get("month")}-${get("day")}T${get("hour")}-${get("minute")}-${get("second")}-${ms}`;
+}
+
 const ACTIONS = ["noop", "expand", "attack_opponent", "boat_attack"] as const;
 type Action = (typeof ACTIONS)[number];
 
@@ -433,12 +458,16 @@ class Session {
    * GET /game/:gameID route needs it, and so does the real client's PRNG
    * reseeding, which is keyed on this exact gameID -- see wireGameID()'s
    * comment), so it stays as a suffix rather than being dropped.
+   *
+   * timestamp is Eastern local time (the host machine's clock is correctly
+   * UTC -- see easternTimestamp()'s comment), not UTC, purely for
+   * readability when eyeballing a directory listing.
    */
   flushRecord(): void {
     if (this.episode && this.dumpGameRecordDir) {
       fs.mkdirSync(this.dumpGameRecordDir, { recursive: true });
       const gameID = this.episode.wireGameID();
-      const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+      const timestamp = easternTimestamp(new Date());
       const outFile = path.join(this.dumpGameRecordDir, `${timestamp}_${gameID}.json`);
       fs.writeFileSync(outFile, JSON.stringify(this.episode.toGameRecord()));
       console.log(`Wrote GameRecord to ${outFile} (watch at /game/${gameID})`);
