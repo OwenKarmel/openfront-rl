@@ -35,10 +35,17 @@ ENV_BRIDGE_DIR = Path(__file__).resolve().parents[2] / "env-bridge"
 OPENFRONTIO_TSCONFIG = ENV_BRIDGE_DIR / ".." / "OpenFrontIO" / "tsconfig.json"
 
 # Must match ACTIONS in EnvServer.ts.
-ACTIONS = ["noop", "expand", "attack_opponent"]
+ACTIONS = ["noop", "expand", "attack_opponent", "boat_attack"]
 DIFFICULTIES = ["easy", "medium", "hard", "impossible"]
 AGENT_ID = "AGENT"
 OPPONENT_ID = "OPPONENT"
+
+# Must match MACRO_GRID in EnvServer.ts. A boat_attack action's tile
+# parameter is a flat index into this MACRO_GRID x MACRO_GRID grid
+# (tile_idx = macroY * MACRO_GRID + macroX, matching boatTargetMacroMask's
+# bit-packing order on the TS side).
+MACRO_GRID = 32
+BOAT_ATTACK_IDX = ACTIONS.index("boat_attack")
 
 
 class OpenFrontEnv(gym.Env):
@@ -75,7 +82,11 @@ class OpenFrontEnv(gym.Env):
         self._step_count = 0
         self._last_obs: dict[str, Any] | None = None
 
-        self.action_space = spaces.Discrete(len(ACTIONS))
+        # [action_type, macro_tile_idx] -- macro_tile_idx only matters when
+        # action_type selects boat_attack (see step_send()); ignored/legal
+        # for any value otherwise, same "cheap to sample, server validates
+        # anyway" spirit as the existing type-level legality mask.
+        self.action_space = spaces.MultiDiscrete([len(ACTIONS), MACRO_GRID * MACRO_GRID])
         # Populated with real dimensions on the first reset(); Box shape must
         # be static, so it's declared for map_name's known geometry via a
         # throwaway reset here.
@@ -83,13 +94,22 @@ class OpenFrontEnv(gym.Env):
         h, w = obs["tile_grid"].shape
         self.observation_space = spaces.Dict(
             {
-                "tile_grid": spaces.Box(low=0, high=2, shape=(h, w), dtype=np.int8),
+                # 0=neutral land, 1=self, 2=opponent, 3=water.
+                "tile_grid": spaces.Box(low=0, high=3, shape=(h, w), dtype=np.int8),
                 "self_tiles": spaces.Box(low=0, high=np.inf, shape=(1,), dtype=np.float32),
                 "self_troops": spaces.Box(low=0, high=np.inf, shape=(1,), dtype=np.float32),
                 "self_gold": spaces.Box(low=0, high=np.inf, shape=(1,), dtype=np.float32),
                 "opp_tiles": spaces.Box(low=0, high=np.inf, shape=(1,), dtype=np.float32),
                 "opp_troops": spaces.Box(low=0, high=np.inf, shape=(1,), dtype=np.float32),
                 "opp_gold": spaces.Box(low=0, high=np.inf, shape=(1,), dtype=np.float32),
+                # Per-macro-cell boat_attack destination legality -- see
+                # boatTargetMacroMask() in EnvServer.ts. Doubles as the tile
+                # parameter's action mask: the network shouldn't need a
+                # separate wire field to know which macro-cells are legal
+                # boat targets when this is already in the observation.
+                "boat_target_mask": spaces.Box(
+                    low=0, high=1, shape=(MACRO_GRID, MACRO_GRID), dtype=np.int8
+                ),
             }
         )
 
@@ -138,13 +158,22 @@ class OpenFrontEnv(gym.Env):
         self._write(cmd)
         return self._read_reply()
 
-    def step_send(self, action: int) -> None:
+    def step_send(self, action) -> None:
         """Write half of step() only -- lets a caller (VecEnv) dispatch a
         step to every env's Node subprocess before blocking on any of their
         replies, so the ticks_per_step simulation ticks across N envs run
         concurrently (separate OS processes/cores) instead of one at a
-        time. Must be paired with a later step_recv()."""
-        self._write({"cmd": "step", "action": ACTIONS[action]})
+        time. Must be paired with a later step_recv().
+
+        action: [action_type_idx, macro_tile_idx] (see action_space)."""
+        type_idx = int(action[0])
+        cmd: dict[str, Any] = {"cmd": "step", "action": ACTIONS[type_idx]}
+        if type_idx == BOAT_ATTACK_IDX:
+            tile_idx = int(action[1])
+            macro_y, macro_x = divmod(tile_idx, MACRO_GRID)
+            cmd["macroX"] = macro_x
+            cmd["macroY"] = macro_y
+        self._write(cmd)
 
     def step_recv(self) -> tuple[dict[str, Any], float, bool, bool, dict[str, Any]]:
         """Read half of step() -- see step_send()."""
@@ -171,6 +200,17 @@ class OpenFrontEnv(gym.Env):
         # tens/hundreds of thousands of individual JSON tokens per step.
         grid_bytes = base64.b64decode(raw["obs"]["tileGridB64"])
         grid = np.frombuffer(grid_bytes, dtype=np.uint8).reshape(h, w).astype(np.int8)
+        # Packed bits, LSB-first within each byte (matches EnvServer.ts's
+        # `out[bitIdx >> 3] |= 1 << (bitIdx & 7)`); bitIdx = macroY*MACRO_GRID
+        # + macroX, so a row-major reshape lines up with (macroY, macroX).
+        boat_mask_bytes = base64.b64decode(raw["obs"]["boatTargetMacroMaskB64"])
+        boat_mask = (
+            np.unpackbits(np.frombuffer(boat_mask_bytes, dtype=np.uint8), bitorder="little")[
+                : MACRO_GRID * MACRO_GRID
+            ]
+            .reshape(MACRO_GRID, MACRO_GRID)
+            .astype(np.int8)
+        )
         p = raw["obs"]["players"]
         return {
             "tile_grid": grid,
@@ -180,6 +220,7 @@ class OpenFrontEnv(gym.Env):
             "opp_tiles": np.array([p[OPPONENT_ID]["tiles"]], dtype=np.float32),
             "opp_troops": np.array([p[OPPONENT_ID]["troops"]], dtype=np.float32),
             "opp_gold": np.array([p[OPPONENT_ID]["gold"]], dtype=np.float32),
+            "boat_target_mask": boat_mask,
         }
 
     def _legal_action_mask(self, legal_actions: list[str]) -> np.ndarray:

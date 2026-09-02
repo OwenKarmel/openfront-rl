@@ -43,7 +43,9 @@ class VecEnv:
     def step(
         self, actions: np.ndarray
     ) -> tuple[list[dict], np.ndarray, np.ndarray, np.ndarray, list[dict]]:
-        """actions: (n,) int array. Auto-resets any env that just terminated/truncated.
+        """actions: (n, 2) int array -- [action_type_idx, macro_tile_idx] per
+        env (see OpenFrontEnv.action_space). Auto-resets any env that just
+        terminated/truncated.
 
         Dispatches all N envs' step commands before blocking on any reply
         (step_send/step_recv, see OpenFrontEnv) so their ticks_per_step
@@ -55,7 +57,7 @@ class VecEnv:
         envs strictly sequentially.
         """
         for env, action in zip(self.envs, actions):
-            env.step_send(int(action))
+            env.step_send(action)
 
         obs, rewards, terms, truncs, infos = [], [], [], [], []
         for i, env in enumerate(self.envs):

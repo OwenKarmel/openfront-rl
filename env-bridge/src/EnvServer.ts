@@ -46,12 +46,22 @@
 import fs from "fs";
 import path from "path";
 import readline from "readline";
-import { Difficulty, Game, Player } from "../../OpenFrontIO/src/core/game/Game";
+import { Difficulty, Game, Player, UnitType } from "../../OpenFrontIO/src/core/game/Game";
 import { StampedIntent } from "../../OpenFrontIO/src/core/Schemas";
+import { canBuildTransportShip } from "../../OpenFrontIO/src/core/game/TransportShipUtils";
 import { AGENT_CLIENT_ID, Episode } from "./GameSetup";
 
-const ACTIONS = ["noop", "expand", "attack_opponent"] as const;
+const ACTIONS = ["noop", "expand", "attack_opponent", "boat_attack"] as const;
 type Action = (typeof ACTIONS)[number];
+
+// Fixed-size macro-tile grid a spatial action (today: boat_attack's
+// destination) picks a cell from, independent of the actual map's pixel
+// dimensions -- same size-invariance trick the network's AdaptiveAvgPool2d
+// already relies on. Full tile-resolution targeting would be far more
+// precision than the game needs (canBuildTransportShip below already snaps
+// to the nearest legal shore) and would make the per-step legality mask
+// below cost far more to compute/transmit.
+const MACRO_GRID = 32;
 
 interface ResetCmd {
   cmd: "reset";
@@ -64,6 +74,11 @@ interface ResetCmd {
 interface StepCmd {
   cmd: "step";
   action: Action;
+  // Only meaningful (and required) when action === "boat_attack": a cell in
+  // the MACRO_GRID x MACRO_GRID grid, translated to a real tile server-side
+  // by macroCellToTile().
+  macroX?: number;
+  macroY?: number;
 }
 interface CloseCmd {
   cmd: "close";
@@ -95,15 +110,19 @@ function player(game: Game, playerId: string): Player {
 }
 
 /**
- * Ownership grid: 0 = unowned/water, 1 = AGENT, 2 = OPPONENT. Returned as a
- * Uint8Array (base64-encoded on the wire by observation() below), not a
- * plain number[] -- profiling found that for a 512x512 map, JSON-encoding
- * this as 262144 individual array elements produced a ~524KB line and cost
- * ~10ms of Python-side json.loads plus ~5ms of numpy postprocessing *per
- * decision step* (measured: ~15ms of a ~22ms step, i.e. the dominant cost,
- * well above the actual simulation-tick time). A single base64 string
- * decodes via one C-level call on both ends instead of parsing 262144 JSON
- * tokens.
+ * Ownership grid: 0 = neutral land, 1 = AGENT, 2 = OPPONENT, 3 = water.
+ * Water used to be lumped into the same "0" bucket as neutral land, which
+ * made a naval/boat-destination action unlearnable (the agent couldn't
+ * distinguish "unclaimed land I could expand into" from "open sea") --
+ * split out as its own class now that boat_attack needs it (see
+ * boatTargetMacroMask()). Returned as a Uint8Array (base64-encoded on the
+ * wire by observation() below), not a plain number[] -- profiling found
+ * that for a 512x512 map, JSON-encoding this as 262144 individual array
+ * elements produced a ~524KB line and cost ~10ms of Python-side json.loads
+ * plus ~5ms of numpy postprocessing *per decision step* (measured: ~15ms of
+ * a ~22ms step, i.e. the dominant cost, well above the actual
+ * simulation-tick time). A single base64 string decodes via one C-level
+ * call on both ends instead of parsing 262144 JSON tokens.
  */
 function tileGrid(episode: Episode): Uint8Array {
   const game = episode.game;
@@ -116,8 +135,57 @@ function tileGrid(episode: Episode): Uint8Array {
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
       const ref = map.ref(x, y);
+      if (map.isWater(ref)) {
+        out[y * w + x] = 3;
+        continue;
+      }
       const owner = game.owner(ref);
       out[y * w + x] = owner === agent ? 1 : owner === opponent ? 2 : 0;
+    }
+  }
+  return out;
+}
+
+/**
+ * Translates a (macroX, macroY) cell in the fixed MACRO_GRID x MACRO_GRID
+ * grid into one concrete tile: the map-pixel center of that cell's
+ * rectangle, clamped in bounds. Used both to resolve a sampled boat_attack
+ * action into a real BoatAttackIntent.dst, and (in boatTargetMacroMask
+ * below) as the one representative tile each macro-cell's legality is
+ * checked against -- an approximation (a cell could contain a legal tile
+ * that isn't its center) traded for O(MACRO_GRID^2) legality checks per
+ * step instead of O(tiles). canBuildTransportShip resolves the actual
+ * landing shore itself from whatever tile it's given, so this doesn't need
+ * to land exactly on a shore tile.
+ */
+function macroCellToTile(episode: Episode, macroX: number, macroY: number): number {
+  const map = episode.game.map();
+  const w = episode.game.width();
+  const h = episode.game.height();
+  const x = Math.min(w - 1, Math.max(0, Math.floor(((macroX + 0.5) * w) / MACRO_GRID)));
+  const y = Math.min(h - 1, Math.max(0, Math.floor(((macroY + 0.5) * h) / MACRO_GRID)));
+  return map.ref(x, y);
+}
+
+/**
+ * Per-macro-cell boat-destination legality, packed as MACRO_GRID*MACRO_GRID
+ * bits (1024 bits = 128 bytes for the default 32x32 grid), base64-encoded
+ * on the wire like tileGrid(). Computed once per step and reused for both
+ * legalActions() (is boat_attack legal AT ALL this step) and the
+ * boat_target_mask observation field (WHICH cells) -- avoids running the
+ * O(MACRO_GRID^2) canBuildTransportShip sweep twice.
+ */
+function boatTargetMacroMask(episode: Episode): Uint8Array {
+  const agent = player(episode.game, episode.agentId);
+  const numBits = MACRO_GRID * MACRO_GRID;
+  const out = new Uint8Array(Math.ceil(numBits / 8));
+  for (let my = 0; my < MACRO_GRID; my++) {
+    for (let mx = 0; mx < MACRO_GRID; mx++) {
+      const tile = macroCellToTile(episode, mx, my);
+      if (canBuildTransportShip(episode.game, agent, tile) !== false) {
+        const bitIdx = my * MACRO_GRID + mx;
+        out[bitIdx >> 3] |= 1 << (bitIdx & 7);
+      }
     }
   }
   return out;
@@ -133,12 +201,18 @@ function playerObs(game: Game, playerId: string): PlayerObs {
   };
 }
 
-function observation(episode: Episode, width: number, height: number) {
+function observation(
+  episode: Episode,
+  width: number,
+  height: number,
+  boatMask: Uint8Array,
+) {
   return {
     width,
     height,
     // Base64 of the raw Uint8Array bytes -- see tileGrid()'s comment.
     tileGridB64: Buffer.from(tileGrid(episode).buffer).toString("base64"),
+    boatTargetMacroMaskB64: Buffer.from(boatMask.buffer).toString("base64"),
     players: {
       AGENT: playerObs(episode.game, episode.agentId),
       OPPONENT: playerObs(episode.game, episode.opponentId),
@@ -146,7 +220,7 @@ function observation(episode: Episode, width: number, height: number) {
   };
 }
 
-function legalActions(episode: Episode): Action[] {
+function legalActions(episode: Episode, boatMask: Uint8Array): Action[] {
   const agent = player(episode.game, episode.agentId);
   if (!agent.isAlive()) return ["noop"];
   if (episode.game.inSpawnPhase()) return ["noop"];
@@ -154,6 +228,12 @@ function legalActions(episode: Episode): Action[] {
   const actions: Action[] = ["noop", "expand"];
   if (opponent.isAlive() && agent.sharesBorderWith(opponent)) {
     actions.push("attack_opponent");
+  }
+  if (
+    agent.unitCount(UnitType.TransportShip) < episode.game.config().boatMaxNumber() &&
+    boatMask.some((byte) => byte !== 0)
+  ) {
+    actions.push("boat_attack");
   }
   return actions;
 }
@@ -195,7 +275,12 @@ function potential(episode: Episode): number {
   return (agentTiles - opponentTiles) / totalLandTiles;
 }
 
-function intentFor(action: Action, opponentId: string): StampedIntent | null {
+function intentFor(
+  action: Action,
+  episode: Episode,
+  macroX: number | undefined,
+  macroY: number | undefined,
+): StampedIntent | null {
   switch (action) {
     case "noop":
       return null;
@@ -209,10 +294,28 @@ function intentFor(action: Action, opponentId: string): StampedIntent | null {
     case "attack_opponent":
       return {
         type: "attack",
-        targetID: opponentId,
+        targetID: episode.opponentId,
         troops: null,
         clientID: AGENT_CLIENT_ID,
       };
+    case "boat_attack": {
+      if (macroX === undefined || macroY === undefined) {
+        throw new Error("boat_attack requires macroX/macroY");
+      }
+      const dst = macroCellToTile(episode, macroX, macroY);
+      const agent = player(episode.game, episode.agentId);
+      const owner = episode.game.owner(dst);
+      // Unlike AttackIntent, BoatAttackIntent.troops is a required
+      // (non-nullable) float on the wire schema -- boatAttackAmount() is the
+      // same default-sizing the engine's own Nation-bot boats use.
+      const troops = episode.game.config().boatAttackAmount(agent, owner);
+      return {
+        type: "boat",
+        troops,
+        dst,
+        clientID: AGENT_CLIENT_ID,
+      };
+    }
   }
 }
 
@@ -235,9 +338,10 @@ class Session {
     this.ticksPerStep = cmd.ticksPerStep ?? 10;
     this.dumpGameRecordDir = cmd.dumpGameRecordDir;
     this.prevPotential = potential(this.episode);
+    const boatMask = boatTargetMacroMask(this.episode);
     return {
-      obs: observation(this.episode, this.width, this.height),
-      legalActions: legalActions(this.episode),
+      obs: observation(this.episode, this.width, this.height, boatMask),
+      legalActions: legalActions(this.episode, boatMask),
       done: this.episode.isDone(),
     };
   }
@@ -246,7 +350,7 @@ class Session {
     if (!this.episode) throw new Error("step called before reset");
     const episode = this.episode;
 
-    const intent = intentFor(cmd.action, episode.opponentId);
+    const intent = intentFor(cmd.action, episode, cmd.macroX, cmd.macroY);
     const intents: StampedIntent[] = intent ? [intent] : [];
 
     let done = false;
@@ -285,11 +389,12 @@ class Session {
 
     if (done) this.flushRecord();
 
+    const boatMask = boatTargetMacroMask(episode);
     return {
-      obs: observation(episode, this.width, this.height),
+      obs: observation(episode, this.width, this.height, boatMask),
       reward,
       done,
-      legalActions: legalActions(episode),
+      legalActions: legalActions(episode, boatMask),
       info: { ticks: episode.game.ticks(), winner },
     };
   }

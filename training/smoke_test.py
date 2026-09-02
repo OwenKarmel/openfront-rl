@@ -27,18 +27,26 @@ def main() -> None:
               f"legal_actions={info['legal_actions']}")
 
         total_reward = 0.0
+        boat_attacks_taken = 0
         for i in range(15):
             legal = np.flatnonzero(info["action_mask"])
-            action = int(rng.choice(legal))
-            obs, reward, terminated, truncated, info = env.step(action)
+            action_type = int(rng.choice(legal))
+            tile_idx = 0
+            if ACTIONS[action_type] == "boat_attack":
+                legal_tiles = np.flatnonzero(obs["boat_target_mask"].reshape(-1))
+                tile_idx = int(rng.choice(legal_tiles)) if len(legal_tiles) else 0
+                boat_attacks_taken += 1
+            obs, reward, terminated, truncated, info = env.step([action_type, tile_idx])
             total_reward += reward
             print(
-                f"step {i}: action={ACTIONS[action]} reward={reward:.4f} "
+                f"step {i}: action={ACTIONS[action_type]} tile_idx={tile_idx} reward={reward:.4f} "
                 f"self_tiles={obs['self_tiles'][0]:.0f} opp_tiles={obs['opp_tiles'][0]:.0f} "
                 f"ticks={info['ticks']} terminated={terminated} truncated={truncated}"
             )
             if terminated or truncated:
                 break
+
+        print(f"boat_attack sampled {boat_attacks_taken} time(s) in this run.")
 
         print(f"\nSmoke test passed. total_reward={total_reward:.4f}")
     finally:

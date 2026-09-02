@@ -113,12 +113,29 @@ Concretely this also means:
 - `noop` — do nothing this decision step
 - `expand` — attack neutral (unowned) land bordering AGENT's territory
 - `attack_opponent` — attack OPPONENT directly (only legal once they share a border)
+- `boat_attack` — send a transport ship (troops + a destination tile) across
+  water to invade OPPONENT's territory, including territory AGENT has no
+  land border with. This is what lets the agent cross water at all — before
+  this action existed, an agent landlocked behind an opponent's coastal ring
+  (all land routes blocked) had no way to ever reach the rest of the map.
 
-Intentionally still small: richer intents (boat attacks, structure builds,
-alliances) need a spatial/entity action head to *target* them, which is
-Phase 3 network work, not env-bridge plumbing. `legal_actions`/`action_mask`
-are provided every `reset()`/`step()` so a policy never needs to guess
-legality.
+`boat_attack` is spatially targeted: the action is `[action_type,
+macro_tile_idx]`, where `macro_tile_idx` picks a cell in a fixed 32×32
+"macro-tile" grid (independent of the real map's pixel size — same
+size-invariance trick the network's `AdaptiveAvgPool2d` already relies on).
+`EnvServer.ts`'s `macroCellToTile()` translates the chosen cell into one
+real tile server-side; the real engine (`canBuildTransportShip`) then
+resolves the actual landing shore itself, so the network only ever needs to
+point at "roughly here," not a literal tile. Legal macro-cells are provided
+as `boat_target_mask` in the observation (see below) — the network's
+`tile_head` (`models/network.py`) is masked over exactly this, the same
+`-1e9`-on-illegal-logits pattern the action-type head already used.
+
+Still missing: structure builds and diplomacy (alliances, donations,
+embargoes) — reuse this same macro-tile targeting machinery once added; see
+the action-space-expansion plan for the phased roadmap.
+`legal_actions`/`action_mask`/`boat_target_mask` are provided every
+`reset()`/`step()` so a policy never needs to guess legality.
 
 ## Watching a game
 
@@ -326,6 +343,38 @@ npm run replay:game -- ../training/replays/<gameID>.json
       *recovered* to ~0.75-0.78 by the end rather than collapsing
       permanently, and the early-stop safety net fired a handful of times
       exactly as intended. Long run restarted against this fix.
+- [x] Naval/boat actions: added `boat_attack` (previously agents landlocked
+      behind an opponent's coastal ring had no way to ever cross water — see
+      the action-space-expansion plan). Required a real architecture change,
+      not just a new list entry: (1) `tile_grid` now distinguishes water from
+      neutral land (was conflated as one "0" class); (2) a spatial `tile_head`
+      in `models/network.py`, branching off the CNN's pre-pool feature map
+      (the existing `AdaptiveAvgPool2d` path destroys (x,y) structure, so the
+      tile head taps in earlier), producing a logit over a fixed 32×32
+      macro-tile grid, independent of the real map's pixel size; (3) a
+      factorized action `[action_type, macro_tile_idx]` whose log_prob/
+      entropy are a masked sum of the type term and (only when boat_attack
+      was sampled) the tile term — keeps `ppo.py`'s GAE/clip/entropy-bonus
+      math completely unchanged, since it still only ever sees one scalar
+      log_prob/entropy per transition; (4) a `boatTargetMacroMask` computed
+      server-side once per step (real `canBuildTransportShip` legality,
+      sampled at one representative tile per macro-cell to stay O(1024) not
+      O(tiles) — measured no added per-step latency). No new reward term —
+      the existing territory-margin reward already scores a successful boat
+      landing like any other tile gain. Verified: smoke test round-trips the
+      new wire format and samples/exercises `boat_attack`; a 15-update PPO
+      validation run stayed healthy (value_loss bounded, approx_kl small,
+      entropy explored then settled rather than collapsing — its achievable
+      range is now much higher than the old 3-action ceiling since the tile
+      head's own entropy adds in whenever boat_attack is sampled); a
+      boat-biased episode dump passed `npm run replay:game` **IN SYNC**,
+      confirming the new intent type replays bit-identically through
+      OpenFrontIO's own stock verification tooling.
+- [ ] Roadmap (not yet built, see the action-space-expansion plan): building/
+      structure actions, multi-opponent environment groundwork, and
+      diplomacy actions (alliance/donate/embargo) — diplomacy explicitly
+      gated on multi-opponent support landing first, since it's close to
+      meaningless with exactly one opponent.
 - [ ] v1 milestone: train to consistently beat the Impossible-difficulty
       Nation bot 1v1 — the actual multi-hour-plus training run(s), likely
       spanning local + Kaggle sessions per the original compute plan.
@@ -377,12 +426,18 @@ case of actually hitting the safety cap) still has no winner and still
 counts as a loss for curriculum purposes (see `record_episode` in
 `curriculum.py`).
 
-**What is the agent's action space?** Three discrete choices per decision
-step (`ACTIONS` in `EnvServer.ts`/`openfront_env.py` — see "Action space"
-above): `noop`, `expand` (attack neutral land bordering AGENT), and
+**What is the agent's action space?** Four discrete action *types* per
+decision step (`ACTIONS` in `EnvServer.ts`/`openfront_env.py` — see "Action
+space" above): `noop`, `expand` (attack neutral land bordering AGENT),
 `attack_opponent` (attack OPPONENT directly — only legal once territories
-share a border and both sides are alive). `legal_actions`/`action_mask`
-are provided every step so illegal choices are never sampled.
+share a border and both sides are alive), and `boat_attack` (invade across
+water — see "Action space" above for the macro-tile targeting mechanism).
+The full action is `[action_type, macro_tile_idx]`; `macro_tile_idx` only
+matters (and only contributes to the policy's log-prob/entropy — see
+`models/network.py`'s `act()`/`evaluate_actions()`) when `action_type` is
+`boat_attack`. `legal_actions`/`action_mask` gate which action *types* are
+legal each step; `boat_target_mask` (part of the observation) gates which
+macro-tiles are legal `boat_attack` destinations.
 
 **What is the reward formula?** From `EnvServer.ts`'s `step()`/`potential()`:
 `reward = 5.0 * Δ((agent_tiles - opponent_tiles) / total_land_tiles)` every
@@ -413,11 +468,14 @@ margin and the terminal win/loss are the entire signal for now.
 game state on every decision step (never cached/approximated):
 
 - **`tile_grid`** — a `(height, width)` integer array covering the *entire
-  map*, one entry per tile: `0` = unowned/water, `1` = owned by AGENT, `2` =
-  owned by OPPONENT (`tileGrid()` in `EnvServer.ts`). No fog of war — this is
+  map*, one entry per tile: `0` = neutral land, `1` = owned by AGENT, `2` =
+  owned by OPPONENT, `3` = water (`tileGrid()` in `EnvServer.ts`). Water used
+  to be lumped into the same "0" bucket as neutral land — split out once
+  `boat_attack` needed the distinction, since the agent otherwise couldn't
+  tell "land I could expand into" from "open sea." No fog of war — this is
   full ground-truth ownership, not just what AGENT could plausibly "see" in
   a real game. On the Python/network side (`train.py`'s `obs_to_batch`,
-  `models/network.py`'s `_features`) this is one-hot encoded to 3 channels
+  `models/network.py`'s `_features`) this is one-hot encoded to 4 channels
   and fed through a small CNN.
 - **Six scalar player stats** — `self_tiles`, `self_troops`, `self_gold`
   (AGENT) and `opp_tiles`, `opp_troops`, `opp_gold` (OPPONENT), each a raw
@@ -426,16 +484,25 @@ game state on every decision step (never cached/approximated):
   tame gold's huge dynamic range. No `alive` flag reaches the network
   directly, though `alive` is present in the raw JSON and used server-side to
   decide `legalActions`/episode termination.
+- **`boat_target_mask`** — a `(32, 32)` boolean macro-tile grid, `True` where
+  a `boat_attack` targeting that macro-cell would be legal (computed
+  server-side once per step via `canBuildTransportShip`, the same real-engine
+  legality the game's own UI uses — see "Action space" above). Doubles as
+  both the observation *and* the tile-parameter's action mask, so there's no
+  separate wire field for masking — the network reads legality directly off
+  what it's already shown.
 
 Alongside the observation, every step also carries `legal_actions`/
 `action_mask` (see action space above) — not part of the observation the
 network's CNN/MLP branches consume, but still information available to the
-agent each step, since it's what makes illegal actions unsampleable.
+agent each step, since it's what makes illegal action *types* unsampleable.
 
-Not currently observed: terrain type/elevation beyond ownership, unit
-positions/movement, build menu state, or anything about the opponent's
-intentions — the agent only ever sees the ownership grid and the six scalar
-totals above.
+Not currently observed: existing structures/buildings, units/boats in
+transit, or anything about the opponent's diplomatic state — the agent only
+ever sees the ownership+water grid, the six scalar totals, and the boat
+target mask above. See the action-space-expansion plan for what's needed to
+observe structures (for build actions) and per-opponent relations (for
+diplomacy).
 
 **How is the agent and its opponent placed initially — is it random?**
 - **AGENT: no, always the same fixed spot.** `Episode.create()`

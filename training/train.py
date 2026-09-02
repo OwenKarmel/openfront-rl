@@ -35,10 +35,11 @@ from ppo import RolloutBuffer, ppo_update
 SCALAR_KEYS = ["self_tiles", "self_troops", "self_gold", "opp_tiles", "opp_troops", "opp_gold"]
 
 
-def obs_to_batch(obs_list: list[dict]) -> tuple[np.ndarray, np.ndarray]:
+def obs_to_batch(obs_list: list[dict]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     tile_grid = np.stack([o["tile_grid"] for o in obs_list])
     scalars = np.stack([np.concatenate([o[k] for k in SCALAR_KEYS]) for o in obs_list])
-    return tile_grid, scalars
+    tile_mask = np.stack([o["boat_target_mask"] for o in obs_list])
+    return tile_grid, scalars, tile_mask
 
 
 def mask_batch(infos: list[dict]) -> np.ndarray:
@@ -148,11 +149,13 @@ def run_eval_episode(args: argparse.Namespace, net: ActorCritic, device: torch.d
             scalars = torch.as_tensor(
                 np.concatenate([obs[k] for k in SCALAR_KEYS])[None], dtype=torch.float32, device=device
             )
+            tile_mask = torch.as_tensor(obs["boat_target_mask"][None], dtype=torch.bool, device=device)
             mask = torch.as_tensor(info["action_mask"][None], dtype=torch.bool, device=device)
             with torch.no_grad():
-                logits, _ = net(tile_grid, scalars, mask)
-                action = int(torch.argmax(logits, dim=-1).item())
-            obs, reward, terminated, truncated, info = env.step(action)
+                type_logits, tile_logits, _ = net(tile_grid, scalars, tile_mask, mask)
+                action_type = int(torch.argmax(type_logits, dim=-1).item())
+                tile_idx = int(torch.argmax(tile_logits, dim=-1).item())
+            obs, reward, terminated, truncated, info = env.step([action_type, tile_idx])
             total_reward += reward
         return {
             "winner": info["winner"],
@@ -202,7 +205,7 @@ def main() -> None:
         )
 
     obs_list, info_list = vec_env.reset()
-    tile_grid, scalars = obs_to_batch(obs_list)
+    tile_grid, scalars, tile_mask = obs_to_batch(obs_list)
     action_mask = mask_batch(info_list)
 
     for update in range(start_update, args.updates):
@@ -214,8 +217,9 @@ def main() -> None:
         for _ in range(args.rollout_length):
             tile_grid_t = torch.as_tensor(tile_grid, device=device)
             scalars_t = torch.as_tensor(scalars, dtype=torch.float32, device=device)
+            tile_mask_t = torch.as_tensor(tile_mask, dtype=torch.bool, device=device)
             mask_t = torch.as_tensor(action_mask, dtype=torch.bool, device=device)
-            actions_t, log_probs_t, values_t = net.act(tile_grid_t, scalars_t, mask_t)
+            actions_t, log_probs_t, values_t = net.act(tile_grid_t, scalars_t, tile_mask_t, mask_t)
             actions_np = actions_t.cpu().numpy()
 
             next_obs_list, rewards, terms, truncs, infos = vec_env.step(actions_np)
@@ -226,6 +230,7 @@ def main() -> None:
                 tile_grid,
                 scalars,
                 action_mask,
+                tile_mask,
                 actions_np,
                 log_probs_t.cpu().numpy(),
                 values_t.cpu().numpy(),
@@ -237,14 +242,15 @@ def main() -> None:
                 if "episode_info" in info:
                     episode_outcomes.append(info["episode_info"]["winner"] == "AGENT")
 
-            tile_grid, scalars = obs_to_batch(next_obs_list)
+            tile_grid, scalars, tile_mask = obs_to_batch(next_obs_list)
             action_mask = mask_batch(infos)
 
         with torch.no_grad():
             tile_grid_t = torch.as_tensor(tile_grid, device=device)
             scalars_t = torch.as_tensor(scalars, dtype=torch.float32, device=device)
+            tile_mask_t = torch.as_tensor(tile_mask, dtype=torch.bool, device=device)
             mask_t = torch.as_tensor(action_mask, dtype=torch.bool, device=device)
-            _, last_values_t = net(tile_grid_t, scalars_t, mask_t)
+            _, _, last_values_t = net(tile_grid_t, scalars_t, tile_mask_t, mask_t)
             last_values = last_values_t.cpu().numpy()
 
         stats = ppo_update(
