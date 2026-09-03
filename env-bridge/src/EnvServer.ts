@@ -48,6 +48,7 @@ import fs from "fs";
 import path from "path";
 import readline from "readline";
 import { Difficulty, Game, Player, UnitType } from "../../OpenFrontIO/src/core/game/Game";
+import { targetTransportTile } from "../../OpenFrontIO/src/core/game/TransportShipUtils";
 import { StampedIntent } from "../../OpenFrontIO/src/core/Schemas";
 import { AGENT_CLIENT_ID, Episode } from "./GameSetup";
 
@@ -156,24 +157,6 @@ function player(game: Game, playerId: string): Player {
 }
 
 /**
- * Translates a (macroX, macroY) cell in the fixed MACRO_GRID x MACRO_GRID
- * grid into one concrete tile: the map-pixel center of that cell's
- * rectangle, clamped in bounds. Used to resolve a sampled boat_attack
- * action into a real BoatAttackIntent.dst -- canBuildTransportShip (called
- * internally by the engine's own TransportShipExecution when the intent is
- * processed) resolves the actual landing shore itself from whatever tile
- * it's given, so this doesn't need to land exactly on a shore tile.
- */
-function macroCellToTile(episode: Episode, macroX: number, macroY: number): number {
-  const map = episode.game.map();
-  const w = episode.game.width();
-  const h = episode.game.height();
-  const x = Math.min(w - 1, Math.max(0, Math.floor(((macroX + 0.5) * w) / MACRO_GRID)));
-  const y = Math.min(h - 1, Math.max(0, Math.floor(((macroY + 0.5) * h) / MACRO_GRID)));
-  return map.ref(x, y);
-}
-
-/**
  * Ownership grid (0=neutral land, 1=AGENT, 2=OPPONENT, 3=water) AND the
  * boat-destination macro-mask, computed together in one pass over every
  * tile. Water used to be lumped into the same "0" bucket as neutral land,
@@ -182,21 +165,16 @@ function macroCellToTile(episode: Episode, macroX: number, macroY: number): numb
  * sea") -- split out as its own class now that boat_attack needs it.
  *
  * The boat mask is a CHEAP heuristic (any OPPONENT-owned tile in the
- * macro-cell -> legal), not the real canBuildTransportShip check -- an
- * earlier version called canBuildTransportShip on one representative tile
- * per macro-cell (1024 calls/step). That measured fine in isolation (an
- * all-noop policy keeps the per-attacker water-reachability cache warm),
- * but under a real rollout's constant tile churn (expand/attack/boat
- * actions changing the agent's border every few ticks) that cache
- * invalidates constantly, and each of the 1024 calls does its own bounded
- * BFS plus an A* search -- ~200s/update, ~10x worse than the pre-naval
- * baseline. The engine's own TransportShipExecution still validates the
- * real reachability when a BoatAttackIntent actually executes (an
- * unreachable pick is a harmless no-op, not a crash -- this mask is only a
- * training-time hint, never the authority), so a cheap O(tiles) proxy
- * folded into the grid's existing pass is the right tradeoff: correctness
- * is unaffected, and this eliminates the extra cost entirely rather than
- * just shrinking it.
+ * macro-cell -> legal), not the real targetTransportTile()/
+ * closestReachableShore() check -- deliberately deferred, see
+ * resolveBoatTarget()'s comment for why and for where the real check
+ * actually happens (once, only for the one macro-cell chosen, only on the
+ * step where boat_attack is the sampled type -- not here, on every step,
+ * for every candidate cell). This mask is only ever used to (a) decide
+ * whether "boat_attack" appears in legalActions at all, and (b) as the
+ * network's tile_target_mask for sampling *which* cell to try -- both
+ * tolerant of false positives, since resolveBoatTarget() is the actual
+ * authority when an attempt is made.
  *
  * Returned as Uint8Arrays (base64-encoded on the wire by observation()
  * below), not plain number[]s -- profiling found that for a 512x512 map,
@@ -238,6 +216,70 @@ function tileGridAndBoatMask(episode: Episode): { grid: Uint8Array; boatMask: Ui
     }
   }
   return { grid, boatMask };
+}
+
+/**
+ * Resolves a sampled (macroX, macroY) boat_attack target to a real,
+ * verified landing tile -- called from intentFor(), i.e. ONLY on the one
+ * step where boat_attack is actually the sampled type, and ONLY for that
+ * one chosen macro-cell, never all MACRO_GRID*MACRO_GRID=1024 of them.
+ *
+ * This replaces an earlier version of this fix that ran the real
+ * targetTransportTile()/closestReachableShore() check for every
+ * OPPONENT-bordering macro-cell inside tileGridAndBoatMask(), unconditionally,
+ * on every single step regardless of which action ends up chosen (needed
+ * so the returned tile_target_mask/observation would already reflect real
+ * legality). Benchmarked: ~7-10x slower per step in isolation, and ~3-3.5x
+ * slower per training update end-to-end (measured against this project's
+ * live 8-env rollout: ~23-25s/update baseline -> ~72-87s/update) -- because
+ * that cost was paid on every step, not just boat_attack steps, since
+ * legalActions()/tile_target_mask have to be ready before the network even
+ * samples an action. Deferring to here instead means the expensive part
+ * only runs on steps where the sampled type is actually boat_attack (per
+ * training's own diagnostics, roughly 5-30% of steps, not 100%), and even
+ * then it's exactly ONE targetTransportTile() call, not O(candidate
+ * macro-cells) of them.
+ *
+ * The tradeoff: the mask the network samples FROM (tileGridAndBoatMask()'s
+ * boatMask) stays the cheap any-opponent-tile-in-cell heuristic, so a
+ * sampled cell can still fail this real check (mirroring the original,
+ * pre-fix false-legality gap) -- but now that's confined to "this one
+ * attempt is a no-op" (see intentFor()'s handling of a null return here),
+ * not "the whole per-step mask is expensive regardless of outcome". Given
+ * training's own type_probs diagnostics show boat_attack sampled well
+ * under 100% of steps, this trades a bounded amount of residual no-op risk
+ * for most of the real check's cost back.
+ *
+ * Scans only the chosen macro-cell's own pixel rectangle (bounded by
+ * roughly (w/MACRO_GRID)*(h/MACRO_GRID) tiles, not the whole map) for one
+ * representative OPPONENT-owned tile, then runs the same real check
+ * intentFor() used to always defer to when the mask alone said "legal".
+ * Returns null if the macro-cell truly has no OPPONENT tile (stale/false
+ * heuristic pick) or no real reachable shore near it.
+ */
+function resolveBoatTarget(episode: Episode, macroX: number, macroY: number): number | null {
+  const game = episode.game;
+  const map = game.map();
+  const w = game.width();
+  const h = game.height();
+  const opponent = player(game, episode.opponentId);
+  const agent = player(game, episode.agentId);
+  const x0 = Math.floor((macroX * w) / MACRO_GRID);
+  const x1 = Math.min(w, Math.floor(((macroX + 1) * w) / MACRO_GRID));
+  const y0 = Math.floor((macroY * h) / MACRO_GRID);
+  const y1 = Math.min(h, Math.floor(((macroY + 1) * h) / MACRO_GRID));
+  let representative: number | null = null;
+  for (let y = y0; y < y1 && representative === null; y++) {
+    for (let x = x0; x < x1; x++) {
+      const ref = map.ref(x, y);
+      if (!map.isWater(ref) && game.owner(ref) === opponent) {
+        representative = ref;
+        break;
+      }
+    }
+  }
+  if (representative === null) return null;
+  return targetTransportTile(game, agent, representative);
 }
 
 function playerObs(game: Game, playerId: string): PlayerObs {
@@ -352,7 +394,24 @@ function intentFor(
       if (macroX === undefined || macroY === undefined) {
         throw new Error("boat_attack requires macroX/macroY");
       }
-      const dst = macroCellToTile(episode, macroX, macroY);
+      // dst is the REAL verified landing shore, resolved HERE (not in
+      // tileGridAndBoatMask()) -- see resolveBoatTarget()'s comment for why
+      // this is deliberately deferred to only the step where boat_attack is
+      // actually the sampled type, and only for this one chosen macro-cell.
+      // null means the cheap heuristic mask picked a cell that doesn't
+      // actually have a reachable target (no OPPONENT tile in it after all,
+      // or one with no reachable shore nearby) -- training must never crash
+      // over an env-side edge case like this, so it stays a harmless no-op
+      // (like "noop") rather than throwing, consistent with the rest of
+      // this module's stance on unreachable boat picks. Logged (not
+      // silenced) so a persistently high rate would still be visible.
+      const dst = resolveBoatTarget(episode, macroX, macroY);
+      if (dst === null) {
+        console.warn(
+          `boat_attack macro-cell (${macroX},${macroY}) has no verified target -- treating as noop`,
+        );
+        return null;
+      }
       const agent = player(episode.game, episode.agentId);
       const owner = episode.game.owner(dst);
       // Unlike AttackIntent, BoatAttackIntent.troops is a required
