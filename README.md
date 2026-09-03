@@ -68,6 +68,237 @@ MuZero/EfficientZero, action/observation space, phased milestones).
     approximation of what training saw).
 - `kaggle/` — not yet built (Kaggle burst-training notebooks).
 
+## Architecture
+
+There is exactly **one** trained neural network in this project:
+`ActorCritic` (`training/models/network.py`), a single `nn.Module` with a
+shared conv/MLP trunk and three heads (action-type, spatial tile-target,
+value) that all backprop through that shared trunk together — not three
+separately-trained networks. **178,390 trainable parameters total**
+(~178K), sized deliberately small for a single local GTX 1660 (6GB) plus
+occasional Kaggle GPU bursts, not a cluster.
+
+```mermaid
+flowchart TD
+    TG["tile_grid<br/>(B,H,W) int8 in {0,1,2,3}<br/>0=neutral 1=self 2=opponent 3=water"]
+    SC["scalars (B,6) float32<br/>self_tiles, self_troops, self_gold,<br/>opp_tiles, opp_troops, opp_gold"]
+    TM["tile_target_mask<br/>(B,32,32) bool<br/>legal boat_attack macro-cells"]
+    AM["action_mask (B,4) bool<br/>legal action types"]
+
+    TG --> OH["one_hot → (B,4,H,W) float"]
+
+    subgraph CONVBODY["conv_body — shared spatial CNN · 24,752 params"]
+        direction TB
+        C1["Conv2d(4→16, k5,s2,p2)+ReLU · 1,616p"]
+        C2["Conv2d(16→32, k3,s2,p1)+ReLU · 4,640p"]
+        C3["Conv2d(32→32, k3,s2,p1)+ReLU · 9,248p"]
+        C4["Conv2d(32→32, k3,s2,p1)+ReLU · 9,248p"]
+        C1 --> C2 --> C3 --> C4
+    end
+    OH --> C1
+    C4 --> FM["feat_map (B,32,H/16,W/16)<br/>e.g. (B,32,32,32) on a 512×512 map"]
+
+    FM --> POOL["AdaptiveAvgPool2d(4×4) · 0p"]
+    POOL --> CF["conv_feat (B,512)"]
+
+    subgraph TILEHEAD["tile_head_conv — spatial param head · 33 params"]
+        TC["Conv2d(32→1, k1,s1) · 33p"]
+    end
+    FM --> TC
+    TC --> TAP["adaptive_avg_pool2d(32×32) · 0p"]
+    TAP --> TFLAT["flatten → tile_logits_raw (B,1024)"]
+    TFLAT --> TMASKFILL["masked_fill(¬tile_target_mask, -1e9)"]
+    TM --> TMASKFILL
+    TMASKFILL --> TILEOUT(["tile_logits (B,1024)<br/>Categorical → macro_tile_idx<br/>(only used when action_type==boat_attack)"])
+
+    SC --> LOG1P["log1p(clamp(scalars, min=0))<br/>compresses troop/gold dynamic range"]
+    subgraph SCALARMLP["scalar_mlp — player-stat MLP · 4,608 params"]
+        direction TB
+        S1["Linear(6→64)+ReLU · 448p"]
+        S2["Linear(64→64)+ReLU · 4,160p"]
+        S1 --> S2
+    end
+    LOG1P --> S1
+    S2 --> SF["scalar_feat (B,64)"]
+
+    CF --> CAT["concat → (B,576)"]
+    SF --> CAT
+
+    subgraph TRUNKG["trunk — shared fusion layer · 147,712 params"]
+        T1["Linear(576→256)+ReLU"]
+    end
+    CAT --> T1
+    T1 --> TRF["trunk_feat (B,256)"]
+
+    subgraph TYPEHEAD["type_head — action-type policy · 1,028 params"]
+        TY1["Linear(256→4)"]
+    end
+    TRF --> TY1
+    TY1 --> TYMASKFILL["masked_fill(¬action_mask, -1e9)"]
+    AM --> TYMASKFILL
+    TYMASKFILL --> TYPEOUT(["type_logits (B,4)<br/>Categorical → action_type<br/>{noop, expand, attack_opponent, boat_attack}"])
+
+    subgraph VALUEHEAD["value_head — critic · 257 params"]
+        V1["Linear(256→1)"]
+    end
+    TRF --> V1
+    V1 --> VALOUT(["value (B,)<br/>V(s), fed to GAE in ppo.py"])
+
+    TYPEOUT -.-> COMPOSE["log_prob = log_prob(type) +<br/>1[type==boat_attack] · log_prob(tile)<br/>entropy = entropy(type) +<br/>1[type==boat_attack] · entropy(tile)<br/>(masked-sum composition, network.py act()/evaluate_actions())"]
+    TILEOUT -.-> COMPOSE
+```
+
+### Per-component sizes and hyperparameters
+
+| Component | Type | Shape in → out | Hyperparameters | Params |
+|---|---|---|---|---|
+| `conv_body` (shared) | 4× `Conv2d`+ReLU | `(B,4,H,W)` → `(B,32,H/16,W/16)` | channels 4→16→32→32→32; kernels 5,3,3,3; stride 2 (all); padding 2,1,1,1 | 24,752 |
+| `pool` (trunk path) | `AdaptiveAvgPool2d` | `(B,32,h,w)` → `(B,32,4,4)` | output size 4×4 (fixed, size-invariant to map dims) | 0 |
+| `tile_head_conv` | `Conv2d` 1×1 | `(B,32,h,w)` → `(B,1,h,w)` | kernel 1, stride 1 | 33 |
+| tile head pooling | `adaptive_avg_pool2d` | `(B,1,h,w)` → `(B,1,32,32)` | output size = `MACRO_GRID`=32 (fixed) | 0 |
+| `scalar_mlp` | 2× `Linear`+ReLU | `(B,6)` → `(B,64)` | hidden width 64 (both layers); input pre-transform `log1p(clamp(x,min=0))` | 4,608 |
+| `trunk` | 1× `Linear`+ReLU | `(B,576)` → `(B,256)` | `trunk_dim`=256; input = `conv_feat`(512) ⧺ `scalar_feat`(64) | 147,712 |
+| `type_head` | `Linear` | `(B,256)` → `(B,4)` | `NUM_ACTIONS`=4; masked with `-1e9` on illegal types | 1,028 |
+| `value_head` | `Linear` | `(B,256)` → `(B,1)` | — | 257 |
+| **Total** | | | | **178,390** |
+
+Architecture-level constants (`network.py`): `conv_channels=32`,
+`trunk_dim=256`, `NUM_TILE_CLASSES=4`, `NUM_SCALAR_FEATURES=6`,
+`NUM_ACTIONS=4`, `MACRO_GRID=32` (must match `EnvServer.ts`/
+`openfront_env.py`'s constant of the same name).
+
+### Training (PPO) hyperparameters
+
+Not part of the network itself, but every knob governing how it's
+trained (`train.py` CLI flags / `ppo.py` defaults; **current live run's
+overrides in bold** where they differ from the default):
+
+| Hyperparameter | Default | Current run |
+|---|---|---|
+| optimizer | `torch.optim.Adam` | — |
+| learning rate (`--lr`) | 3e-4 | 3e-4 |
+| discount `gamma` (`--gamma`) | 0.99 | **0.999** |
+| GAE `lambda` (`--gae-lambda`) | 0.95 | 0.95 |
+| PPO clip `epsilon` (`--clip-eps`) | 0.2 | 0.2 |
+| value loss coef (`ppo.py`'s `value_coef`) | 0.5 | 0.5 |
+| entropy coef (`--entropy-coef`) | 0.02 | **0.02** (lowered from an earlier 0.04 — see Status) |
+| max grad norm (`ppo.py`'s `max_grad_norm`) | 0.5 | 0.5 |
+| target KL / early-stop (`--target-kl`) | 0.03 (abort epoch loop past 1.5×) | 0.03 |
+| PPO epochs per update (`--epochs`) | 4 | 4 |
+| minibatch size (`--minibatch-size`) | 128 | 128 |
+| parallel envs (`--num-envs`) | 4 | **8** |
+| rollout length (`--rollout-length`) | 64 | **300** |
+| ticks per decision step (`--ticks-per-step`) | 10 | 10 |
+| max episode steps, safety cap (`--max-episode-steps`) | 20,000 | 20,000 |
+| curriculum window (`--curriculum-window`) | 20 episodes | 20 episodes |
+| checkpoint interval (`--checkpoint-every`) | 20 updates | **10** |
+| eval interval (`--eval-every`) | 20 updates | **10** |
+
+Environment/reward-side constants (`EnvServer.ts`, not network
+hyperparameters but still tunable knobs): potential-shaping coefficient
+`5.0`, terminal win/loss reward `±1`, `MACRO_GRID`=32.
+
+## Upcoming Architecture
+
+Not yet built — the proposed design for Phase 1 of the roadmap (see the
+naval/boat-actions plan: multi-opponent support + the variable-N
+opponent-encoding architecture it requires). Kept here so the diagram
+travels with the codebase, and in the plan file itself so it travels with
+the design rationale — the two copies should be kept identical if this
+design changes before it's implemented.
+
+The core problem this solves: today's network concatenates a fixed
+6-scalar vector (three stats for AGENT, three for exactly one OPPONENT)
+into the trunk. That only works for exactly one opponent. Supporting a
+variable number of opponents (1, 5, 10, ...) needs a fundamentally
+different encoding for the opponent side — a **DeepSets**-style shared
+per-opponent MLP (`φ`) followed by a masked, permutation-invariant
+sum-pool, so the network handles any `N` without hard-coding a shape. The
+same per-opponent embeddings also feed a small **pointer-network**-style
+read-out head so `attack_opponent` can select *which* opponent to attack
+out of however many currently exist, rather than there being exactly one
+implicit target.
+
+Green = new component, amber = changed input/output shape on an
+otherwise-existing component, plain = unchanged from the shipped network:
+
+```mermaid
+flowchart TD
+    classDef newnode fill:#d1fae5,stroke:#059669,color:#065f46,stroke-width:2px;
+    classDef changednode fill:#fef3c7,stroke:#d97706,color:#78350f,stroke-width:2px;
+
+    subgraph LEGEND["Legend"]
+        direction LR
+        LN["new component"]:::newnode
+        LC["changed shape/input"]:::changednode
+        LU["unchanged"]
+    end
+
+    TG["tile_grid (B,H,W) int8 in {0,1,2,3}<br/>0=neutral 1=self 2=ANY-opponent 3=water<br/>(unchanged -- stays 4 classes, no per-opponent identity)"]
+    SS["self_scalars (B,7) float32<br/>self_tiles, self_troops, self_gold, self_troops_ratio<br/>+3 more TBD"]:::changednode
+    OR["opponent_raw (B,MAX_OPPONENTS,6) float32<br/>per slot: alive, tiles, troops, troops_ratio, gold, shares_border<br/>MAX_OPPONENTS=10 (proposed), padded"]:::newnode
+    OM["opponent_mask (B,10) bool<br/>True = real opponent, False = padding"]:::newnode
+    ATM["attack_target_mask (B,10) bool<br/>legal attack_opponent targets"]:::newnode
+    TM["tile_target_mask (B,32,32) bool (unchanged)"]
+    AM["action_mask (B,4) bool (unchanged)<br/>{noop,expand,attack_opponent,boat_attack}"]
+
+    TG --> CONVPATH["conv_body -> pool -> conv_feat (B,512)<br/>(unchanged -- see README Architecture)"]
+    TG --> TILEPATH["tile_head_conv -> tile_logits (B,1024)<br/>(unchanged -- see README Architecture)"]
+    TM --> TILEPATH
+
+    SS --> SMLP["scalar_mlp (unchanged 2-layer, 64-wide)<br/>input dim 6 to 7"]:::changednode
+    SMLP --> SF["self_feat (B,64)"]
+
+    OR --> RESHAPE1["reshape (B,10,6) -> (B*10,6)"]:::newnode
+    subgraph PHI["opponent_mlp (phi) -- shared per-opponent MLP - NEW"]
+        direction TB
+        P1["Linear(6 to 64)+ReLU (proposed)"]
+        P2["Linear(64 to 64)+ReLU (proposed)"]
+        P1 --> P2
+    end
+    class PHI newnode
+    RESHAPE1 --> P1
+    P2 --> RESHAPE2["reshape (B*10,64) -> (B,10,64)<br/>= per-opponent embeddings"]:::newnode
+
+    RESHAPE2 --> POOL2["masked sum-pool over slot dim<br/>(zero out padding via opponent_mask first)"]:::newnode
+    OM --> POOL2
+    POOL2 --> OSUM["opponent_set_summary (B,64)<br/>permutation-invariant, N-agnostic (DeepSets)"]:::newnode
+
+    RESHAPE2 --> PTRHEAD["pointer head: Linear(64 to 1) shared per-slot (proposed)<br/>applied to PRE-POOL embeddings"]:::newnode
+    PTRHEAD --> PTRSQ["squeeze -> player_idx_logits_raw (B,10)"]:::newnode
+    PTRSQ --> PTRMASK["masked_fill(not attack_target_mask, -1e9)"]:::newnode
+    ATM --> PTRMASK
+    PTRMASK --> PLAYEROUT(["player_idx_logits (B,10)<br/>Categorical -> player_idx<br/>(only used when action_type==attack_opponent)"]):::newnode
+
+    CONVPATH --> CAT["concat -> (B, 512+64+64=640)"]:::changednode
+    SF --> CAT
+    OSUM --> CAT
+
+    CAT --> TRUNK["trunk: Linear(640 to 256)+ReLU<br/>(unchanged shape logic, input dim 576 to 640)"]:::changednode
+    TRUNK --> TRF["trunk_feat (B,256)"]
+
+    TRF --> TYPEHEAD["type_head: Linear(256 to 4) (unchanged)"]
+    AM --> TYPEHEAD
+    TYPEHEAD --> TYPEOUT(["type_logits (B,4) -> action_type<br/>{noop,expand,attack_opponent,boat_attack} (unchanged)"])
+
+    TRF --> VALUEHEAD["value_head: Linear(256 to 1) (unchanged)"]
+    VALUEHEAD --> VALOUT(["value (B,) (unchanged)"])
+
+    TYPEOUT -.-> COMPOSE["log_prob = log_prob(type)<br/>+ 1[type==boat_attack]-log_prob(tile)<br/>+ 1[type==attack_opponent]-log_prob(player_idx)<br/>entropy: same 3-term structure<br/>(THIRD term is new -- reuses the RolloutBuffer's<br/>already-reserved player_idx slot)"]:::changednode
+    TILEPATH -.-> COMPOSE
+    PLAYEROUT -.-> COMPOSE
+```
+
+Notably **unchanged**: the spatial tile-ownership grid stays 4 classes
+(`neutral, self, ANY-opponent, water`) rather than growing to encode
+per-opponent identity spatially. `boat_attack` doesn't need to know in
+advance which opponent owns a macro-cell (the engine resolves that from
+the real destination tile after the fact), and `attack_opponent`'s target
+selection is handled by the pointer head instead of a tile — so the much
+harder problem of broadcasting a variable-length per-opponent embedding
+back onto a fixed-channel spatial grid is deliberately deferred until a
+concrete capability gap actually needs it.
+
 ## Why real construction matters (train/deploy fidelity)
 
 Earlier versions of this project used a `TestConfig`-derived config (fast,
