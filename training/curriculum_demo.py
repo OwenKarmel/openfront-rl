@@ -3,10 +3,11 @@ several episodes of a random (legal-action-masked) policy.
 
 This is a mechanism demo, not a training result: a random policy has no
 reason to beat even Easy reliably, so the expected (and correct) outcome
-here is the scheduler staying at/near "easy" rather than climbing the
-ladder -- promotions only happen once Phase 3's real policy can actually
-win consistently. What this proves is that reset(difficulty=...) and the
-scheduler's promote/demote bookkeeping work end to end.
+here is the scheduler staying at "easy" rather than climbing the ladder --
+promotions only happen once Phase 3's real policy can actually win
+consistently. What this proves is that reset(difficulty=...) and the
+scheduler's (promotion-only, no demotion -- see curriculum.py) bookkeeping
+work end to end.
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ NUM_EPISODES = 12
 
 def main() -> None:
     rng = np.random.default_rng(0)
-    scheduler = CurriculumScheduler(window=4, promote_threshold=0.6, demote_threshold=0.2)
+    scheduler = CurriculumScheduler(window=4, promote_threshold=0.6)
 
     for episode in range(NUM_EPISODES):
         difficulty = scheduler.difficulty

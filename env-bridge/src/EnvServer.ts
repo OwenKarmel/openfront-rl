@@ -64,9 +64,18 @@ import { AGENT_CLIENT_ID, Episode } from "./GameSetup";
 // harness concern, not an engine change -- rather than in Python, since
 // Node's console.warn already writes straight to stderr before it ever
 // reaches the Python subprocess.
+//
+// resolveBoatTarget()'s own "no verified target -- treating as noop"
+// warning (intentFor(), below) is the same class of expected/harmless
+// no-op, and at training volume was ~98% of train_stdout.log's lines
+// (332,717 of 340,383 measured on a live run) -- filtered here for the
+// same reason, not because the underlying rate is a problem worth fixing.
 const originalConsoleWarn = console.warn;
 console.warn = (...args: unknown[]) => {
-  if (typeof args[0] === "string" && args[0].includes("cannot send ship to")) {
+  if (
+    typeof args[0] === "string" &&
+    (args[0].includes("cannot send ship to") || args[0].includes("has no verified target"))
+  ) {
     return;
   }
   originalConsoleWarn(...args);

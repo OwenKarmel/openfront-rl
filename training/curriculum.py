@@ -1,17 +1,43 @@
 """Windowed win-rate curriculum scheduler.
 
 Tracks the agent's recent win rate against the current difficulty and
-advances (or backs off) through OpenFrontEnv's DIFFICULTIES ladder --
-Easy -> Medium -> Hard -> Impossible -- accordingly. This is deliberately
-just the scheduling policy: it doesn't run episodes or train anything,
-so it's usable as-is once Phase 3 wires up a real PPO training loop, and
+advances through OpenFrontEnv's DIFFICULTIES ladder -- Easy -> Medium ->
+Hard -> Impossible -- accordingly. This is deliberately just the
+scheduling policy: it doesn't run episodes or train anything, so it's
+usable as-is once Phase 3 wires up a real PPO training loop, and
 independently testable/demoable before that loop exists (see
 curriculum_demo.py).
 
-Demotion exists because a fixed-difficulty curriculum risks catastrophic
-forgetting: an agent promoted on a lucky streak that then can't hold Medium
-should drop back rather than grind uselessly against an opponent it isn't
-beating, per the self-play/league guidance in the project plan.
+Monotonic (promotion only, no demotion): an earlier version demoted back
+down once the trailing win rate fell to <=20%, on a catastrophic-forgetting
+rationale. In practice this produced a persistent oscillation, not a
+safety net -- promotion is gated on mastery of the *current* (easier) tier,
+not readiness for the next one, so crossing the promote threshold reliably
+triggered an initial losing streak against the harder opponent, which then
+hit the demote threshold before enough medium-specific experience had
+accumulated to actually close the gap; demoting cleared the window and
+dropped back to a difficulty the policy hadn't forgotten (weights aren't
+reset on demotion), so it re-promoted quickly on unchanged skill and
+repeated. Measured on a real run: 25 easy<->medium round-trips over ~2,500
+updates, 73% of that time spent back at easy, hard never reached even
+once. Removing demotion trades the (theoretical, not observed here)
+catastrophic-forgetting risk for guaranteed forward progress and lets a
+harder tier accumulate the sustained time-on-task it needs to actually be
+learnable.
+
+Fed from eval (greedy/deterministic) episodes, not training-rollout
+(stochastic/sampled) ones -- train.py calls record_episode() from
+run_eval_episode()'s result, not from the stochastic episode_outcomes
+collected during rollout. This matters a lot more now that promotion is
+one-way: on a real run, the stochastic training win rate at medium sat
+around 15-27% while the greedy eval win rate was a flat 0% across 105
+medium evals -- promoting on the stochastic number alone risks locking in
+a permanent promotion the actual (deployed, watched) policy hasn't earned.
+window=12 and promote_threshold=0.75 (9/12) are deliberately conservative
+given there's no more demotion to correct a premature promotion; the
+tradeoff is a much slower feedback loop (evals run once every
+--eval-every updates, not several times per update like training
+episodes), accepted deliberately since training now runs indefinitely.
 """
 
 from __future__ import annotations
@@ -25,9 +51,8 @@ DIFFICULTIES = ["easy", "medium", "hard", "impossible"]
 @dataclass
 class CurriculumScheduler:
     difficulties: list[str] = field(default_factory=lambda: list(DIFFICULTIES))
-    window: int = 20
-    promote_threshold: float = 0.6
-    demote_threshold: float = 0.2
+    window: int = 12
+    promote_threshold: float = 0.75
     start_index: int = 0
 
     def __post_init__(self) -> None:
@@ -48,7 +73,7 @@ class CurriculumScheduler:
         return sum(self._results) / len(self._results)
 
     def record_episode(self, won: bool) -> str:
-        """Feed one episode's outcome in; returns "promoted"/"demoted"/"holding"."""
+        """Feed one episode's outcome in; returns "promoted"/"holding" (no demotion -- see module docstring)."""
         self._results.append(won)
         rate = self.win_rate
         if rate is None:
@@ -57,10 +82,6 @@ class CurriculumScheduler:
             self._index += 1
             self._results.clear()
             return "promoted"
-        if rate <= self.demote_threshold and self._index > 0:
-            self._index -= 1
-            self._results.clear()
-            return "demoted"
         return "holding"
 
     def state(self) -> dict:

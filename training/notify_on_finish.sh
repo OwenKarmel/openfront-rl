@@ -15,12 +15,14 @@ while kill -0 "$PID" 2>/dev/null; do
 done
 
 LAST_LINES=$(tail -5 "$LOG")
-if echo "$LAST_LINES" | grep -qE "^update +1999 "; then
-  STATUS="finished all 2000 updates"
-elif echo "$LAST_LINES" | grep -qiE "error|traceback"; then
-  STATUS="stopped early -- looks like a crash"
+if echo "$LAST_LINES" | grep -qiE "error|traceback"; then
+  STATUS="stopped -- looks like a crash"
 else
-  STATUS="process exited (check log for details)"
+  # Training runs indefinitely (--updates 0) -- there is no "finished"
+  # state to detect anymore, so any exit that isn't an obvious crash is
+  # reported as unexpected (a clean stop should come from an intentional
+  # kill, which this watcher isn't told about and can't distinguish here).
+  STATUS="process exited unexpectedly (check log for details)"
 fi
 
 curl -s -m 15 -d "OpenFront RL training run: $STATUS. PID $PID." "https://ntfy.sh/$TOPIC" >/dev/null

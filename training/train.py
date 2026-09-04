@@ -3,20 +3,25 @@ of an agent against OpenFrontIO's real built-in Nation-AI, working toward
 the v1 milestone (beat Impossible 1v1).
 
 Usage:
-    python train.py [--num-envs 4] [--rollout-length 64] [--updates 1000]
+    python train.py [--num-envs 4] [--rollout-length 64] [--updates 0]
                      [--map onion] [--checkpoint-dir checkpoints]
                      [--checkpoint-every 20] [--eval-every 20]
 
-Resumes automatically from <checkpoint-dir>/latest.pt if present (model,
-optimizer, curriculum scheduler state, update count) -- safe to Ctrl-C and
-rerun, which matters given this trains across Kaggle session boundaries
-(12h/session cap) as well as the local GPU.
+`--updates` defaults to 0, meaning run indefinitely (no fixed stopping
+point) -- pass a positive value to cap it instead. Resumes automatically
+from <checkpoint-dir>/latest.pt if present (model, optimizer, curriculum
+scheduler state, update count) -- safe to Ctrl-C and rerun, which matters
+given this trains across Kaggle session boundaries (12h/session cap) as
+well as the local GPU.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import itertools
+import json
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -56,7 +61,10 @@ def parse_args() -> argparse.Namespace:
     # (training and eval alike) should end via a real win/loss
     # (Episode.isDone()), not by running out of decision steps.
     p.add_argument("--max-episode-steps", type=int, default=20000)
-    p.add_argument("--updates", type=int, default=1000)
+    p.add_argument(
+        "--updates", type=int, default=0,
+        help="stop after this many updates; 0 (default) or negative runs indefinitely",
+    )
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--gamma", type=float, default=0.99)
     p.add_argument("--gae-lambda", type=float, default=0.95)
@@ -88,7 +96,10 @@ def parse_args() -> argparse.Namespace:
     # pressure than they gain from fewer/bigger steps. 128 is the settled
     # middle ground.
     p.add_argument("--minibatch-size", type=int, default=128)
-    p.add_argument("--curriculum-window", type=int, default=20)
+    p.add_argument(
+        "--curriculum-window", type=int, default=12,
+        help="number of eval (greedy) episodes the curriculum's rolling win rate is computed over",
+    )
     p.add_argument("--checkpoint-dir", default=str(Path(__file__).parent / "checkpoints"))
     p.add_argument("--checkpoint-every", type=int, default=20, help="updates between checkpoints")
     p.add_argument("--eval-every", type=int, default=20, help="updates between eval episodes")
@@ -117,9 +128,48 @@ def save_checkpoint(path: Path, net, optimizer, scheduler: CurriculumScheduler, 
             "update": update,
             "curriculum_index": scheduler._index,
             "curriculum_results": list(scheduler._results),
+            # Marks curriculum_results as eval-episode (greedy) outcomes --
+            # see load_checkpoint()'s comment. Bump/rename this if the
+            # semantics of what record_episode() is fed ever change again.
+            "curriculum_mode": "eval",
         },
         path,
     )
+
+
+MILESTONE_DIFFICULTIES = ("medium", "hard", "impossible")
+
+
+def send_ntfy(message: str) -> None:
+    """Fire-and-forget push notification via ntfy.sh, same topic/mechanism
+    notify_on_finish.sh already uses for run-went-down alerts -- topic read
+    from training/.ntfy_topic (sibling of this file), one unified
+    notification stream rather than a second topic to track. Never raises:
+    a notification failure (offline, ntfy.sh down) must not take training
+    down with it."""
+    topic_path = Path(__file__).parent / ".ntfy_topic"
+    try:
+        topic = topic_path.read_text().strip()
+        if not topic:
+            return
+        subprocess.run(
+            ["curl", "-s", "-m", "15", "-d", message, f"https://ntfy.sh/{topic}"],
+            check=False, capture_output=True, timeout=20,
+        )
+    except Exception as e:  # noqa: BLE001 -- deliberately broad, see docstring
+        print(f"  (ntfy notification failed, continuing: {e})")
+
+
+def load_notified_milestones(checkpoint_dir: Path) -> set[str]:
+    path = checkpoint_dir / "notified_milestones.json"
+    if not path.exists():
+        return set()
+    return set(json.loads(path.read_text()))
+
+
+def save_notified_milestones(checkpoint_dir: Path, notified: set[str]) -> None:
+    path = checkpoint_dir / "notified_milestones.json"
+    path.write_text(json.dumps(sorted(notified)))
 
 
 def load_checkpoint(path: Path, net, optimizer, scheduler: CurriculumScheduler) -> int:
@@ -128,7 +178,20 @@ def load_checkpoint(path: Path, net, optimizer, scheduler: CurriculumScheduler) 
     optimizer.load_state_dict(ckpt["optimizer"])
     scheduler._index = ckpt["curriculum_index"]
     scheduler._results.clear()
-    scheduler._results.extend(ckpt["curriculum_results"])
+    # curriculum_results predating "curriculum_mode": "eval" (see
+    # save_checkpoint()) holds stochastic training-rollout outcomes, not
+    # eval ones -- a different, incompatible population from what the
+    # window means now. Reinterpreting old stochastic win/losses as eval
+    # results could misfire an early promotion on stale, wrong-kind data,
+    # so those get discarded (fresh eval window) rather than loaded; the
+    # difficulty level itself (curriculum_index) is still valid and kept.
+    if ckpt.get("curriculum_mode") == "eval":
+        scheduler._results.extend(ckpt["curriculum_results"])
+    elif ckpt.get("curriculum_results"):
+        print(
+            "  (checkpoint's curriculum_results predate eval-based promotion -- "
+            "discarding, starting a fresh eval window at the same difficulty)"
+        )
     return ckpt["update"]
 
 
@@ -193,6 +256,11 @@ def main() -> None:
         vec_env.set_difficulty(scheduler.difficulty)
         print(f"resumed from {latest_path} at update {start_update}, difficulty={scheduler.difficulty}")
 
+    # First-time-beats-{medium,hard,impossible} milestone notifications --
+    # persisted alongside the checkpoint so a restart doesn't re-fire a
+    # milestone already hit in a prior run.
+    notified_milestones = load_notified_milestones(checkpoint_dir)
+
     log_path = Path(args.log_csv)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_is_new = not log_path.exists()
@@ -209,7 +277,8 @@ def main() -> None:
     tile_grid, scalars, tile_mask = obs_to_batch(obs_list)
     action_mask = mask_batch(info_list)
 
-    for update in range(start_update, args.updates):
+    update_iter = range(start_update, args.updates) if args.updates > 0 else itertools.count(start_update)
+    for update in update_iter:
         t0 = time.time()
         buffer = RolloutBuffer()
         episode_outcomes: list[bool] = []  # True = AGENT won
@@ -277,12 +346,6 @@ def main() -> None:
             target_kl=args.target_kl,
         )
 
-        for won in episode_outcomes:
-            outcome = scheduler.record_episode(won)
-            if outcome != "holding":
-                vec_env.set_difficulty(scheduler.difficulty)
-                print(f"  curriculum {outcome} -> {scheduler.difficulty}")
-
         win_rate = (sum(episode_outcomes) / len(episode_outcomes)) if episode_outcomes else float("nan")
         mean_reward = reward_sum / (args.rollout_length * args.num_envs)
         elapsed = time.time() - t0
@@ -308,8 +371,44 @@ def main() -> None:
             print(f"  checkpoint saved: {latest_path}")
 
         if (update + 1) % args.eval_every == 0:
-            result = run_eval_episode(args, net, device, scheduler.difficulty, update + 1)
-            print(f"  eval vs {scheduler.difficulty}: {result}")
+            # Captured before record_episode() below, which can promote and
+            # change scheduler.difficulty as a side effect -- both the
+            # milestone check and the printed "eval vs X" line must refer to
+            # the difficulty this particular eval was actually run against,
+            # not whatever the scheduler ends up at afterward.
+            eval_difficulty = scheduler.difficulty
+            result = run_eval_episode(args, net, device, eval_difficulty, update + 1)
+            print(f"  eval vs {eval_difficulty}: {result}")
+
+            if (
+                result["winner"] == "AGENT"
+                and eval_difficulty in MILESTONE_DIFFICULTIES
+                and eval_difficulty not in notified_milestones
+            ):
+                notified_milestones.add(eval_difficulty)
+                save_notified_milestones(checkpoint_dir, notified_milestones)
+                send_ntfy(
+                    f"OpenFront RL milestone: agent beat a {eval_difficulty} opponent "
+                    f"for the first time (eval at update {update + 1}, ticks={result['ticks']})."
+                )
+                print(f"  *** milestone: first eval win vs {eval_difficulty} -- ntfy sent ***")
+
+            # Curriculum promotion is driven by eval (greedy/deterministic)
+            # outcomes, not the stochastic training-rollout episodes above --
+            # see curriculum.py's docstring for why: the stochastic win rate
+            # can look much better than the actual (deployed, watched)
+            # greedy policy, especially early against a new difficulty, and
+            # since promotion is one-way (no demotion), that gap matters a
+            # lot more than it used to.
+            curriculum_outcome = scheduler.record_episode(result["winner"] == "AGENT")
+            if curriculum_outcome != "holding":
+                vec_env.set_difficulty(scheduler.difficulty)
+                print(f"  curriculum {curriculum_outcome} -> {scheduler.difficulty}")
+            state = scheduler.state()
+            print(
+                f"  curriculum state: difficulty={state['difficulty']} "
+                f"eval_win_rate={state['win_rate']} episodes_at_level={state['episodes_at_level']}/{scheduler.window}"
+            )
 
     save_checkpoint(latest_path, net, optimizer, scheduler, args.updates)
     vec_env.close()
