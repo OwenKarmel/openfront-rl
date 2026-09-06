@@ -1,8 +1,11 @@
 # openfront-rl
+> AI Use Disclosure: Claude Code, an AI coding agent, was extensively used in this project. More human written documentation will follow once the project is complete. 
 
 Training a deep RL agent to beat OpenFrontIO's hardest built-in AI
 ("Impossible"-difficulty Nation bot) via self-play, under a tight compute
-budget (one local GTX 1660 + free-tier Kaggle GPU/TPU hours).
+budget (one local GTX 1660).
+
+Current status: can beat the "medium" difficulty Nation bot. 
 
 See `.claude`-generated plan for full design rationale (PPO over
 MuZero/EfficientZero, action/observation space, phased milestones).
