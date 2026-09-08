@@ -3,10 +3,8 @@
 Tracks the agent's recent win rate against the current difficulty and
 advances through OpenFrontEnv's DIFFICULTIES ladder -- Easy -> Medium ->
 Hard -> Impossible -- accordingly. This is deliberately just the
-scheduling policy: it doesn't run episodes or train anything, so it's
-usable as-is once Phase 3 wires up a real PPO training loop, and
-independently testable/demoable before that loop exists (see
-curriculum_demo.py).
+scheduling policy: it doesn't run episodes or train anything, which keeps
+it independently testable without standing up an environment.
 
 Monotonic (promotion only, no demotion): an earlier version demoted back
 down once the trailing win rate fell to <=20%, on a catastrophic-forgetting

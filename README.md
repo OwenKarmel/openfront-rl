@@ -42,9 +42,13 @@ MuZero/EfficientZero, action/observation space, phased milestones).
   - `curriculum.py` — `CurriculumScheduler`: windowed win-rate promotion/
     demotion through Easy → Medium → Hard → Impossible, now driven by real
     training via `train.py`.
-  - `smoke_test.py`, `curriculum_demo.py`, `dump_random_policy_log.py` —
-    round-trip checks and mechanism demos using a random (legal-action-
-    masked) policy; none of them are the actual training loop.
+  - `smoke_test.py` — full-stack round-trip check using a random
+    (legal-action-masked) policy; not the actual training loop.
+  - `smoke_test_multiopp.py` — checks the properties that make the opponent
+    encoder count-agnostic (one network across 1/5/10 slots, padding
+    contributing nothing, permutation invariance, the pointer head never
+    targeting a masked-off slot). These can't be covered by training while
+    `MAX_OPPONENTS` is 1, since nothing is ever padded or ambiguous then.
   - `models/network.py` — the actor-critic network: a small CNN (strided
     convs + adaptive pooling, so it works across map sizes unchanged) over
     the one-hot tile-ownership grid, concatenated with an MLP over the six
@@ -72,16 +76,29 @@ MuZero/EfficientZero, action/observation space, phased milestones).
 
 There is exactly **one** trained neural network in this project:
 `ActorCritic` (`training/models/network.py`), a single `nn.Module` with a
-shared conv/MLP trunk and three heads (action-type, spatial tile-target,
-value) that all backprop through that shared trunk together — not three
-separately-trained networks. **178,390 trainable parameters total**
-(~178K), sized deliberately small for a single local GTX 1660 (6GB) plus
-occasional Kaggle GPU bursts, not a cluster.
+shared conv/MLP trunk and four heads (action-type, spatial tile-target,
+opponent-pointer, value) that all backprop through that shared trunk
+together — not four separately-trained networks. **199,319 trainable
+parameters total** (~199K), sized deliberately small for a single local GTX
+1660 (6GB) plus occasional Kaggle GPU bursts, not a cluster.
+
+Opponents are encoded as a **set**, not fixed scalars: a shared per-opponent
+MLP (`opponent_mlp`, DeepSets' φ) embeds each padded slot, a masked sum-pool
+collapses those into one order-independent summary for the trunk, and a
+shared pointer head scores each slot for `attack_opponent`'s target. No
+weight shape depends on the number of opponents, so the count is a config
+value (`MAX_OPPONENTS`), not an architectural commitment. It is **1** today —
+the same 1v1 matchup as every run so far — with the count-agnostic
+properties covered by `training/smoke_test_multiopp.py` rather than by
+training.
 
 ```mermaid
 flowchart TD
-    TG["tile_grid<br/>(B,H,W) int8 in {0,1,2,3}<br/>0=neutral 1=self 2=opponent 3=water"]
-    SC["scalars (B,6) float32<br/>self_tiles, self_troops, self_gold,<br/>opp_tiles, opp_troops, opp_gold"]
+    TG["tile_grid<br/>(B,H,W) int8 in {0,1,2,3}<br/>0=neutral 1=self 2=ANY-opponent 3=water"]
+    SC["self_features (B,4) float32<br/>tiles, troops, troops_ratio, gold"]
+    OR["opponent_features (B,S,6) float32<br/>per slot: alive, tiles, troops,<br/>troops_ratio, gold, shares_border<br/>S = MAX_OPPONENTS (1 today), padded"]
+    OM["opponent_mask (B,S) bool<br/>True = real opponent, False = padding"]
+    ATM["attack_target_mask (B,S) bool<br/>legal attack_opponent targets"]
     TM["tile_target_mask<br/>(B,32,32) bool<br/>legal boat_attack macro-cells"]
     AM["action_mask (B,4) bool<br/>legal action types"]
 
@@ -111,21 +128,42 @@ flowchart TD
     TM --> TMASKFILL
     TMASKFILL --> TILEOUT(["tile_logits (B,1024)<br/>Categorical → macro_tile_idx<br/>(only used when action_type==boat_attack)"])
 
-    SC --> LOG1P["log1p(clamp(scalars, min=0))<br/>compresses troop/gold dynamic range"]
-    subgraph SCALARMLP["scalar_mlp — player-stat MLP · 4,608 params"]
+    SC --> LOG1P["log1p(clamp(x, min=0))<br/>compresses troop/gold dynamic range"]
+    subgraph SCALARMLP["scalar_mlp — own-stat MLP · 4,480 params"]
         direction TB
-        S1["Linear(6→64)+ReLU · 448p"]
+        S1["Linear(4→64)+ReLU · 320p"]
         S2["Linear(64→64)+ReLU · 4,160p"]
         S1 --> S2
     end
     LOG1P --> S1
-    S2 --> SF["scalar_feat (B,64)"]
+    S2 --> SF["self_feat (B,64)"]
 
-    CF --> CAT["concat → (B,576)"]
+    OR --> LOG1PO["log1p(clamp(x, min=0))"]
+    subgraph PHI["opponent_mlp (φ) — shared per-opponent MLP · 4,608 params"]
+        direction TB
+        P1["Linear(6→64)+ReLU · 448p"]
+        P2["Linear(64→64)+ReLU · 4,160p"]
+        P1 --> P2
+    end
+    LOG1PO --> P1
+    P2 --> OEMB["opponent_emb (B,S,64)<br/>same weights applied to every slot"]
+
+    OEMB --> POOL2["mask, then sum over the slot dim<br/>(padding contributes exactly 0)"]
+    OM --> POOL2
+    POOL2 --> OSUM["opponent_summary (B,64)<br/>permutation-invariant, count-agnostic"]
+
+    OEMB --> PTR["player_head: Linear(64→1) · 65p<br/>shared, reads PRE-pool embeddings"]
+    PTR --> PTRSQ["squeeze → (B,S)"]
+    PTRSQ --> PTRMASK["masked_fill(¬attack_target_mask, -1e9)"]
+    ATM --> PTRMASK
+    PTRMASK --> PLAYEROUT(["player_logits (B,S)<br/>Categorical → player_idx<br/>(only used when action_type==attack_opponent)"])
+
+    CF --> CAT["concat → (B,640)"]
     SF --> CAT
+    OSUM --> CAT
 
-    subgraph TRUNKG["trunk — shared fusion layer · 147,712 params"]
-        T1["Linear(576→256)+ReLU"]
+    subgraph TRUNKG["trunk — shared fusion layer · 164,096 params"]
+        T1["Linear(640→256)+ReLU"]
     end
     CAT --> T1
     T1 --> TRF["trunk_feat (B,256)"]
@@ -144,8 +182,9 @@ flowchart TD
     TRF --> V1
     V1 --> VALOUT(["value (B,)<br/>V(s), fed to GAE in ppo.py"])
 
-    TYPEOUT -.-> COMPOSE["log_prob = log_prob(type) +<br/>1[type==boat_attack] · log_prob(tile)<br/>entropy = entropy(type) +<br/>1[type==boat_attack] · entropy(tile)<br/>(masked-sum composition, network.py act()/evaluate_actions())"]
+    TYPEOUT -.-> COMPOSE["log_prob = log_prob(type)<br/>+ 1[type==boat_attack] · log_prob(tile)<br/>+ 1[type==attack_opponent] · log_prob(player_idx)<br/>entropy: same 3-term structure<br/>(masked-sum composition, network.py act()/evaluate_actions())"]
     TILEOUT -.-> COMPOSE
+    PLAYEROUT -.-> COMPOSE
 ```
 
 ### Per-component sizes and hyperparameters
@@ -156,16 +195,21 @@ flowchart TD
 | `pool` (trunk path) | `AdaptiveAvgPool2d` | `(B,32,h,w)` → `(B,32,4,4)` | output size 4×4 (fixed, size-invariant to map dims) | 0 |
 | `tile_head_conv` | `Conv2d` 1×1 | `(B,32,h,w)` → `(B,1,h,w)` | kernel 1, stride 1 | 33 |
 | tile head pooling | `adaptive_avg_pool2d` | `(B,1,h,w)` → `(B,1,32,32)` | output size = `MACRO_GRID`=32 (fixed) | 0 |
-| `scalar_mlp` | 2× `Linear`+ReLU | `(B,6)` → `(B,64)` | hidden width 64 (both layers); input pre-transform `log1p(clamp(x,min=0))` | 4,608 |
-| `trunk` | 1× `Linear`+ReLU | `(B,576)` → `(B,256)` | `trunk_dim`=256; input = `conv_feat`(512) ⧺ `scalar_feat`(64) | 147,712 |
+| `scalar_mlp` | 2× `Linear`+ReLU | `(B,4)` → `(B,64)` | hidden width 64 (both layers); input pre-transform `log1p(clamp(x,min=0))` | 4,480 |
+| `opponent_mlp` (φ) | 2× `Linear`+ReLU | `(B,S,6)` → `(B,S,64)` | hidden width 64; **shared across all S slots** — the weight sharing is what makes the encoder permutation-invariant and count-agnostic | 4,608 |
+| opponent pooling | masked sum | `(B,S,64)` → `(B,64)` | padding zeroed via `opponent_mask` before summing; sum (not mean) keeps opponent count recoverable | 0 |
+| `player_head` | `Linear` | `(B,S,64)` → `(B,S)` | shared per-slot; reads pre-pool embeddings; masked with `-1e9` on illegal targets | 65 |
+| `trunk` | 1× `Linear`+ReLU | `(B,640)` → `(B,256)` | `trunk_dim`=256; input = `conv_feat`(512) ⧺ `self_feat`(64) ⧺ `opponent_summary`(64) | 164,096 |
 | `type_head` | `Linear` | `(B,256)` → `(B,4)` | `NUM_ACTIONS`=4; masked with `-1e9` on illegal types | 1,028 |
 | `value_head` | `Linear` | `(B,256)` → `(B,1)` | — | 257 |
-| **Total** | | | | **178,390** |
+| **Total** | | | | **199,319** |
 
 Architecture-level constants (`network.py`): `conv_channels=32`,
-`trunk_dim=256`, `NUM_TILE_CLASSES=4`, `NUM_SCALAR_FEATURES=6`,
-`NUM_ACTIONS=4`, `MACRO_GRID=32` (must match `EnvServer.ts`/
-`openfront_env.py`'s constant of the same name).
+`trunk_dim=256`, `NUM_TILE_CLASSES=4`, `NUM_SELF_FEATURES=4`,
+`NUM_OPPONENT_FEATURES=6`, `NUM_ACTIONS=4`, `MACRO_GRID=32` (the last must
+match `EnvServer.ts`/`openfront_env.py`'s constant of the same name, as must
+`MAX_OPPONENTS` — which is *not* a network constant precisely because no
+weight shape depends on it; `S` is read from the input tensor at runtime).
 
 ### Training (PPO) hyperparameters
 
@@ -196,109 +240,36 @@ overrides in bold** where they differ from the default):
 
 Environment/reward-side constants (`EnvServer.ts`, not network
 hyperparameters but still tunable knobs): potential-shaping coefficient
-`5.0`, terminal win/loss reward `±1`, `MACRO_GRID`=32.
+`1.0` (i.e. the tile-share delta is used unscaled), terminal win/loss reward
+`±1` (a truncated/drawn episode scores `-1`, same as a loss), `MACRO_GRID`=32,
+`MAX_OPPONENTS`=1.
 
 ## Upcoming Architecture
 
-Not yet built — the proposed design for Phase 1 of the roadmap (see the
-naval/boat-actions plan: multi-opponent support + the variable-N
-opponent-encoding architecture it requires). Kept here so the diagram
-travels with the codebase, and in the plan file itself so it travels with
-the design rationale — the two copies should be kept identical if this
-design changes before it's implemented.
+Phase 1 of the roadmap (multi-opponent support + the variable-N opponent
+encoding it requires) is **built** — its diagram is the live one in
+[Architecture](#architecture) above, not a proposal. `MAX_OPPONENTS` is
+still 1, so the shipped environment is the same 1v1 matchup as before; what
+changed is that neither the wire format nor any weight shape depends on that
+number anymore, so raising it is a config change. `attack_opponent` is now
+parameterized by `player_idx` (chosen by the pointer head), and the observation
+carries `self_troops_ratio` plus a per-opponent `troops_ratio` — the
+capped-army signal that a raw troop count cannot express, since the cap is
+map- and tile-count-dependent.
 
-The core problem this solves: today's network concatenates a fixed
-6-scalar vector (three stats for AGENT, three for exactly one OPPONENT)
-into the trunk. That only works for exactly one opponent. Supporting a
-variable number of opponents (1, 5, 10, ...) needs a fundamentally
-different encoding for the opponent side — a **DeepSets**-style shared
-per-opponent MLP (`φ`) followed by a masked, permutation-invariant
-sum-pool, so the network handles any `N` without hard-coding a shape. The
-same per-opponent embeddings also feed a small **pointer-network**-style
-read-out head so `attack_opponent` can select *which* opponent to attack
-out of however many currently exist, rather than there being exactly one
-implicit target.
+Deliberately **not** taken from the roadmap: its proposed sum-of-margins
+reward (`(self_tiles - Σ opp_tiles) / total_land_tiles`). The live reward
+counts only AGENT's own tile share, which already means the same thing at
+any opponent count, so there was nothing to generalize — and changing the
+reward in the same step as the architecture would make any regression
+un-attributable to either. See `potential()` in `EnvServer.ts`.
 
-Green = new component, amber = changed input/output shape on an
-otherwise-existing component, plain = unchanged from the shipped network:
-
-```mermaid
-flowchart TD
-    classDef newnode fill:#d1fae5,stroke:#059669,color:#065f46,stroke-width:2px;
-    classDef changednode fill:#fef3c7,stroke:#d97706,color:#78350f,stroke-width:2px;
-
-    subgraph LEGEND["Legend"]
-        direction LR
-        LN["new component"]:::newnode
-        LC["changed shape/input"]:::changednode
-        LU["unchanged"]
-    end
-
-    TG["tile_grid (B,H,W) int8 in {0,1,2,3}<br/>0=neutral 1=self 2=ANY-opponent 3=water<br/>(unchanged -- stays 4 classes, no per-opponent identity)"]
-    SS["self_scalars (B,7) float32<br/>self_tiles, self_troops, self_gold, self_troops_ratio<br/>+3 more TBD"]:::changednode
-    OR["opponent_raw (B,MAX_OPPONENTS,6) float32<br/>per slot: alive, tiles, troops, troops_ratio, gold, shares_border<br/>MAX_OPPONENTS=10 (proposed), padded"]:::newnode
-    OM["opponent_mask (B,10) bool<br/>True = real opponent, False = padding"]:::newnode
-    ATM["attack_target_mask (B,10) bool<br/>legal attack_opponent targets"]:::newnode
-    TM["tile_target_mask (B,32,32) bool (unchanged)"]
-    AM["action_mask (B,4) bool (unchanged)<br/>{noop,expand,attack_opponent,boat_attack}"]
-
-    TG --> CONVPATH["conv_body -> pool -> conv_feat (B,512)<br/>(unchanged -- see README Architecture)"]
-    TG --> TILEPATH["tile_head_conv -> tile_logits (B,1024)<br/>(unchanged -- see README Architecture)"]
-    TM --> TILEPATH
-
-    SS --> SMLP["scalar_mlp (unchanged 2-layer, 64-wide)<br/>input dim 6 to 7"]:::changednode
-    SMLP --> SF["self_feat (B,64)"]
-
-    OR --> RESHAPE1["reshape (B,10,6) -> (B*10,6)"]:::newnode
-    subgraph PHI["opponent_mlp (phi) -- shared per-opponent MLP - NEW"]
-        direction TB
-        P1["Linear(6 to 64)+ReLU (proposed)"]
-        P2["Linear(64 to 64)+ReLU (proposed)"]
-        P1 --> P2
-    end
-    class PHI newnode
-    RESHAPE1 --> P1
-    P2 --> RESHAPE2["reshape (B*10,64) -> (B,10,64)<br/>= per-opponent embeddings"]:::newnode
-
-    RESHAPE2 --> POOL2["masked sum-pool over slot dim<br/>(zero out padding via opponent_mask first)"]:::newnode
-    OM --> POOL2
-    POOL2 --> OSUM["opponent_set_summary (B,64)<br/>permutation-invariant, N-agnostic (DeepSets)"]:::newnode
-
-    RESHAPE2 --> PTRHEAD["pointer head: Linear(64 to 1) shared per-slot (proposed)<br/>applied to PRE-POOL embeddings"]:::newnode
-    PTRHEAD --> PTRSQ["squeeze -> player_idx_logits_raw (B,10)"]:::newnode
-    PTRSQ --> PTRMASK["masked_fill(not attack_target_mask, -1e9)"]:::newnode
-    ATM --> PTRMASK
-    PTRMASK --> PLAYEROUT(["player_idx_logits (B,10)<br/>Categorical -> player_idx<br/>(only used when action_type==attack_opponent)"]):::newnode
-
-    CONVPATH --> CAT["concat -> (B, 512+64+64=640)"]:::changednode
-    SF --> CAT
-    OSUM --> CAT
-
-    CAT --> TRUNK["trunk: Linear(640 to 256)+ReLU<br/>(unchanged shape logic, input dim 576 to 640)"]:::changednode
-    TRUNK --> TRF["trunk_feat (B,256)"]
-
-    TRF --> TYPEHEAD["type_head: Linear(256 to 4) (unchanged)"]
-    AM --> TYPEHEAD
-    TYPEHEAD --> TYPEOUT(["type_logits (B,4) -> action_type<br/>{noop,expand,attack_opponent,boat_attack} (unchanged)"])
-
-    TRF --> VALUEHEAD["value_head: Linear(256 to 1) (unchanged)"]
-    VALUEHEAD --> VALOUT(["value (B,) (unchanged)"])
-
-    TYPEOUT -.-> COMPOSE["log_prob = log_prob(type)<br/>+ 1[type==boat_attack]-log_prob(tile)<br/>+ 1[type==attack_opponent]-log_prob(player_idx)<br/>entropy: same 3-term structure<br/>(THIRD term is new -- reuses the RolloutBuffer's<br/>already-reserved player_idx slot)"]:::changednode
-    TILEPATH -.-> COMPOSE
-    PLAYEROUT -.-> COMPOSE
-```
-
-Notably **unchanged**: the spatial tile-ownership grid stays 4 classes
-(`neutral, self, ANY-opponent, water`) rather than growing to encode
-per-opponent identity spatially. `boat_attack` doesn't need to know in
-advance which opponent owns a macro-cell (the engine resolves that from
-the real destination tile after the fact), and `attack_opponent`'s target
-selection is handled by the pointer head instead of a tile — so the much
-harder problem of broadcasting a variable-length per-opponent embedding
-back onto a fixed-channel spatial grid is deliberately deferred until a
-concrete capability gap actually needs it.
-
+Still unbuilt: Phase 2 (building/structure actions, reusing the macro-tile
+head as a build-location picker plus a `unit_type` head) and Phase 3
+(diplomacy — alliances, donations, embargoes — all `player_idx`-parameterized
+and reusing the pointer head above rather than adding new architecture).
+Phase 3 is gated on multi-opponent being genuinely exercised, since
+diplomacy is close to meaningless against exactly one opponent.
 ## Why real construction matters (train/deploy fidelity)
 
 Earlier versions of this project used a `TestConfig`-derived config (fast,
@@ -343,15 +314,22 @@ Concretely this also means:
 
 - `noop` — do nothing this decision step
 - `expand` — attack neutral (unowned) land bordering AGENT's territory
-- `attack_opponent` — attack OPPONENT directly (only legal once they share a border)
+- `attack_opponent` — attack one specific opponent, chosen by `player_idx`
+  (only legal for opponents that are alive and share a land border)
 - `boat_attack` — send a transport ship (troops + a destination tile) across
-  water to invade OPPONENT's territory, including territory AGENT has no
+  water to invade opponent territory, including territory AGENT has no
   land border with. This is what lets the agent cross water at all — before
   this action existed, an agent landlocked behind an opponent's coastal ring
   (all land routes blocked) had no way to ever reach the rest of the map.
 
-`boat_attack` is spatially targeted: the action is `[action_type,
-macro_tile_idx]`, where `macro_tile_idx` picks a cell in a fixed 32×32
+Both targeted actions are parameterized, so the action is `[action_type,
+macro_tile_idx, player_idx]` — each parameter read only for its own type.
+`player_idx` indexes the padded opponent array (see Architecture above);
+its legal values are given by `attack_target_mask`, and unlike the boat
+mask that one is exact, so the env-bridge rejects an unmasked pick rather
+than treating it as a no-op.
+
+`boat_attack` is spatially targeted: `macro_tile_idx` picks a cell in a fixed 32×32
 "macro-tile" grid (independent of the real map's pixel size — same
 size-invariance trick the network's `AdaptiveAvgPool2d` already relies on).
 `EnvServer.ts`'s `macroCellToTile()` translates the chosen cell into one
@@ -498,9 +476,9 @@ npm run smoke -- --map onion --seed smoke-1 --ticks 300 --difficulty hard
 cd ../training
 python smoke_test.py
 
-# Curriculum scheduler mechanism demo (random policy — expect it to stay
-# at "easy"; only a real policy earns promotions)
-python curriculum_demo.py
+# Variable-opponent-count architecture checks (no environment needed for
+# most of it — see smoke_test_multiopp.py's docstring)
+python smoke_test_multiopp.py
 
 # Headless replay verification via OpenFrontIO's own stock tooling
 cd ../env-bridge
@@ -665,39 +643,45 @@ counts as a loss for curriculum purposes (see `record_episode` in
 **What is the agent's action space?** Four discrete action *types* per
 decision step (`ACTIONS` in `EnvServer.ts`/`openfront_env.py` — see "Action
 space" above): `noop`, `expand` (attack neutral land bordering AGENT),
-`attack_opponent` (attack OPPONENT directly — only legal once territories
-share a border and both sides are alive), and `boat_attack` (invade across
+`attack_opponent` (attack one specific opponent — only legal against one
+that is alive and shares a border), and `boat_attack` (invade across
 water — see "Action space" above for the macro-tile targeting mechanism).
-The full action is `[action_type, macro_tile_idx]`; `macro_tile_idx` only
-matters (and only contributes to the policy's log-prob/entropy — see
-`models/network.py`'s `act()`/`evaluate_actions()`) when `action_type` is
-`boat_attack`. `legal_actions`/`action_mask` gate which action *types* are
-legal each step; `boat_target_mask` (part of the observation) gates which
-macro-tiles are legal `boat_attack` destinations.
+The full action is `[action_type, macro_tile_idx, player_idx]`; each
+parameter only matters (and only contributes to the policy's
+log-prob/entropy — see `models/network.py`'s `act()`/`evaluate_actions()`)
+for its own type — `macro_tile_idx` for `boat_attack`, `player_idx` for
+`attack_opponent`. `legal_actions`/`action_mask` gate which action *types*
+are legal each step; `boat_target_mask` and `attack_target_mask` (both part
+of the observation) gate the two parameters.
 
 **What is the reward formula?** From `EnvServer.ts`'s `step()`/`potential()`:
-`reward = 5.0 * Δ((agent_tiles - opponent_tiles) / total_land_tiles)` every
-decision step — potential-based shaping on the *relative, map-size-
-normalized* tile-count margin — **plus**, only on the step the episode
-ends: `+1` if AGENT is alive and OPPONENT isn't (a win), `-1` if the
-reverse (a loss), `+0` otherwise (a truncation with both still alive).
-Both the "relative" and the "normalized" parts were found necessary the
-hard way (see Status), not chosen upfront:
-- **Relative, not just AGENT's own count** — an earlier single-sided
-  version (`Δagent_tiles` alone) made expanding into neutral land and
-  attacking OPPONENT reward-equivalent per tile, with attacking strictly
-  riskier for no extra reward, so the policy learned to expand forever and
-  never fight.
-- **Normalized by `numLandTiles()`** — even after making it relative, raw
-  tile-count deltas on a real map (tens of thousands of tiles) produced
-  huge, unbounded per-step rewards, which produced huge value-function
-  targets, which produced value-loss gradients large enough to destabilize
-  the policy through the network's shared trunk (see `models/network.py`)
-  despite PPO's usual ratio clipping. Normalizing bounds `potential()` to
-  roughly [-1, 1] regardless of map size.
+`reward = Δ(agent_tiles / total_land_tiles)` every decision step —
+potential-based shaping on AGENT's map-size-normalized tile *share* —
+**plus**, only on the step the episode ends: `+1` if AGENT outlived every
+opponent (a win), `-1` otherwise, which includes both an outright loss and
+a truncated/drawn episode. Stalling to the episode-length safety cap is
+therefore punished like a loss, not treated as neutral.
+
+Two notes on how this got here, both worth knowing before changing it:
+- **Normalized by `numLandTiles()`** — raw tile-count deltas on a real map
+  (tens of thousands of tiles) produce huge, unbounded per-step rewards,
+  which produce huge value-function targets, which produce value-loss
+  gradients large enough to destabilize the policy through the network's
+  shared trunk (see `models/network.py`) despite PPO's usual ratio clipping.
+  This part is load-bearing; normalizing bounds `potential()` to [0, 1]
+  regardless of map size.
+- **Not relative to opponents** — an earlier version subtracted the
+  opponent's tile count, because with only AGENT's own count, expanding into
+  neutral land and attacking are reward-equivalent per tile while attacking
+  is strictly riskier, and a run under a single-sided reward once collapsed
+  to "expand forever, never fight" within ~10 updates. The current
+  single-sided formula deliberately reintroduces that risk (see
+  `potential()`'s comment) — **watch for an entropy collapse** if you resume
+  a run under it. It is also, incidentally, already opponent-count-agnostic,
+  which is why the multi-opponent work changed nothing here.
 
 There's still no separate reward for gold/troops/build actions — territory
-margin and the terminal win/loss are the entire signal for now.
+share and the terminal win/loss are the entire signal for now.
 
 **What observation does the agent see at each timestep?** `observation()` in
 `EnvServer.ts` returns two parts, both recomputed fresh from the real live
@@ -705,7 +689,8 @@ game state on every decision step (never cached/approximated):
 
 - **`tile_grid`** — a `(height, width)` integer array covering the *entire
   map*, one entry per tile: `0` = neutral land, `1` = owned by AGENT, `2` =
-  owned by OPPONENT, `3` = water (`tileGrid()` in `EnvServer.ts`). Water used
+  owned by *any* opponent (deliberately no per-opponent identity — see
+  Architecture), `3` = water (`tileGrid()` in `EnvServer.ts`). Water used
   to be lumped into the same "0" bucket as neutral land — split out once
   `boat_attack` needed the distinction, since the agent otherwise couldn't
   tell "land I could expand into" from "open sea." No fog of war — this is
@@ -713,13 +698,28 @@ game state on every decision step (never cached/approximated):
   a real game. On the Python/network side (`train.py`'s `obs_to_batch`,
   `models/network.py`'s `_features`) this is one-hot encoded to 4 channels
   and fed through a small CNN.
-- **Six scalar player stats** — `self_tiles`, `self_troops`, `self_gold`
-  (AGENT) and `opp_tiles`, `opp_troops`, `opp_gold` (OPPONENT), each a raw
-  live count/amount from `playerObs()` (`p.numTilesOwned()`, `p.troops()`,
-  `p.gold()`). Fed through `log1p` before the network's scalar MLP branch to
-  tame gold's huge dynamic range. No `alive` flag reaches the network
-  directly, though `alive` is present in the raw JSON and used server-side to
-  decide `legalActions`/episode termination.
+- **`self_features`** — AGENT's own stats: `tiles`, `troops`, `troops_ratio`,
+  `gold`, from `playerObs()` (`p.numTilesOwned()`, `p.troops()`, `p.gold()`).
+  Fed through `log1p` before the network's scalar MLP branch to tame gold's
+  huge dynamic range.
+- **`opponent_features` + `opponent_mask`** — a padded `(MAX_OPPONENTS, 6)`
+  array, one row per opponent slot: `alive`, `tiles`, `troops`,
+  `troops_ratio`, `gold`, `shares_border`, with `opponent_mask` marking
+  which slots are real rather than padding. Consumed by the network's shared
+  per-opponent MLP + masked sum-pool (see Architecture), so the observation's
+  shape doesn't change when the opponent count does. `MAX_OPPONENTS` is 1
+  today, so there is exactly one real slot and no padding.
+- **`troops_ratio`** (both sides) — `troops / config.maxTroops(player)`.
+  Worth calling out separately because it is *not* redundant with `troops`:
+  troop regrowth stops at the cap (`troopIncreaseRate()` scales growth by
+  `1 - troops/maxTroops`), and the cap is map- and tile-count-dependent, so
+  no fixed threshold on the raw count means "capped" twice. Added after a
+  replay showed AGENT sitting at ratio 1.000 for ~100k ticks with 200k+
+  unclaimed neutral tiles beside it.
+- **`attack_target_mask`** — `(MAX_OPPONENTS,)` boolean, `True` where
+  `attack_opponent` may legally target that slot (alive + shares a land
+  border). The pointer head is masked over exactly this, the same
+  `-1e9`-on-illegal-logits pattern the other heads use.
 - **`boat_target_mask`** — a `(32, 32)` boolean macro-tile grid, `True` where
   a `boat_attack` targeting that macro-cell would be legal (computed
   server-side once per step via `canBuildTransportShip`, the same real-engine
@@ -734,20 +734,23 @@ network's CNN/MLP branches consume, but still information available to the
 agent each step, since it's what makes illegal action *types* unsampleable.
 
 Not currently observed: existing structures/buildings, units/boats in
-transit, or anything about the opponent's diplomatic state — the agent only
-ever sees the ownership+water grid, the six scalar totals, and the boat
-target mask above. See the action-space-expansion plan for what's needed to
+transit, or anything about diplomatic state — the agent only ever sees the
+ownership+water grid, its own and its opponents' stat vectors, and the two
+target masks above. See the action-space-expansion plan for what's needed to
 observe structures (for build actions) and per-opponent relations (for
-diplomacy).
+diplomacy); the latter fold into `opponent_features` as extra per-slot
+columns rather than needing a new encoder.
 
 **How is the agent and its opponent placed initially — is it random?**
-- **AGENT: no, always the same fixed spot.** `Episode.create()`
-  (`GameSetup.ts`) spawns AGENT at the nearest land tile to
-  `(15% of map width, 50% of map height)` — a fixed point on the map's west
-  side, vertically centered — via a spiral search (`findLandTile`) outward
-  from that point. Every episode, every seed, every map: same target
-  point (though the actual nearest-land tile found can differ *by map*,
-  since it depends on that map's coastline).
+- **AGENT: yes, random per episode.** `Episode.create()` (`GameSetup.ts`)
+  draws a uniformly random `(x, y)` and snaps it to the nearest land tile
+  via a spiral search (`findLandTile`), from a `PseudoRandom` seeded off the
+  episode's gameID — deterministic given the seed, different across seeds.
+  A random point can land somewhere `SpawnExecution` rejects (a landlocked
+  speck, or terrain already owned within its spawn radius), which is a
+  silent no-op rather than an error, so it retries up to 50 times and only
+  gives up if none took. This replaced a fixed spawn point (15% across, 50%
+  down) that gave the agent the same opening position every single episode.
 - **OPPONENT: seed-dependent, not manually randomized, and not fixed
   either.** Which real nation from the map's manifest becomes OPPONENT is
   chosen by `createNationsForGame()` — a PRNG shuffle

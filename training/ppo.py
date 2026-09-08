@@ -21,20 +21,30 @@ class RolloutBuffer:
     by map, so tile_grid is a python list of (N,H,W) arrays, one per step)."""
 
     tile_grids: list = field(default_factory=list)  # T x (N, H, W)
-    scalars: list = field(default_factory=list)  # T x (N, 6)
+    self_features: list = field(default_factory=list)  # T x (N, NUM_SELF_FEATURES)
+    opponent_features: list = field(default_factory=list)  # T x (N, slots, NUM_OPPONENT_FEATURES)
+    opponent_masks: list = field(default_factory=list)  # T x (N, slots)
     action_masks: list = field(default_factory=list)  # T x (N, num_actions)
     tile_masks: list = field(default_factory=list)  # T x (N, MACRO_GRID, MACRO_GRID)
-    actions: list = field(default_factory=list)  # T x (N, 2) -- [action_type, macro_tile_idx]
+    attack_masks: list = field(default_factory=list)  # T x (N, slots)
+    # T x (N, 3) -- [action_type, macro_tile_idx, player_idx]
+    actions: list = field(default_factory=list)
     log_probs: list = field(default_factory=list)  # T x (N,) -- already-composed scalar, see network.py
     values: list = field(default_factory=list)  # T x (N,)
     rewards: list = field(default_factory=list)  # T x (N,)
     dones: list = field(default_factory=list)  # T x (N,) -- terminated OR truncated
 
-    def add(self, tile_grid, scalars, action_mask, tile_mask, action, log_prob, value, reward, done):
+    def add(
+        self, tile_grid, self_feat, opponent_feat, opponent_mask, action_mask,
+        tile_mask, attack_mask, action, log_prob, value, reward, done,
+    ):
         self.tile_grids.append(tile_grid)
-        self.scalars.append(scalars)
+        self.self_features.append(self_feat)
+        self.opponent_features.append(opponent_feat)
+        self.opponent_masks.append(opponent_mask)
         self.action_masks.append(action_mask)
         self.tile_masks.append(tile_mask)
+        self.attack_masks.append(attack_mask)
         self.actions.append(action)
         self.log_probs.append(log_prob)
         self.values.append(value)
@@ -95,20 +105,32 @@ def ppo_update(
     # Flatten (T, N, ...) -> (T*N, ...) for minibatching. tile_grid shape can
     # vary per-map but is constant within one training run, so a plain stack
     # is safe here.
-    flat_tile_grid = np.stack(buffer.tile_grids).reshape(T * N, *buffer.tile_grids[0].shape[1:])
-    flat_scalars = np.stack(buffer.scalars).reshape(T * N, -1)
-    flat_masks = np.stack(buffer.action_masks).reshape(T * N, -1)
-    flat_tile_masks = np.stack(buffer.tile_masks).reshape(T * N, *buffer.tile_masks[0].shape[1:])
-    flat_actions = np.stack(buffer.actions).reshape(T * N, -1)
+    def flatten(steps: list) -> np.ndarray:
+        """T x (N, ...) -> (T*N, ...), preserving every trailing dim."""
+        return np.stack(steps).reshape(T * N, *steps[0].shape[1:])
+
+    flat_tile_grid = flatten(buffer.tile_grids)
+    flat_self_features = flatten(buffer.self_features)
+    flat_opponent_features = flatten(buffer.opponent_features)
+    flat_opponent_masks = flatten(buffer.opponent_masks)
+    flat_masks = flatten(buffer.action_masks)
+    flat_tile_masks = flatten(buffer.tile_masks)
+    flat_attack_masks = flatten(buffer.attack_masks)
+    flat_actions = flatten(buffer.actions)
     flat_log_probs = np.stack(buffer.log_probs).reshape(T * N)
     flat_advantages = advantages.reshape(T * N)
     flat_returns = returns.reshape(T * N)
     flat_old_values = values.reshape(T * N)
 
     tile_grid_t = torch.as_tensor(flat_tile_grid, device=device)
-    scalars_t = torch.as_tensor(flat_scalars, dtype=torch.float32, device=device)
+    self_features_t = torch.as_tensor(flat_self_features, dtype=torch.float32, device=device)
+    opponent_features_t = torch.as_tensor(
+        flat_opponent_features, dtype=torch.float32, device=device
+    )
+    opponent_masks_t = torch.as_tensor(flat_opponent_masks, dtype=torch.bool, device=device)
     masks_t = torch.as_tensor(flat_masks, dtype=torch.bool, device=device)
     tile_masks_t = torch.as_tensor(flat_tile_masks, dtype=torch.bool, device=device)
+    attack_masks_t = torch.as_tensor(flat_attack_masks, dtype=torch.bool, device=device)
     actions_t = torch.as_tensor(flat_actions, dtype=torch.long, device=device)
     old_log_probs_t = torch.as_tensor(flat_log_probs, dtype=torch.float32, device=device)
     advantages_t = torch.as_tensor(flat_advantages, dtype=torch.float32, device=device)
@@ -127,7 +149,14 @@ def ppo_update(
             idx = perm[start : start + minibatch_size]
 
             log_probs, entropy, value = net.evaluate_actions(
-                tile_grid_t[idx], scalars_t[idx], tile_masks_t[idx], masks_t[idx], actions_t[idx]
+                tile_grid_t[idx],
+                self_features_t[idx],
+                opponent_features_t[idx],
+                opponent_masks_t[idx],
+                tile_masks_t[idx],
+                attack_masks_t[idx],
+                masks_t[idx],
+                actions_t[idx],
             )
             ratio = torch.exp(log_probs - old_log_probs_t[idx])
             adv = advantages_t[idx]

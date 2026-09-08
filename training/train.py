@@ -32,19 +32,48 @@ import numpy as np
 import torch
 
 from curriculum import CurriculumScheduler
-from envs.openfront_env import ACTIONS, OpenFrontEnv
+from envs.openfront_env import (
+    ACTIONS,
+    OPPONENT_TILES_IDX,
+    SELF_TILES_IDX,
+    SMALL_MAPS,
+    OpenFrontEnv,
+)
 from envs.vector_env import VecEnv
 from models.network import ActorCritic
 from ppo import RolloutBuffer, ppo_update
 
-SCALAR_KEYS = ["self_tiles", "self_troops", "self_gold", "opp_tiles", "opp_troops", "opp_gold"]
+# Every observation field the network consumes, stacked across envs. Kept as
+# one dict rather than a tuple of parallel locals: the network takes seven
+# inputs now, and threading seven same-looking arrays through the loop
+# positionally is how they end up silently swapped.
+BATCH_KEYS = (
+    "tile_grid",
+    "self_features",
+    "opponent_features",
+    "opponent_mask",
+    "boat_target_mask",
+    "attack_target_mask",
+)
 
 
-def obs_to_batch(obs_list: list[dict]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    tile_grid = np.stack([o["tile_grid"] for o in obs_list])
-    scalars = np.stack([np.concatenate([o[k] for k in SCALAR_KEYS]) for o in obs_list])
-    tile_mask = np.stack([o["boat_target_mask"] for o in obs_list])
-    return tile_grid, scalars, tile_mask
+def obs_to_batch(obs_list: list[dict]) -> dict[str, np.ndarray]:
+    return {k: np.stack([o[k] for o in obs_list]) for k in BATCH_KEYS}
+
+
+def net_inputs(batch: dict[str, np.ndarray], action_mask: np.ndarray, device) -> tuple:
+    """The tensors every ActorCritic entry point takes, in its argument
+    order -- forward(), act(), and type_diagnostics() all share this
+    signature (evaluate_actions() appends the taken actions)."""
+    return (
+        torch.as_tensor(batch["tile_grid"], device=device),
+        torch.as_tensor(batch["self_features"], dtype=torch.float32, device=device),
+        torch.as_tensor(batch["opponent_features"], dtype=torch.float32, device=device),
+        torch.as_tensor(batch["opponent_mask"], dtype=torch.bool, device=device),
+        torch.as_tensor(batch["boat_target_mask"], dtype=torch.bool, device=device),
+        torch.as_tensor(batch["attack_target_mask"], dtype=torch.bool, device=device),
+        torch.as_tensor(action_mask, dtype=torch.bool, device=device),
+    )
 
 
 def mask_batch(infos: list[dict]) -> np.ndarray:
@@ -53,7 +82,12 @@ def mask_batch(infos: list[dict]) -> np.ndarray:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
-    p.add_argument("--map", default="onion")
+    p.add_argument(
+        "--map", default=None,
+        help="fixed map name for every episode; if omitted (default), each "
+             "episode independently picks a random map from SMALL_MAPS "
+             "(every <=1500x1500 map, see openfront_env.py)",
+    )
     p.add_argument("--num-envs", type=int, default=4)
     p.add_argument("--rollout-length", type=int, default=64)
     p.add_argument("--ticks-per-step", type=int, default=10)
@@ -111,7 +145,8 @@ def parse_args() -> argparse.Namespace:
 
 def make_env(args: argparse.Namespace, difficulty: str, seed_prefix: str) -> OpenFrontEnv:
     return OpenFrontEnv(
-        map_name=args.map,
+        map_name=args.map or "onion",
+        map_pool=None if args.map else SMALL_MAPS,
         seed=seed_prefix,
         difficulty=difficulty,
         ticks_per_step=args.ticks_per_step,
@@ -138,6 +173,11 @@ def save_checkpoint(path: Path, net, optimizer, scheduler: CurriculumScheduler, 
 
 
 MILESTONE_DIFFICULTIES = ("medium", "hard", "impossible")
+# Peak territorial-extent fractions (see territory_fraction()) worth a
+# one-time notification, per difficulty -- ascending, so a single eval that
+# jumps straight past more than one (e.g. 0% -> 45% in one eval) notifies
+# every newly-crossed threshold, not just the highest.
+TERRITORY_MILESTONES = (0.2, 0.4, 0.6)
 
 
 def send_ntfy(message: str) -> None:
@@ -160,16 +200,30 @@ def send_ntfy(message: str) -> None:
         print(f"  (ntfy notification failed, continuing: {e})")
 
 
-def load_notified_milestones(checkpoint_dir: Path) -> set[str]:
+def load_notified_state(checkpoint_dir: Path) -> dict:
+    """{"wins": {difficulty, ...}, "territory": {difficulty: {frac, ...}}}
+    -- tracks which one-time notifications have already fired, persisted
+    alongside the checkpoint so a restart doesn't re-fire one. Backward
+    compatible with the pre-territory-milestone format (a flat list of
+    win-difficulties)."""
     path = checkpoint_dir / "notified_milestones.json"
     if not path.exists():
-        return set()
-    return set(json.loads(path.read_text()))
+        return {"wins": set(), "territory": {}}
+    raw = json.loads(path.read_text())
+    if isinstance(raw, list):
+        return {"wins": set(raw), "territory": {}}
+    return {
+        "wins": set(raw.get("wins", [])),
+        "territory": {k: set(v) for k, v in raw.get("territory", {}).items()},
+    }
 
 
-def save_notified_milestones(checkpoint_dir: Path, notified: set[str]) -> None:
+def save_notified_state(checkpoint_dir: Path, state: dict) -> None:
     path = checkpoint_dir / "notified_milestones.json"
-    path.write_text(json.dumps(sorted(notified)))
+    path.write_text(json.dumps({
+        "wins": sorted(state["wins"]),
+        "territory": {k: sorted(v) for k, v in state["territory"].items()},
+    }))
 
 
 def load_checkpoint(path: Path, net, optimizer, scheduler: CurriculumScheduler) -> int:
@@ -195,6 +249,22 @@ def load_checkpoint(path: Path, net, optimizer, scheduler: CurriculumScheduler) 
     return ckpt["update"]
 
 
+def territory_fraction(obs: dict) -> float:
+    """AGENT's share of the map's land, straight from tile_grid's own class
+    proportions (0=neutral,1=self,2=opponent,3=water) rather than the
+    self_tiles/opp_tiles raw counts -- those are real per-tile counts, but
+    tile_grid may be the resized (map_pool) canvas (see openfront_env.py's
+    RESIZE_DIM), a different unit system. Class *proportions* survive a
+    nearest-neighbor resize essentially unchanged, so this ratio is valid
+    whether or not the observation was resized, without needing to know
+    which case applies."""
+    grid = obs["tile_grid"]
+    land = int(np.count_nonzero(grid != 3))
+    if land == 0:
+        return 0.0
+    return int(np.count_nonzero(grid == 1)) / land
+
+
 def run_eval_episode(args: argparse.Namespace, net: ActorCritic, device: torch.device, difficulty: str, update: int) -> dict:
     """Greedy (argmax) rollout to completion, dumping a watchable/verifiable
     GameRecord -- the "evaluation routine" the project's design calls for:
@@ -207,25 +277,32 @@ def run_eval_episode(args: argparse.Namespace, net: ActorCritic, device: torch.d
         obs, info = env.reset(seed=update)
         terminated = truncated = False
         total_reward = 0.0
+        peak_territory_frac = territory_fraction(obs)
         while not (terminated or truncated):
-            tile_grid = torch.as_tensor(obs["tile_grid"][None], device=device)
-            scalars = torch.as_tensor(
-                np.concatenate([obs[k] for k in SCALAR_KEYS])[None], dtype=torch.float32, device=device
-            )
-            tile_mask = torch.as_tensor(obs["boat_target_mask"][None], dtype=torch.bool, device=device)
-            mask = torch.as_tensor(info["action_mask"][None], dtype=torch.bool, device=device)
+            inputs = net_inputs(obs_to_batch([obs]), info["action_mask"][None], device)
             with torch.no_grad():
-                type_logits, tile_logits, _ = net(tile_grid, scalars, tile_mask, mask)
+                type_logits, tile_logits, player_logits, _ = net(*inputs)
                 action_type = int(torch.argmax(type_logits, dim=-1).item())
                 tile_idx = int(torch.argmax(tile_logits, dim=-1).item())
-            obs, reward, terminated, truncated, info = env.step([action_type, tile_idx])
+                player_idx = int(torch.argmax(player_logits, dim=-1).item())
+            obs, reward, terminated, truncated, info = env.step([action_type, tile_idx, player_idx])
             total_reward += reward
+            peak_territory_frac = max(peak_territory_frac, territory_fraction(obs))
         return {
             "winner": info["winner"],
             "ticks": info["ticks"],
             "total_reward": total_reward,
-            "self_tiles": float(obs["self_tiles"][0]),
-            "opp_tiles": float(obs["opp_tiles"][0]),
+            "self_tiles": float(obs["self_features"][SELF_TILES_IDX]),
+            # Summed across opponents -- one number for "how much land the
+            # opposition holds", which stays comparable as the count changes.
+            "opp_tiles": float(obs["opponent_features"][:, OPPONENT_TILES_IDX].sum()),
+            # Peak, not final -- an episode can reach a high territorial
+            # share and then lose ground before ending (see the peak-vs-
+            # final distinction in analysis/territorial_extent/), and
+            # "achieves 20% territorial extent" reads as an achievement
+            # reached at any point, not a requirement to still hold it at
+            # episode end.
+            "peak_territory_frac": peak_territory_frac,
         }
     finally:
         env.close()
@@ -234,7 +311,8 @@ def run_eval_episode(args: argparse.Namespace, net: ActorCritic, device: torch.d
 def main() -> None:
     args = parse_args()
     device = torch.device(args.device)
-    print(f"device={device} num_envs={args.num_envs} map={args.map}")
+    map_desc = args.map if args.map else f"random from SMALL_MAPS ({len(SMALL_MAPS)} maps)"
+    print(f"device={device} num_envs={args.num_envs} map={map_desc}")
 
     scheduler = CurriculumScheduler(window=args.curriculum_window)
     vec_env = VecEnv(
@@ -256,10 +334,10 @@ def main() -> None:
         vec_env.set_difficulty(scheduler.difficulty)
         print(f"resumed from {latest_path} at update {start_update}, difficulty={scheduler.difficulty}")
 
-    # First-time-beats-{medium,hard,impossible} milestone notifications --
-    # persisted alongside the checkpoint so a restart doesn't re-fire a
-    # milestone already hit in a prior run.
-    notified_milestones = load_notified_milestones(checkpoint_dir)
+    # First-time-beats-{medium,hard,impossible} and first-reaches-{20,40,60}%
+    # territorial-extent milestone notifications -- persisted alongside the
+    # checkpoint so a restart doesn't re-fire one already hit in a prior run.
+    notified = load_notified_state(checkpoint_dir)
 
     log_path = Path(args.log_csv)
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -274,7 +352,7 @@ def main() -> None:
         )
 
     obs_list, info_list = vec_env.reset()
-    tile_grid, scalars, tile_mask = obs_to_batch(obs_list)
+    batch = obs_to_batch(obs_list)
     action_mask = mask_batch(info_list)
 
     update_iter = range(start_update, args.updates) if args.updates > 0 else itertools.count(start_update)
@@ -285,11 +363,7 @@ def main() -> None:
         reward_sum = 0.0
 
         for _ in range(args.rollout_length):
-            tile_grid_t = torch.as_tensor(tile_grid, device=device)
-            scalars_t = torch.as_tensor(scalars, dtype=torch.float32, device=device)
-            tile_mask_t = torch.as_tensor(tile_mask, dtype=torch.bool, device=device)
-            mask_t = torch.as_tensor(action_mask, dtype=torch.bool, device=device)
-            actions_t, log_probs_t, values_t = net.act(tile_grid_t, scalars_t, tile_mask_t, mask_t)
+            actions_t, log_probs_t, values_t = net.act(*net_inputs(batch, action_mask, device))
             actions_np = actions_t.cpu().numpy()
 
             next_obs_list, rewards, terms, truncs, infos = vec_env.step(actions_np)
@@ -297,10 +371,13 @@ def main() -> None:
             reward_sum += float(rewards.sum())
 
             buffer.add(
-                tile_grid,
-                scalars,
+                batch["tile_grid"],
+                batch["self_features"],
+                batch["opponent_features"],
+                batch["opponent_mask"],
                 action_mask,
-                tile_mask,
+                batch["boat_target_mask"],
+                batch["attack_target_mask"],
                 actions_np,
                 log_probs_t.cpu().numpy(),
                 values_t.cpu().numpy(),
@@ -312,22 +389,19 @@ def main() -> None:
                 if "episode_info" in info:
                     episode_outcomes.append(info["episode_info"]["winner"] == "AGENT")
 
-            tile_grid, scalars, tile_mask = obs_to_batch(next_obs_list)
+            batch = obs_to_batch(next_obs_list)
             action_mask = mask_batch(infos)
 
         with torch.no_grad():
-            tile_grid_t = torch.as_tensor(tile_grid, device=device)
-            scalars_t = torch.as_tensor(scalars, dtype=torch.float32, device=device)
-            tile_mask_t = torch.as_tensor(tile_mask, dtype=torch.bool, device=device)
-            mask_t = torch.as_tensor(action_mask, dtype=torch.bool, device=device)
-            _, _, last_values_t = net(tile_grid_t, scalars_t, tile_mask_t, mask_t)
+            inputs = net_inputs(batch, action_mask, device)
+            _, _, _, last_values_t = net(*inputs)
             last_values = last_values_t.cpu().numpy()
 
             # Type-head-only entropy/probabilities -- see network.py's
             # type_diagnostics() docstring. Reuses the same post-rollout
             # batch as the bootstrap value above, so this is a free extra
             # forward pass, not an extra environment interaction.
-            type_probs_t, type_entropy_t = net.type_diagnostics(tile_grid_t, scalars_t, tile_mask_t, mask_t)
+            type_probs_t, type_entropy_t = net.type_diagnostics(*inputs)
             type_probs = type_probs_t.cpu().numpy()
             type_entropy = float(type_entropy_t.item())
 
@@ -383,15 +457,34 @@ def main() -> None:
             if (
                 result["winner"] == "AGENT"
                 and eval_difficulty in MILESTONE_DIFFICULTIES
-                and eval_difficulty not in notified_milestones
+                and eval_difficulty not in notified["wins"]
             ):
-                notified_milestones.add(eval_difficulty)
-                save_notified_milestones(checkpoint_dir, notified_milestones)
+                notified["wins"].add(eval_difficulty)
+                save_notified_state(checkpoint_dir, notified)
                 send_ntfy(
                     f"OpenFront RL milestone: agent beat a {eval_difficulty} opponent "
                     f"for the first time (eval at update {update + 1}, ticks={result['ticks']})."
                 )
                 print(f"  *** milestone: first eval win vs {eval_difficulty} -- ntfy sent ***")
+
+            # First-time-reaches-{20,40,60}% peak territorial extent,
+            # per difficulty (20% against impossible is a much bigger deal
+            # than 20% against easy, so these don't share one flag across
+            # difficulties -- same reasoning as the per-difficulty win
+            # milestones above). Loops ascending so an eval that jumps past
+            # more than one threshold in one go still notifies each of them,
+            # not just the highest.
+            territory_hit = notified["territory"].setdefault(eval_difficulty, set())
+            for threshold in TERRITORY_MILESTONES:
+                if result["peak_territory_frac"] >= threshold and threshold not in territory_hit:
+                    territory_hit.add(threshold)
+                    save_notified_state(checkpoint_dir, notified)
+                    send_ntfy(
+                        f"OpenFront RL milestone: agent reached {threshold:.0%} peak territorial "
+                        f"extent vs {eval_difficulty} for the first time (eval at update {update + 1}, "
+                        f"peak={result['peak_territory_frac']:.1%})."
+                    )
+                    print(f"  *** milestone: first {threshold:.0%} peak territory vs {eval_difficulty} -- ntfy sent ***")
 
             # Curriculum promotion is driven by eval (greedy/deterministic)
             # outcomes, not the stochastic training-rollout episodes above --
@@ -404,6 +497,16 @@ def main() -> None:
             if curriculum_outcome != "holding":
                 vec_env.set_difficulty(scheduler.difficulty)
                 print(f"  curriculum {curriculum_outcome} -> {scheduler.difficulty}")
+                if curriculum_outcome == "promoted":
+                    # Promotion is inherently one-time per difficulty (the
+                    # scheduler only ever moves forward -- see
+                    # curriculum.py), so this needs no separate persisted
+                    # "already notified" state the way the win/territory
+                    # milestones above do.
+                    send_ntfy(
+                        f"OpenFront RL curriculum: promoted to {scheduler.difficulty} "
+                        f"at update {update + 1}."
+                    )
             state = scheduler.state()
             print(
                 f"  curriculum state: difficulty={state['difficulty']} "

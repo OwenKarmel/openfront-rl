@@ -4,19 +4,27 @@
  * stdin/stdout, so a Python `gymnasium.Env` can reset/step it like any other
  * RL environment. See training/envs/openfront_env.py.
  *
- * Single-agent: AGENT is the controlled player; OPPONENT is a real built-in
- * Nation-AI (NationExecution — the same code driving Nation bots in
+ * Single-agent: AGENT is the controlled player; every opponent is a real
+ * built-in Nation-AI (NationExecution — the same code driving Nation bots in
  * production games, difficulty selectable per episode, drawn from the map's
  * real manifest — see GameSetup.ts) making its own decisions every tick.
- * There is nothing to send OPPONENT actions for.
+ * There is nothing to send opponents actions for.
+ *
+ * Opponents are reported as a fixed-width, masked ARRAY of MAX_OPPONENTS
+ * slots rather than one singular OPPONENT block, so neither the wire format
+ * nor the network has to change shape when the real opponent count does
+ * (see MAX_OPPONENTS and observation() below). Today that count is 1
+ * (GameSetup.ts's NUM_NATIONS), i.e. the same 1v1 environment as before —
+ * the array/mask plumbing is what's new, not the matchup.
  *
  * Action space (still intentionally small — richer intents like structure
  * builds and diplomacy come later, per the action-space-expansion plan):
  *   "noop"             — do nothing this decision step
  *   "expand"           — attack neutral (unowned) land bordering AGENT's territory
- *   "attack_opponent"  — attack OPPONENT directly across a shared border
- *   "boat_attack"      — send a transport ship across water to invade OPPONENT's
- *                         territory (needs macroX/macroY — see StepCmd)
+ *   "attack_opponent"  — attack one specific opponent across a shared land
+ *                         border (needs playerIdx — see StepCmd)
+ *   "boat_attack"      — send a transport ship across water to invade any
+ *                         opponent's territory (needs macroX/macroY — see StepCmd)
  *
  * Decision cadence: one JSON "step" call advances `ticksPerStep` simulation
  * ticks (default 10), applying AGENT's chosen intent on the first of those
@@ -35,7 +43,10 @@
  *   -> {"cmd":"close"}
  *
  * `info.winner` is "AGENT"/"OPPONENT"/null (still playing, or a truncated-
- * without-a-winner episode) — set only once `done` is true.
+ * without-a-winner episode) — set only once `done` is true. "OPPONENT" means
+ * *some* opponent outlived AGENT, not which one: the reward and the
+ * curriculum both only care whether AGENT survived, and collapsing it keeps
+ * this field's meaning identical at any opponent count.
  *
  * `dumpGameRecordDir` (optional, on reset) writes a full, strictly
  * schema-valid GameRecord (Episode.toGameRecord()) to
@@ -50,7 +61,7 @@ import readline from "readline";
 import { Difficulty, Game, Player, UnitType } from "../../OpenFrontIO/src/core/game/Game";
 import { targetTransportTile } from "../../OpenFrontIO/src/core/game/TransportShipUtils";
 import { StampedIntent } from "../../OpenFrontIO/src/core/Schemas";
-import { AGENT_CLIENT_ID, Episode } from "./GameSetup";
+import { AGENT_CLIENT_ID, Episode, NUM_NATIONS } from "./GameSetup";
 
 // boat_attack's target macro-cell is a cheap heuristic (see
 // tileGridAndBoatMask() below), not the real canBuildTransportShip check --
@@ -119,6 +130,25 @@ type Action = (typeof ACTIONS)[number];
 // to compute/transmit.
 const MACRO_GRID = 32;
 
+/**
+ * Fixed number of opponent slots every opponent-indexed observation, mask,
+ * and action parameter is padded to — the same size-invariance trick
+ * MACRO_GRID applies to space, applied to opponents. Slots beyond the
+ * episode's real opponent count are zero-filled and flagged false in
+ * `opponentMask`, so the wire format and the network's input shapes stay
+ * constant no matter how many opponents an episode actually has.
+ *
+ * Derived from GameSetup.ts's NUM_NATIONS rather than hardcoded so the two
+ * can never drift into silently dropping a real opponent off the end of the
+ * array. Once opponent count varies PER EPISODE (rather than being one
+ * constant for every episode), this becomes a literal >= the largest such
+ * count and the padding below starts doing real work; today it pads
+ * nothing, and the masked path is exercised instead by the network's own
+ * smoke test at wider slot counts (training/smoke_test_multiopp.py) while
+ * training stays on the unchanged 1v1 environment.
+ */
+const MAX_OPPONENTS = NUM_NATIONS;
+
 interface ResetCmd {
   cmd: "reset";
   seed: string;
@@ -135,6 +165,10 @@ interface StepCmd {
   // by macroCellToTile().
   macroX?: number;
   macroY?: number;
+  // Only meaningful (and required) when action === "attack_opponent": which
+  // opponent slot to attack, indexing the same padded array observation()
+  // reports (so the network's pointer head and this share one indexing).
+  playerIdx?: number;
 }
 interface CloseCmd {
   cmd: "close";
@@ -158,11 +192,49 @@ interface PlayerObs {
   alive: boolean;
   tiles: number;
   troops: number;
+  /**
+   * troops / config.maxTroops(player), in [0,1]. Troop regrowth STOPS at the
+   * cap (Config.ts's troopIncreaseRate() multiplies growth by
+   * `1 - troops/maxTroops`), so a raw troop count alone cannot tell the
+   * network "this army is capped, waiting longer earns nothing" — the cap is
+   * itself map- and tile-count-dependent, so no fixed threshold on the raw
+   * count means the same thing twice. Motivated by a replay where AGENT sat
+   * at ratio 1.000 for ~100k ticks with 200k+ unclaimed neutral tiles
+   * adjacent to it.
+   */
+  troopsRatio: number;
   gold: number;
 }
 
+interface OpponentObs extends PlayerObs {
+  /** Whether AGENT's territory touches this opponent's — attack_opponent's
+   * geometric precondition. Reported independently of `alive` (which is its
+   * own feature) rather than pre-combined, so the network sees the two
+   * signals separately. */
+  sharesBorder: boolean;
+}
+
+/** A padding slot: not a real opponent, all features zeroed. Zeros (not
+ * NaN/sentinels) because the network sum-pools these after masking, and a
+ * non-finite padding value would propagate through `emb * mask` regardless
+ * of the mask. */
+const PADDING_OPPONENT: OpponentObs = {
+  alive: false,
+  tiles: 0,
+  troops: 0,
+  troopsRatio: 0,
+  gold: 0,
+  sharesBorder: false,
+};
+
 function player(game: Game, playerId: string): Player {
   return game.player(playerId);
+}
+
+/** Every opponent AGENT is still contesting — used wherever "is this tile/
+ * player hostile" is asked, so no call site assumes exactly one. */
+function opponents(episode: Episode): Player[] {
+  return episode.opponentIds.map((id) => player(episode.game, id));
 }
 
 /**
@@ -200,7 +272,6 @@ function tileGridAndBoatMask(episode: Episode): { grid: Uint8Array; boatMask: Ui
   const w = game.width();
   const h = game.height();
   const agent = player(game, episode.agentId);
-  const opponent = player(game, episode.opponentId);
   const grid = new Uint8Array(w * h);
   const boatMask = new Uint8Array(Math.ceil((MACRO_GRID * MACRO_GRID) / 8));
   for (let y = 0; y < h; y++) {
@@ -214,7 +285,16 @@ function tileGridAndBoatMask(episode: Episode): { grid: Uint8Array; boatMask: Ui
       const owner = game.owner(ref);
       if (owner === agent) {
         grid[y * w + x] = 1;
-      } else if (owner === opponent) {
+      } else if (owner.isPlayer()) {
+        // Class 2 is ANY opponent, deliberately not per-opponent identity:
+        // the only players in an episode are AGENT and the Nation AIs, so
+        // "owned by someone who isn't AGENT" is exactly "hostile" at any
+        // opponent count -- and it's one pointer/tag check per tile rather
+        // than a membership test against an opponent list, which matters
+        // across w*h tiles every step. boat_attack doesn't need to know
+        // WHICH opponent owns a cell either (the engine resolves that from
+        // the real landing tile), and attack_opponent picks its target
+        // through the padded opponent array instead of off this grid.
         grid[y * w + x] = 2;
         const mx = Math.min(MACRO_GRID - 1, Math.floor((x * MACRO_GRID) / w));
         const bitIdx = my * MACRO_GRID + mx;
@@ -271,7 +351,6 @@ function resolveBoatTarget(episode: Episode, macroX: number, macroY: number): nu
   const map = game.map();
   const w = game.width();
   const h = game.height();
-  const opponent = player(game, episode.opponentId);
   const agent = player(game, episode.agentId);
   const x0 = Math.floor((macroX * w) / MACRO_GRID);
   const x1 = Math.min(w, Math.floor(((macroX + 1) * w) / MACRO_GRID));
@@ -281,7 +360,12 @@ function resolveBoatTarget(episode: Episode, macroX: number, macroY: number): nu
   for (let y = y0; y < y1 && representative === null; y++) {
     for (let x = x0; x < x1; x++) {
       const ref = map.ref(x, y);
-      if (!map.isWater(ref) && game.owner(ref) === opponent) {
+      if (map.isWater(ref)) continue;
+      // Any opponent's tile will do -- a boat targets a place, not a
+      // player, and TransportShipExecution resolves whose shore it
+      // actually lands on when the intent executes.
+      const owner = game.owner(ref);
+      if (owner.isPlayer() && owner !== agent) {
         representative = ref;
         break;
       }
@@ -291,14 +375,55 @@ function resolveBoatTarget(episode: Episode, macroX: number, macroY: number): nu
   return targetTransportTile(game, agent, representative);
 }
 
-function playerObs(game: Game, playerId: string): PlayerObs {
-  const p = player(game, playerId);
+function playerObs(game: Game, p: Player): PlayerObs {
   return {
     alive: p.isAlive(),
     tiles: p.numTilesOwned(),
     troops: p.troops(),
+    troopsRatio: p.troops() / game.config().maxTroops(p),
     gold: Number(p.gold()),
   };
+}
+
+interface OpponentBlock {
+  /** Exactly MAX_OPPONENTS entries, real ones first, then padding. */
+  opponents: OpponentObs[];
+  /** True where the slot is a real opponent rather than padding. */
+  opponentMask: boolean[];
+  /** True where attack_opponent may legally target that slot. */
+  attackTargetMask: boolean[];
+}
+
+/**
+ * The padded, masked opponent array plus attack_opponent's per-slot
+ * legality — built once per step and shared by observation() and
+ * legalActions(), since both need it and sharesBorderWith() is the
+ * expensive part (it walks AGENT's border tiles, once per opponent).
+ */
+function opponentBlock(episode: Episode): OpponentBlock {
+  const game = episode.game;
+  const agent = player(game, episode.agentId);
+  const live = opponents(episode);
+  const list: OpponentObs[] = [];
+  const opponentMask: boolean[] = [];
+  const attackTargetMask: boolean[] = [];
+  for (let i = 0; i < MAX_OPPONENTS; i++) {
+    const opp = live[i];
+    if (opp === undefined) {
+      list.push(PADDING_OPPONENT);
+      opponentMask.push(false);
+      attackTargetMask.push(false);
+      continue;
+    }
+    const obs: OpponentObs = {
+      ...playerObs(game, opp),
+      sharesBorder: agent.sharesBorderWith(opp),
+    };
+    list.push(obs);
+    opponentMask.push(true);
+    attackTargetMask.push(obs.alive && obs.sharesBorder);
+  }
+  return { opponents: list, opponentMask, attackTargetMask };
 }
 
 function observation(
@@ -307,6 +432,7 @@ function observation(
   height: number,
   grid: Uint8Array,
   boatMask: Uint8Array,
+  block: OpponentBlock,
 ) {
   return {
     width,
@@ -314,20 +440,22 @@ function observation(
     // Base64 of the raw Uint8Array bytes -- see tileGridAndBoatMask()'s comment.
     tileGridB64: Buffer.from(grid.buffer).toString("base64"),
     boatTargetMacroMaskB64: Buffer.from(boatMask.buffer).toString("base64"),
-    players: {
-      AGENT: playerObs(episode.game, episode.agentId),
-      OPPONENT: playerObs(episode.game, episode.opponentId),
-    },
+    self: playerObs(episode.game, player(episode.game, episode.agentId)),
+    // Plain JSON arrays, not base64: MAX_OPPONENTS is small (single digits
+    // to low tens), so this is a handful of objects per line -- nothing like
+    // the w*h tile grid that forced a packed encoding.
+    opponents: block.opponents,
+    opponentMask: block.opponentMask,
+    attackTargetMask: block.attackTargetMask,
   };
 }
 
-function legalActions(episode: Episode, boatMask: Uint8Array): Action[] {
+function legalActions(episode: Episode, boatMask: Uint8Array, block: OpponentBlock): Action[] {
   const agent = player(episode.game, episode.agentId);
   if (!agent.isAlive()) return ["noop"];
   if (episode.game.inSpawnPhase()) return ["noop"];
-  const opponent = player(episode.game, episode.opponentId);
   const actions: Action[] = ["noop", "expand"];
-  if (opponent.isAlive() && agent.sharesBorderWith(opponent)) {
+  if (block.attackTargetMask.some((legal) => legal)) {
     actions.push("attack_opponent");
   }
   if (
@@ -340,40 +468,75 @@ function legalActions(episode: Episode, boatMask: Uint8Array): Action[] {
 }
 
 /**
- * Potential function for reward shaping: AGENT's owned tile count MINUS
- * OPPONENT's, normalized by the map's total land tiles. Two deliberate
- * choices here, both found necessary empirically (not just architecturally
- * motivated):
+ * Potential function for reward shaping: AGENT's own tile share of the
+ * map (no longer relative to OPPONENT's tile count -- see git history/the
+ * archived run READMEs under training/checkpoints/archive/ for the
+ * previous relative-margin design and why it was adopted).
  *
- * 1. Relative, not just AGENT's own count: with only AGENT's count,
- *    expanding into neutral land and attacking OPPONENT are reward-
- *    equivalent per tile gained, but attacking is strictly riskier
- *    (contested combat, troop losses) with no offsetting benefit — so the
- *    reward-maximizing policy has no incentive to ever fight, only to
- *    expand into neutral land forever (confirmed empirically: policy
- *    entropy collapsed to ~0 within ~10 updates under the old single-sided
- *    reward, converging fast onto "always expand, never attack").
- * 2. Normalized by total land tiles: raw tile counts on a real production
- *    map range into the tens of thousands, so *un*normalized deltas (even
- *    after fix 1) produced huge, map-size-dependent reward swings —
- *    confirmed empirically again: value_loss spiked into the thousands
- *    within ~10-20 updates, approx_kl spiked to ~0.27 (healthy PPO stays
- *    under ~0.02-0.05) in the same window, and entropy collapsed to ~0
- *    shortly after. Mechanism: huge value-loss gradients backpropagate
- *    through the trunk the policy head shares (see models/network.py),
- *    corrupting its features and destabilizing the policy despite PPO's
- *    ratio clipping, which doesn't protect against the *feature
- *    representation itself* shifting wildly underneath it. Normalizing by
- *    numLandTiles() bounds potential to roughly [-1, 1] regardless of map
- *    size, keeping per-step reward and discounted returns in a small,
- *    consistent range — the standard reward/return-normalization fix for
- *    this class of instability.
+ * This reintroduces, deliberately, the exact risk that motivated the
+ * relative version in the first place: with only AGENT's own count,
+ * expanding into neutral land and attacking OPPONENT are reward-
+ * equivalent per tile gained, but attacking is strictly riskier
+ * (contested combat, troop losses) with no offsetting benefit -- an
+ * earlier run under this same non-relative formula saw policy entropy
+ * collapse to ~0 within ~10 updates, converging on "always expand, never
+ * attack." Watch for a repeat of that collapse.
+ *
+ * Still normalized by total land tiles (bounds potential to [0, 1]
+ * regardless of map size) for the same reason as before: unnormalized raw
+ * tile counts produced huge, map-size-dependent reward swings that
+ * destabilized PPO (value_loss/approx_kl spikes, entropy collapse) via
+ * the shared trunk (see models/network.py).
+ *
+ * Deliberately UNCHANGED by the multi-opponent work: referencing only
+ * AGENT's own tiles, it already means the same thing at any opponent count,
+ * so there was nothing to generalize. The roadmap's alternative (subtract
+ * the SUM of every opponent's tiles) would be a reward-function change
+ * riding along with an architecture change -- exactly the confound that
+ * makes a regression un-attributable to either one.
  */
 function potential(episode: Episode): number {
   const agentTiles = player(episode.game, episode.agentId).numTilesOwned();
-  const opponentTiles = player(episode.game, episode.opponentId).numTilesOwned();
   const totalLandTiles = episode.game.map().numLandTiles();
-  return (agentTiles - opponentTiles) / totalLandTiles;
+  return agentTiles / totalLandTiles;
+}
+
+/**
+ * Who actually won, per the ENGINE's own declaration -- not a guess from who
+ * is still breathing.
+ *
+ * This distinction is not cosmetic: OpenFrontIO ends a game as soon as one
+ * player owns percentageTilesOwnedToWin() of the land (80% in FFA, see
+ * Config.ts), which happens with the loser still very much alive. An
+ * earlier version of this function inferred the winner purely from
+ * isAlive(), so EVERY domination win -- the normal way games end -- fell
+ * through both branches and reported null, which step() then scored as -1.
+ *
+ * That meant AGENT was punished for winning, and its win was logged as a
+ * loss. It also left AGENT with no reachable positive reward at all: the
+ * game ends at 80% long before an opponent can be wiped out entirely, so
+ * the "outlived everyone" path that did score +1 was nearly unreachable.
+ * Confirmed against a real run: all 72 winner=null evals had the opponent
+ * holding exactly 80% of that map's num_land_tiles.
+ *
+ * `lastWinner` is the Win update GameSetup.ts already records. Its shape is
+ * ["player", clientID, ...] | ["nation", name, ...] | ["team", name,
+ * ...clientIDs] (WinnerSchema in Schemas.ts) -- AGENT is the only player
+ * with a clientID, so its presence anywhere in the tuple means AGENT won,
+ * covering the team case without special-casing it.
+ */
+function resolveWinner(episode: Episode): "AGENT" | "OPPONENT" | null {
+  const declared = episode.lastWinner;
+  if (declared !== undefined) {
+    return declared.includes(AGENT_CLIENT_ID) ? "AGENT" : "OPPONENT";
+  }
+  // No declared winner -- the game ended by elimination instead (or every
+  // player died). Fall back to survival.
+  const agentAlive = player(episode.game, episode.agentId).isAlive();
+  const anyOpponentAlive = opponents(episode).some((o) => o.isAlive());
+  if (agentAlive && !anyOpponentAlive) return "AGENT";
+  if (!agentAlive && anyOpponentAlive) return "OPPONENT";
+  return null;
 }
 
 function intentFor(
@@ -381,6 +544,7 @@ function intentFor(
   episode: Episode,
   macroX: number | undefined,
   macroY: number | undefined,
+  playerIdx: number | undefined,
 ): StampedIntent | null {
   switch (action) {
     case "noop":
@@ -392,13 +556,29 @@ function intentFor(
         troops: null,
         clientID: AGENT_CLIENT_ID,
       };
-    case "attack_opponent":
+    case "attack_opponent": {
+      if (playerIdx === undefined) {
+        throw new Error("attack_opponent requires playerIdx");
+      }
+      // Unlike boat_attack's deliberately-approximate target mask, the
+      // attack target mask is exact (real alive/sharesBorderWith checks),
+      // so a slot outside the episode's real opponents means the caller
+      // ignored the mask -- a protocol bug worth surfacing, not an
+      // expected miss to swallow as a no-op.
+      const targetID = episode.opponentIds[playerIdx];
+      if (targetID === undefined) {
+        throw new Error(
+          `attack_opponent playerIdx ${playerIdx} is not a real opponent ` +
+            `(episode has ${episode.opponentIds.length})`,
+        );
+      }
       return {
         type: "attack",
-        targetID: episode.opponentId,
+        targetID,
         troops: null,
         clientID: AGENT_CLIENT_ID,
       };
+    }
     case "boat_attack": {
       if (macroX === undefined || macroY === undefined) {
         throw new Error("boat_attack requires macroX/macroY");
@@ -457,9 +637,10 @@ class Session {
     this.dumpGameRecordDir = cmd.dumpGameRecordDir;
     this.prevPotential = potential(this.episode);
     const { grid, boatMask } = tileGridAndBoatMask(this.episode);
+    const block = opponentBlock(this.episode);
     return {
-      obs: observation(this.episode, this.width, this.height, grid, boatMask),
-      legalActions: legalActions(this.episode, boatMask),
+      obs: observation(this.episode, this.width, this.height, grid, boatMask, block),
+      legalActions: legalActions(this.episode, boatMask, block),
       done: this.episode.isDone(),
     };
   }
@@ -468,7 +649,7 @@ class Session {
     if (!this.episode) throw new Error("step called before reset");
     const episode = this.episode;
 
-    const intent = intentFor(cmd.action, episode, cmd.macroX, cmd.macroY);
+    const intent = intentFor(cmd.action, episode, cmd.macroX, cmd.macroY, cmd.playerIdx);
     const intents: StampedIntent[] = intent ? [intent] : [];
 
     let done = false;
@@ -480,39 +661,34 @@ class Session {
       }
     }
 
-    // Potential-based shaping (relative, map-size-normalized tile-count
-    // delta -- see potential()), plus a terminal win/loss term once the
-    // episode ends. Coefficient recalibrated after normalizing potential()
-    // to roughly [-1, 1] (was 0.01 against *unbounded* raw tile counts,
-    // which produced huge, map-size-dependent returns -- see potential()'s
-    // comment); 5.0 keeps a fully map-dominant swing's cumulative shaping
-    // reward in the same rough order of magnitude as before (bounded now,
-    // not larger) while staying a meaningful dense signal relative to the
-    // terminal ±1.
+    // Potential-based shaping (map-size-normalized tile-share delta -- see
+    // potential()), unscaled (no coefficient -- previously 5.0, against a
+    // [-1,1]-bounded relative potential; this one is bounded [0,1] and
+    // unscaled instead), plus a terminal term once the episode ends: +1
+    // for an AGENT win, -1 for anything else -- an OPPONENT win *or* a
+    // truncated/drawn ending with no clear winner. That's a deliberate
+    // change from the previous "truncation is reward-neutral" behavior:
+    // stalling out to the episode-length safety cap without ever dying is
+    // now punished the same as an outright loss, rather than being a free
+    // (if unambitious) way to avoid the terminal penalty.
     const newPotential = potential(episode);
-    let reward = (newPotential - this.prevPotential) * 5.0;
+    let reward = newPotential - this.prevPotential;
     this.prevPotential = newPotential;
     let winner: "AGENT" | "OPPONENT" | null = null;
     if (done) {
-      const agentAlive = player(episode.game, episode.agentId).isAlive();
-      const opponentAlive = player(episode.game, episode.opponentId).isAlive();
-      if (agentAlive && !opponentAlive) {
-        reward += 1;
-        winner = "AGENT";
-      } else if (!agentAlive && opponentAlive) {
-        reward -= 1;
-        winner = "OPPONENT";
-      }
+      winner = resolveWinner(episode);
+      reward += winner === "AGENT" ? 1 : -1;
     }
 
     if (done) this.flushRecord();
 
     const { grid, boatMask } = tileGridAndBoatMask(episode);
+    const block = opponentBlock(episode);
     return {
-      obs: observation(episode, this.width, this.height, grid, boatMask),
+      obs: observation(episode, this.width, this.height, grid, boatMask, block),
       reward,
       done,
-      legalActions: legalActions(episode, boatMask),
+      legalActions: legalActions(episode, boatMask, block),
       info: { ticks: episode.game.ticks(), winner },
     };
   }

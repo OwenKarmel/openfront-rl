@@ -58,6 +58,17 @@ const PRODUCTION_MAPS_DIR = path.join(
 // so a fixed constant is fine.
 export const AGENT_CLIENT_ID = "AGENTAAA";
 
+/**
+ * How many Nation-AI opponents each episode is built with. Must stay <=
+ * EnvServer.ts's MAX_OPPONENTS (the fixed width every opponent-indexed
+ * observation/mask/action is padded to) -- that's the constant to raise
+ * alongside this one when actually moving past 1v1. Kept at 1 for now: the
+ * padded/masked observation and the set-encoder network are what changed
+ * first, deliberately validated against the unchanged 1v1 environment
+ * before the environment itself gets more opponents.
+ */
+export const NUM_NATIONS = 1;
+
 interface ResolvedMap {
   gameMap: GameMap;
   miniGameMap: GameMap;
@@ -182,8 +193,13 @@ export class Episode {
    * PseudoRandom.nextID(), same as here, so it's not a fixed constant.
    */
   agentId: string;
-  /** Resolved once, after construction: game.nations()[0]'s internal player id. */
-  opponentId: string;
+  /**
+   * Every Nation-AI opponent's internal player id, in game.nations() order.
+   * An array (not a single id) so nothing downstream assumes 1v1: raising
+   * gameConfig.nations below is then the only change needed to actually
+   * play N opponents. Currently always length 1 -- see NUM_NATIONS.
+   */
+  opponentIds: string[];
   lastHash: HashUpdate | undefined;
   lastWinner: Winner | undefined;
   fatalError: string | undefined;
@@ -199,14 +215,14 @@ export class Episode {
     gameID: string,
     gameConfig: GameConfig,
     agentId: string,
-    opponentId: string,
+    opponentIds: string[],
   ) {
     this.runner = runner;
     this.game = runner.game;
     this.gameID = gameID;
     this.gameConfig = gameConfig;
     this.agentId = agentId;
-    this.opponentId = opponentId;
+    this.opponentIds = opponentIds;
   }
 
   /**
@@ -243,11 +259,10 @@ export class Episode {
       // SpawnTimerExecution a real solo game never has either.
       gameType: GameType.Singleplayer,
       difficulty,
-      // Numeric, not "default": exactly one Nation-AI opponent, matching
-      // this project's v1 scope (beat one bot 1v1). createNationsForGame
-      // draws it (deterministically, given the seed) from the map's real
-      // manifest nations below.
-      nations: 1,
+      // Numeric, not "default": exactly NUM_NATIONS Nation-AI opponents,
+      // drawn (deterministically, given the seed) from the map's real
+      // manifest nations by createNationsForGame below.
+      nations: NUM_NATIONS,
       donateGold: false,
       donateTroops: false,
       bots: 0,
@@ -293,7 +308,7 @@ export class Episode {
     const config = new Config(gameConfig, null, false);
     const game = createGame(humans, nationList, gameMap, miniGameMap, config);
     const agentId = humans[0].id;
-    const opponentId = game.nations()[0].playerInfo.id;
+    const opponentIds = game.nations().map((n) => n.playerInfo.id);
 
     const episode = new Episode(
       new GameRunner(game, new Executor(game, gameID, undefined), (gu) => {
@@ -309,7 +324,7 @@ export class Episode {
       gameID,
       gameConfig,
       agentId,
-      opponentId,
+      opponentIds,
     );
     episode.runner.init();
     return episode;
@@ -323,16 +338,45 @@ export class Episode {
     const episode = await Episode.build(mapName, seed, difficulty);
     const game = episode.game;
 
-    // AGENT picks a spawn tile on one side of the map; OPPONENT self-spawns
-    // via NationExecution, near its manifest-derived spawnCell.
-    const agentTile = findLandTile(
-      game,
-      Math.floor(game.width() * 0.15),
-      Math.floor(game.height() * 0.5),
-    );
-    episode.runTick([
-      { type: "spawn", tile: agentTile, clientID: AGENT_CLIENT_ID },
-    ]);
+    // AGENT spawns at a uniformly random point on the map (snapped to the
+    // nearest land tile) -- previously a fixed point (15% across, 50%
+    // down, "one side of the map") every single episode, unlike OPPONENT,
+    // which already varies per episode via createNationsForGame's PRNG
+    // draw over the map's manifest nations (each nation has its own
+    // manifest-derived spawnCell). Independently seeded from build()'s own
+    // PRNG stream (derived from the episode's gameID, not reusing it)
+    // so this doesn't shift which nation/humans-id draws happen there --
+    // this is purely an additional, unrelated draw.
+    //
+    // A uniformly random point can land somewhere SpawnExecution rejects
+    // (a tiny landlocked speck, terrain within its radius-4 spawn-tile
+    // check already owned or impassable -- see getSpawnTiles() in
+    // OpenFrontIO/src/core/execution/Util.ts) -- silently a no-op, not an
+    // error, so a single fixed attempt can leave AGENT never spawned and
+    // the spawn-phase-timeout safety net below firing on every such
+    // episode. Retry with fresh random points (same PRNG stream, same
+    // pattern SpawnExecution's own random-spawn path already uses
+    // internally) until numTilesOwned() confirms it actually took.
+    const spawnRandom = new PseudoRandom(simpleHash(`${episode.wireGameID()}:agentSpawn`));
+    const MAX_SPAWN_ATTEMPTS = 50;
+    let agent = game.playerByClientID(AGENT_CLIENT_ID);
+    for (let attempt = 0; attempt < MAX_SPAWN_ATTEMPTS; attempt++) {
+      const agentTile = findLandTile(
+        game,
+        spawnRandom.nextInt(0, game.width()),
+        spawnRandom.nextInt(0, game.height()),
+      );
+      episode.runTick([
+        { type: "spawn", tile: agentTile, clientID: AGENT_CLIENT_ID },
+      ]);
+      agent = game.playerByClientID(AGENT_CLIENT_ID);
+      if (agent && agent.numTilesOwned() > 0) break;
+    }
+    if (!agent || agent.numTilesOwned() === 0) {
+      throw new Error(
+        `AGENT failed to spawn on map ${mapName} after ${MAX_SPAWN_ATTEMPTS} random attempts`,
+      );
+    }
 
     // Real numSpawnPhaseTurns() (100 for Singleplayer) — not shortened.
     // Nothing strategic happens during it beyond idle waiting (EnvServer.ts
