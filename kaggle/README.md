@@ -28,6 +28,15 @@ count**: fewer envs is less diverse rollout data per update.
 Use this when you want the local machine back, unattended long runs, or
 parallel experiments — not for speed.
 
+**The notebook runs on CPU (`--device cpu`), not GPU.** Confirmed on the
+first real training attempt: it resumed cleanly, ran 4 updates, then crashed
+with `cudaErrorNoKernelImageForDevice` — Kaggle's default PyTorch image
+doesn't ship CUDA kernels compiled for the P100's compute capability
+(Pascal, sm_60). Since GPU utilisation was 6-7% locally anyway, forcing CPU
+costs nothing real. `enable_gpu` stays on in `kernel-metadata.json` regardless
+— the accelerator tier's extra CPU/RAM allocation is worth having even with
+CUDA unused.
+
 ## Prerequisite: credentials (currently missing)
 
 The Kaggle API needs `~/.kaggle/kaggle.json`:
