@@ -100,6 +100,13 @@ def parse_args() -> argparse.Namespace:
         help="stop after this many updates; 0 (default) or negative runs indefinitely",
     )
     p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument(
+        "--weight-decay", type=float, default=0.0,
+        help="AdamW decoupled weight decay, applied to >=2D params only (conv "
+             "kernels, linear weight matrices), never to biases. 0 (default) "
+             "reproduces plain Adam. BBF uses 0.1 to offset the overfitting "
+             "that reusing each transition many times invites",
+    )
     p.add_argument("--gamma", type=float, default=0.99)
     p.add_argument("--gae-lambda", type=float, default=0.95)
     p.add_argument("--clip-eps", type=float, default=0.2)
@@ -324,7 +331,22 @@ def main() -> None:
     vec_env.set_difficulty(scheduler.difficulty)
 
     net = ActorCritic().to(device)
-    optimizer = torch.optim.Adam(net.parameters(), lr=args.lr)
+    # AdamW rather than Adam so --weight-decay is *decoupled* (applied as
+    # p -= lr*wd*p, not folded into the gradient and thus into Adam's second
+    # moment, where an adaptive optimizer largely cancels it out again).
+    # Biases are excluded: they carry none of the overfitting risk weight
+    # decay targets, and shrinking them just drags the logits toward zero.
+    # The network has no normalization layers, so >=2D vs 1D fully separates
+    # "weights" from "biases" here -- revisit this split if one is ever added.
+    decayed = [p for p in net.parameters() if p.requires_grad and p.dim() >= 2]
+    not_decayed = [p for p in net.parameters() if p.requires_grad and p.dim() < 2]
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": decayed, "weight_decay": args.weight_decay},
+            {"params": not_decayed, "weight_decay": 0.0},
+        ],
+        lr=args.lr,
+    )
 
     checkpoint_dir = Path(args.checkpoint_dir)
     latest_path = checkpoint_dir / "latest.pt"
