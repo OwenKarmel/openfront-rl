@@ -70,7 +70,28 @@ MuZero/EfficientZero, action/observation space, phased milestones).
     construction as training — see `GameSetup.ts` — so it's watchable in
     the real client and verifiable via `npm run replay:game`, not an
     approximation of what training saw).
-- `kaggle/` — not yet built (Kaggle burst-training notebooks).
+  - `run_bbf_gamma098.sh` — launches (**and resumes**) the current run with
+    its hyperparameters pinned. Checkpoints store weights, optimizer state
+    and curriculum position but *not* hyperparameters, so a resume that
+    forgets a flag does not fail — it silently continues the same checkpoint
+    under argparse defaults, flipping `gamma` 0.98→0.99 and rollout 50→64
+    mid-run with nothing in the logs to say so. Always resume via the script.
+  - `oom_guard.sh`, `notify_on_finish.sh`, `notify_on_download.sh` — ops
+    helpers: OOM-victim reordering for the long run, and ntfy alerts.
+- `kaggle/` — Kaggle burst-training port: `package_source.sh` builds the
+  input Dataset payload, `setup_kaggle.sh` bootstraps a session (clones
+  OpenFrontIO at the pinned SHA, `npm ci`, smoke test), and
+  `openfront_rl_kaggle.ipynb` is the notebook that chains sessions across
+  the 12h cap by pushing `out/` back as a new Dataset version. Runs on CPU
+  (`--device cpu`) — see `kaggle/README.md` for why Kaggle is *slower* than
+  this box for this workload.
+- `analysis/` — one directory per training run, each holding self-contained,
+  rerun-safe analyses (a `build_dataset.py` that scrapes the run's own logs
+  or replays, a plot script, the generated CSV/PNG, and a README stating what
+  the run shows and what the comparison caveats are). Plots of the same kind
+  are deliberately built identically across runs — same metric, window, axis
+  limits and colors — so they can be compared by eye. See
+  `analysis/README.md`.
 
 ## Architecture
 
@@ -219,24 +240,49 @@ overrides in bold** where they differ from the default):
 
 | Hyperparameter | Default | Current run |
 |---|---|---|
-| optimizer | `torch.optim.Adam` | — |
+| optimizer | `torch.optim.AdamW` | — |
 | learning rate (`--lr`) | 3e-4 | 3e-4 |
-| discount `gamma` (`--gamma`) | 0.99 | **0.999** |
+| weight decay (`--weight-decay`) | 0.0 (≡ plain Adam) | **0.1** (BBF's value — see Status) |
+| discount `gamma` (`--gamma`) | 0.99 | **0.98** |
 | GAE `lambda` (`--gae-lambda`) | 0.95 | 0.95 |
 | PPO clip `epsilon` (`--clip-eps`) | 0.2 | 0.2 |
 | value loss coef (`ppo.py`'s `value_coef`) | 0.5 | 0.5 |
-| entropy coef (`--entropy-coef`) | 0.02 | **0.02** (lowered from an earlier 0.04 — see Status) |
+| entropy coef (`--entropy-coef`) | 0.02 | 0.02 (lowered from an earlier 0.04 — see Status) |
 | max grad norm (`ppo.py`'s `max_grad_norm`) | 0.5 | 0.5 |
 | target KL / early-stop (`--target-kl`) | 0.03 (abort epoch loop past 1.5×) | 0.03 |
-| PPO epochs per update (`--epochs`) | 4 | 4 |
+| PPO epochs per update (`--epochs`) | 4 | **8** |
 | minibatch size (`--minibatch-size`) | 128 | 128 |
-| parallel envs (`--num-envs`) | 4 | **8** |
-| rollout length (`--rollout-length`) | 64 | **300** |
+| parallel envs (`--num-envs`) | 4 | **10** |
+| rollout length (`--rollout-length`) | 64 | **50** |
 | ticks per decision step (`--ticks-per-step`) | 10 | 10 |
 | max episode steps, safety cap (`--max-episode-steps`) | 20,000 | 20,000 |
-| curriculum window (`--curriculum-window`) | 20 episodes | 20 episodes |
-| checkpoint interval (`--checkpoint-every`) | 20 updates | **10** |
-| eval interval (`--eval-every`) | 20 updates | **10** |
+| curriculum window (`--curriculum-window`) | 12 eval episodes | 12 |
+| checkpoint interval (`--checkpoint-every`) | 20 updates | 20 |
+| eval interval (`--eval-every`) | 20 updates | **60** |
+
+**`--weight-decay` is decoupled and applies to ≥2D parameters only** (conv
+kernels, linear weight matrices), never to biases — biases carry none of the
+overfitting risk it targets and shrinking them just drags the logits toward
+zero. The network has no normalization layers, so ≥2D vs 1D cleanly separates
+weights from biases. At `0.0` the optimizer is bit-identical to the previous
+plain Adam, so the flag is a true no-op by default.
+
+**Several of the current run's values are coupled, not independently chosen:**
+
+- `gamma 0.98` ⇔ `rollout-length 50`. One decision step is 1.0s of game time
+  (`ticks-per-step 10` × `msPerTick 100`), and gamma's effective horizon is
+  `1/(1-0.98) = 50` steps. The rollout is sized to exactly one discount
+  horizon — collecting past the point the return stops weighting buys nothing
+  for credit assignment.
+- `eval-every 60` holds *experience between evals* constant at 3000
+  decision-steps per env (60 × rollout 50), matching the earlier runs'
+  10 × rollout 300. Eval cost is fixed (one full greedy game) while update
+  cost fell 6× with the shorter rollout, so keeping `eval-every 10` would
+  have multiplied eval overhead 6×. This is what makes eval index comparable
+  across runs in `analysis/`.
+- `epochs 8` is BBF's replay ratio; it is paired with the weight decay
+  deliberately, since reusing each transition twice as often is what the
+  decay is there to offset.
 
 Environment/reward-side constants (`EnvServer.ts`, not network
 hyperparameters but still tunable knobs): potential-shaping coefficient
@@ -584,11 +630,44 @@ npm run replay:game -- ../training/replays/<gameID>.json
       boat-biased episode dump passed `npm run replay:game` **IN SYNC**,
       confirming the new intent type replays bit-identically through
       OpenFrontIO's own stock verification tooling.
-- [ ] Roadmap (not yet built, see the action-space-expansion plan): building/
-      structure actions, multi-opponent environment groundwork, and
-      diplomacy actions (alliance/donate/embargo) — diplomacy explicitly
-      gated on multi-opponent support landing first, since it's close to
-      meaningless with exactly one opponent.
+- [x] Roadmap Phase 1 — multi-opponent groundwork + the variable-N opponent
+      encoding (DeepSets φ over padded/masked opponent slots, pointer head
+      for `player_idx`, `self_troops_ratio` and per-opponent `troops_ratio`
+      observations). Built; see [Upcoming Architecture](#upcoming-architecture)
+      for what shipped and what was deliberately left out. `MAX_OPPONENTS` is
+      still 1, so the environment is the same 1v1 matchup — but no wire format
+      or weight shape depends on that number now, so raising it is a config
+      change rather than an architecture change.
+- [x] Kaggle burst-training port (`kaggle/`): Dataset-based source/checkpoint
+      hand-off, session chaining across the 12h cap, CPU-forced (the P100 has
+      no compiled kernels for this PyTorch build, and GPU utilisation was
+      6-7% anyway). Verified end-to-end: a session resumed from the pushed
+      checkpoint at update 1640 and ran its full 11h budget cleanly.
+- [x] BBF-style run (`training/run_bbf_gamma098.sh`, analysis in
+      `analysis/run_2026-09-11_bbf-adamw_gamma098_rollout50/`): AdamW weight
+      decay 0.1 + 8 PPO epochs (BBF's replay ratio), gamma=0.98 with the
+      rollout sized to exactly its 50-step discount horizon. Two things worth
+      carrying forward:
+      **(1) the KL early-stop does not protect against entropy erosion.**
+      It fired 0/38 times over the first 38 updates while entropy fell from
+      2.13 to 0.58 — `approx_kl` bounds per-update policy *movement*, and is
+      blind to entropy decaying across updates. Entropy recovered on its own
+      under the 0.02 bonus and the run has been stable since, but
+      `entropy`/`type_prob_*` is the metric to gate on when raising epochs,
+      not `stopped_early`.
+      **(2) the agent freezes partway through every episode** — 84.5% of
+      500-tick rollout windows across 40 eval episodes gain *exactly zero*
+      tiles, rising to 99.8% past 15k ticks and 100% past 40k. Essentially
+      all territorial work happens in the first ~5000 ticks (~8 min of game
+      time). This is the mechanism behind flat eval territory, ~25k-tick eval
+      episodes, and greedy eval going 0/40 while the sampled policy wins
+      14-28% of training episodes. Notably `self_troops_ratio` — the
+      observation added specifically to fix this — has shipped, and the
+      pathology persists, so it is not purely an observability gap.
+- [ ] Roadmap Phases 2-3 (not yet built, see the action-space-expansion
+      plan): building/structure actions, then diplomacy actions
+      (alliance/donate/embargo) — diplomacy explicitly gated on raising
+      `MAX_OPPONENTS`, since it's close to meaningless with one opponent.
 - [ ] v1 milestone: train to consistently beat the Impossible-difficulty
       Nation bot 1v1 — the actual multi-hour-plus training run(s), likely
       spanning local + Kaggle sessions per the original compute plan.
@@ -598,18 +677,30 @@ npm run replay:game -- ../training/replays/<gameID>.json
 
 ```bash
 cd training
-python train.py                          # real defaults: 4 envs, 64-step rollouts
-# resumes automatically from checkpoints/latest.pt if present -- safe to
-# Ctrl-C and rerun. Progress logs to checkpoints/train_log.csv, eval
+./run_bbf_gamma098.sh                    # the current run, hyperparameters pinned
+# or, for a one-off with your own flags:
+python train.py                          # bare defaults: 4 envs, 64-step rollouts
+# Either resumes automatically from checkpoints/latest.pt if present -- safe
+# to Ctrl-C and rerun. Progress logs to checkpoints/train_log.csv, eval
 # episodes (every --eval-every updates) land in replays/ as watchable/
 # verifiable GameRecords -- see "Watching a game" above.
 ```
 
-Key flags: `--num-envs`, `--rollout-length`, `--updates`, `--map`,
-`--checkpoint-dir`, `--checkpoint-every`, `--eval-every` (see `train.py
---help` for the full list — learning rate, GAE/clip/entropy coefficients,
-epochs, minibatch size are all exposed for tuning once real training
-starts).
+**Resume the current run via `run_bbf_gamma098.sh`, not by retyping the
+command.** Checkpoints carry weights, optimizer state and curriculum position
+but *not* hyperparameters, so a resume that forgets a flag does not fail — it
+continues the same checkpoint under argparse defaults, silently flipping
+`gamma` 0.98→0.99, rollout 50→64 and epochs 8→4 mid-run, with nothing in the
+logs to record the change. This repo has already lost a branch to a quieter
+version of that mistake (see
+`training/checkpoints/archive/run_2026-09-07_*_LOCAL-DIVERGENT-BRANCH/`).
+
+Key flags: `--num-envs`, `--rollout-length`, `--gamma`, `--epochs`,
+`--weight-decay`, `--updates`, `--map`, `--checkpoint-dir`,
+`--checkpoint-every`, `--eval-every` (see `train.py --help` for the full
+list — learning rate, GAE/clip/entropy coefficients and minibatch size are
+exposed too). The current run's values and the reasoning behind the coupled
+ones are in [Training (PPO) hyperparameters](#training-ppo-hyperparameters).
 
 ## FAQ
 
