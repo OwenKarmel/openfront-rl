@@ -34,6 +34,7 @@ import torch
 from curriculum import CurriculumScheduler
 from envs.openfront_env import (
     ACTIONS,
+    REWARD_MODES,
     OPPONENT_TILES_IDX,
     RESIZE_DIM,
     SELF_TILES_IDX,
@@ -176,6 +177,14 @@ def parse_args() -> argparse.Namespace:
     # (training and eval alike) should end via a real win/loss
     # (Episode.isDone()), not by running out of decision steps.
     p.add_argument("--max-episode-steps", type=int, default=20000)
+    p.add_argument(
+        "--reward-mode", choices=REWARD_MODES, default=REWARD_MODES[0],
+        help="which reward terms the env pays: shaping_and_terminal (default: tile-share "
+             "delta every step plus +/-1 when the game ends), shaping_only (tile-share "
+             "delta only), or terminal_only (+/-1 at the end only). Applies to training "
+             "and eval alike. A --max-episode-steps truncation never gets the terminal "
+             "term in any mode",
+    )
 
     p.add_argument(
         "--updates", type=int, default=0,
@@ -263,6 +272,9 @@ def make_env(args: argparse.Namespace, difficulty: str, seed_prefix: str) -> Ope
         difficulty=difficulty,
         ticks_per_step=args.ticks_per_step,
         max_steps=args.max_episode_steps,
+        # getattr: several probe/bench scripts build a bare Namespace for
+        # make_env; they predate the option and mean the default reward.
+        reward_mode=getattr(args, "reward_mode", REWARD_MODES[0]),
     )
 
 
@@ -435,7 +447,7 @@ def main() -> None:
     args.eval_dir = str(Path(args.eval_dir).resolve())
     device = torch.device(args.device)
     map_desc = args.map if args.map else f"random from SMALL_MAPS ({len(SMALL_MAPS)} maps)"
-    print(f"device={device} num_envs={args.num_envs} map={map_desc}")
+    print(f"device={device} num_envs={args.num_envs} map={map_desc} reward_mode={args.reward_mode}")
     if args.gamma_start is not None or args.rollout_match_horizon:
         end = args.gamma_anneal_start + args.gamma_anneal_updates
         peak_rollout = max(rollout_at(args.gamma_anneal_start, args), rollout_at(end, args))
@@ -496,6 +508,7 @@ def main() -> None:
         "update", "difficulty", "win_rate", "mean_reward", "policy_loss",
         "value_loss", "entropy", "approx_kl", "stopped_early", "episodes", "seconds",
         "type_entropy", *[f"type_prob_{a}" for a in ACTIONS], "gamma", "rollout_length",
+        "reward_mode",
     ]
     log_is_new = not log_path.exists() or log_path.stat().st_size == 0
     if not log_is_new:
@@ -511,6 +524,9 @@ def main() -> None:
                   f"Point --log-csv at a new file to record them.")
             if "gamma" in dropped and (args.gamma_start is not None or args.rollout_match_horizon):
                 sys.exit(f"refusing to run a gamma/rollout schedule into {log_path}, "
+                         f"which cannot record it -- pass a new --log-csv")
+            if "reward_mode" in dropped and args.reward_mode != REWARD_MODES[0]:
+                sys.exit(f"refusing to run reward mode {args.reward_mode!r} into {log_path}, "
                          f"which cannot record it -- pass a new --log-csv")
         log_columns = existing
     log_file = open(log_path, "a", newline="")
@@ -614,6 +630,7 @@ def main() -> None:
                 "type_entropy": type_entropy,
                 **{f"type_prob_{a}": p for a, p in zip(ACTIONS, type_probs)},
                 "gamma": gamma, "rollout_length": rollout_length,
+                "reward_mode": args.reward_mode,
             }
         )
         log_file.flush()

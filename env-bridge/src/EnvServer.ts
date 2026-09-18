@@ -35,8 +35,10 @@
  *
  * Protocol (one JSON object per line each direction):
  *   -> {"cmd":"reset","seed":"...","map":"onion","difficulty":"impossible",
- *       "ticksPerStep":10,"dumpGameRecordDir":"/path/to/replays"}
- *   <- {"obs":{...},"legalActions":[...],"done":false}
+ *       "ticksPerStep":10,"dumpGameRecordDir":"/path/to/replays",
+ *       "rewardMode":"shaping_and_terminal"}
+ *   <- {"obs":{...},"legalActions":[...],"done":false,
+ *       "rewardMode":"shaping_and_terminal"}
  *   -> {"cmd":"step","action":"expand"}
  *   <- {"obs":{...},"reward":0.1,"done":false,"legalActions":[...],
  *       "info":{"ticks":123,"winner":null}}
@@ -47,6 +49,11 @@
  * *some* opponent outlived AGENT, not which one: the reward and the
  * curriculum both only care whether AGENT survived, and collapsing it keeps
  * this field's meaning identical at any opponent count.
+ *
+ * `rewardMode` (optional, on reset; default "shaping_and_terminal") picks
+ * which terms make up the step reward -- see REWARD_MODES. The reset reply
+ * echoes the mode actually in effect, so a client can detect an older
+ * server that ignores the field instead of silently training on the default.
  *
  * `dumpGameRecordDir` (optional, on reset) writes a full, strictly
  * schema-valid GameRecord (Episode.toGameRecord()) to
@@ -149,6 +156,33 @@ const MACRO_GRID = 32;
  */
 const MAX_OPPONENTS = NUM_NATIONS;
 
+/**
+ * Which terms make up the step reward:
+ *   - shaping_and_terminal (default): tile-share delta every step, plus +1/-1
+ *     when the engine ends the game. Bit-identical to the reward before this
+ *     option existed.
+ *   - shaping_only: tile-share delta only. The undiscounted return telescopes
+ *     to final share minus starting share, so it still ranks a win (the game
+ *     ends at 80% domination) above any loss (an opponent at 80% leaves AGENT
+ *     at most 20%), but nothing marks the ending itself.
+ *   - terminal_only: +1/-1 at the engine-declared ending only, 0 otherwise.
+ *
+ * In every mode, an episode cut off by the Python side's max-steps safety
+ * cap gets no terminal term: that truncation never reaches this server as
+ * `done`, so only the shaping (if enabled) is ever paid for it.
+ */
+const REWARD_MODES = ["shaping_and_terminal", "shaping_only", "terminal_only"] as const;
+type RewardMode = (typeof REWARD_MODES)[number];
+
+function parseRewardMode(name: string | undefined): RewardMode {
+  if (name === undefined) return "shaping_and_terminal";
+  const mode = REWARD_MODES.find((m) => m === name);
+  if (mode === undefined) {
+    throw new Error(`unknown rewardMode "${name}": expected one of ${REWARD_MODES.join(", ")}`);
+  }
+  return mode;
+}
+
 interface ResetCmd {
   cmd: "reset";
   seed: string;
@@ -156,6 +190,7 @@ interface ResetCmd {
   difficulty?: string;
   ticksPerStep?: number;
   dumpGameRecordDir?: string;
+  rewardMode?: string;
 }
 interface StepCmd {
   cmd: "step";
@@ -612,6 +647,7 @@ function potential(episode: Episode): number {
   return agentTiles / totalLandTiles;
 }
 
+
 /**
  * Who actually won, per the ENGINE's own declaration -- not a guess from who
  * is still breathing.
@@ -735,8 +771,11 @@ class Session {
   ticksPerStep = 10;
   prevPotential = 0;
   dumpGameRecordDir: string | undefined;
+  rewardMode: RewardMode = "shaping_and_terminal";
 
   async reset(cmd: ResetCmd): Promise<object> {
+    // Parsed before building the episode, so a bad mode fails fast.
+    this.rewardMode = parseRewardMode(cmd.rewardMode);
     this.episode = await Episode.create(
       cmd.map,
       cmd.seed,
@@ -753,6 +792,7 @@ class Session {
       obs: observation(this.episode, this.width, this.height, grid, boatMask, block),
       legalActions: legalActions(this.episode, boatMask, block),
       done: this.episode.isDone(),
+      rewardMode: this.rewardMode,
     };
   }
 
@@ -775,21 +815,27 @@ class Session {
     // Potential-based shaping (map-size-normalized tile-share delta -- see
     // potential()), unscaled (no coefficient -- previously 5.0, against a
     // [-1,1]-bounded relative potential; this one is bounded [0,1] and
-    // unscaled instead), plus a terminal term once the episode ends: +1
-    // for an AGENT win, -1 for anything else -- an OPPONENT win *or* a
-    // truncated/drawn ending with no clear winner. That's a deliberate
-    // change from the previous "truncation is reward-neutral" behavior:
-    // stalling out to the episode-length safety cap without ever dying is
-    // now punished the same as an outright loss, rather than being a free
-    // (if unambitious) way to avoid the terminal penalty.
+    // unscaled instead), plus a terminal term once the engine ends the
+    // episode: +1 for an AGENT win, -1 for anything else -- an OPPONENT win
+    // *or* an engine-declared ending with no clear winner. Which of the two
+    // terms is paid is set by rewardMode (see REWARD_MODES); the potential
+    // is tracked in every mode so switching modes never changes the shaping
+    // arithmetic. A Python-side max-steps truncation is not `done` here and
+    // gets no terminal term in any mode.
     const newPotential = potential(episode);
-    let reward = newPotential - this.prevPotential;
+    const shaping = newPotential - this.prevPotential;
     this.prevPotential = newPotential;
     let winner: "AGENT" | "OPPONENT" | null = null;
+    let terminal = 0;
     if (done) {
       winner = resolveWinner(episode);
-      reward += winner === "AGENT" ? 1 : -1;
+      terminal = winner === "AGENT" ? 1 : -1;
     }
+    // Same operand order as the pre-rewardMode `shaping; reward += +/-1`, so
+    // the default mode stays bit-identical.
+    const reward =
+      (this.rewardMode === "terminal_only" ? 0 : shaping) +
+      (this.rewardMode === "shaping_only" ? 0 : terminal);
 
     if (done) this.flushRecord();
 

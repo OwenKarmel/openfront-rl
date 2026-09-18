@@ -43,6 +43,10 @@ OPENFRONTIO_TSCONFIG = ENV_BRIDGE_DIR / ".." / "OpenFrontIO" / "tsconfig.json"
 # Must match ACTIONS in EnvServer.ts.
 ACTIONS = ["noop", "expand", "attack_opponent", "boat_attack"]
 DIFFICULTIES = ["easy", "medium", "hard", "impossible"]
+# Which terms make up the step reward -- mirrors EnvServer.ts's REWARD_MODES
+# (see its docstring). The first entry is the default and reproduces the
+# reward from before this option existed.
+REWARD_MODES = ["shaping_and_terminal", "shaping_only", "terminal_only"]
 
 # Must match MAX_OPPONENTS in EnvServer.ts: the fixed number of opponent
 # slots every opponent-indexed observation/mask/action is padded to.
@@ -140,8 +144,11 @@ class OpenFrontEnv(gym.Env):
         node_bin: str = "node",
         dump_game_record_dir: str | None = None,
         recycle_every: int = 25,
+        reward_mode: str = REWARD_MODES[0],
     ) -> None:
         super().__init__()
+        if reward_mode not in REWARD_MODES:
+            raise ValueError(f"reward_mode must be one of {REWARD_MODES}, got {reward_mode!r}")
         if difficulty not in DIFFICULTIES:
             raise ValueError(f"difficulty must be one of {DIFFICULTIES}, got {difficulty!r}")
         self.map_name = map_name
@@ -157,6 +164,7 @@ class OpenFrontEnv(gym.Env):
         self.max_steps = max_steps
         self._node_bin = node_bin
         self.dump_game_record_dir = dump_game_record_dir
+        self.reward_mode = reward_mode
 
         # The env-bridge Node worker leaks ~2.5 MB per episode (measured:
         # a single worker grew 95 -> 157 MB over 25 resets, while its tsx
@@ -407,10 +415,19 @@ class OpenFrontEnv(gym.Env):
             "map": self.map_name,
             "difficulty": self.difficulty,
             "ticksPerStep": self.ticks_per_step,
+            "rewardMode": self.reward_mode,
         }
         if self.dump_game_record_dir is not None:
             reset_cmd["dumpGameRecordDir"] = self.dump_game_record_dir
         raw = self._send(reset_cmd)
+        if raw.get("rewardMode") != self.reward_mode:
+            # An env-bridge that predates rewardMode ignores the field and pays
+            # the default reward -- which would be indistinguishable from the
+            # requested one in every log. Fail instead.
+            raise RuntimeError(
+                f"env-bridge is using reward mode {raw.get('rewardMode')!r}, "
+                f"not the requested {self.reward_mode!r}"
+            )
         self._step_count = 0
         self._last_obs = raw
         return self._to_gym_obs(raw), {
