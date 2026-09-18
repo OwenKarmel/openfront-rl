@@ -450,17 +450,128 @@ function observation(
   };
 }
 
+/**
+ * Opt-in: mask "expand" when it cannot actually take a tile.
+ *
+ * OFF by default, so a run that does not set OPENFRONT_EXPAND_MASK=1 behaves
+ * bit-identically to before this flag existed. That matters because the live
+ * local training run respawns its env worker every `recycle_every` episodes
+ * (openfront_env.py) and so picks up this file mid-run; the intervention has
+ * to be inert unless asked for.
+ */
+const EXPAND_MASK_ENABLED = process.env.OPENFRONT_EXPAND_MASK === "1";
+
+/**
+ * Opt-in: require AGENT to actually border shore before "boat_attack" is
+ * offered. OFF by default, which keeps the existing approximate mask (any
+ * opponent-owned tile anywhere => boat_attack legal) exactly as-is.
+ *
+ * What the approximate mask misses. boatMask is set purely from ownership
+ * in tileGridAndBoatMask() -- it never asks whether AGENT can launch at all.
+ * A landlocked agent is therefore still offered boat_attack, and when it
+ * picks one intentFor() resolves the real target, gets null, and logs
+ * "treating as noop". That is reward-identical to "noop" (tile share does
+ * not move), so it is the same silent-no-op class of bug that unconditional
+ * "expand" was -- see canExpand() above.
+ *
+ * This check is the engine's own landlocked signal, not a reimplementation:
+ * AiAttackBehavior gates the Nation AI's boat logic on exactly
+ * `borderTiles().some(t => game.isShore(t))`, immediately after the same
+ * boatMaxNumber() guard used just above. Using isShore() keeps the agent and
+ * the built-in AI deciding "can I launch a boat" by the same rule.
+ *
+ * Deliberately NOT the full canBuildTransportShip()/closestReachableShore()
+ * check: that is per-destination and pathfinds over water, which is what
+ * made the earlier exhaustive version 7-10x slower per step (see
+ * resolveBoatTarget()'s comment). "Do I own any shore tile" is O(border
+ * tiles), agent-only, and catches the landlocked case this is aimed at. A
+ * target that is shore-reachable-in-principle but not from here still falls
+ * through to intentFor()'s existing logged no-op.
+ */
+const BOAT_MASK_ENABLED = process.env.OPENFRONT_BOAT_MASK === "1";
+
+/**
+ * Whether AGENT owns any shore tile, i.e. has somewhere to launch a boat
+ * from. Mirrors AiAttackBehavior's `hasShore` check; forEach with an
+ * early-out rather than the engine's Array.from(...).some(...), to avoid
+ * materialising the whole border set every step.
+ */
+function hasShore(episode: Episode): boolean {
+  const game = episode.game;
+  const agent = player(game, episode.agentId);
+  let found = false;
+  agent.borderTiles().forEach((tile) => {
+    if (found) return;
+    if (game.isShore(tile)) found = true;
+  });
+  return found;
+}
+
+/**
+ * Whether "expand" can actually take a tile this step.
+ *
+ * Mirrors AttackExecution.addNeighbors()'s predicate exactly: a tile is
+ * conquerable by a TerraNullius attack iff it is land, passable, unowned,
+ * and 4-adjacent to one of AGENT's border tiles.
+ *
+ * Why this exists. "expand" is otherwise unconditionally legal, and when
+ * nothing is conquerable the engine's round trip is a total no-op that still
+ * looks like an action: AttackExecution deducts attackAmount() = troops/5 up
+ * front, finds toConquer empty on the next tick, and calls retreat() with the
+ * default malusPercent = 0 -- refunding 100% of the troops. Net effect:
+ * troops dip 20%, come back a tick later, nothing happens on the map, and it
+ * costs the agent nothing.
+ *
+ * That is invisible to the reward: tile share does not change, so the
+ * potential-shaped reward is exactly 0 -- identical to "noop". The policy has
+ * no gradient distinguishing the two and can sit in the loop indefinitely.
+ * Observed in eval 0ab47d4b (Irish Sea, update 2879): the agent conquered its
+ * spawn island, then issued 9,159 expand intents over 91,591 ticks -- one
+ * every decision step for the whole episode -- while boat_attack, the only
+ * action that could have got it off the island, was legal throughout and
+ * sampled zero times.
+ *
+ * Cost: O(border tiles), early-outing once a target is found, via forEach
+ * (the dense path; ReadonlyTileSet.values() is a generator that showed up in
+ * the engine's own long-game profiles). Negligible next to the full w*h
+ * tile_grid scan tileGridAndBoatMask() already does every step.
+ */
+function canExpand(episode: Episode): boolean {
+  const game = episode.game;
+  const map = game.map();
+  const agent = player(game, episode.agentId);
+  const nbuf: number[] = [0, 0, 0, 0];
+  let found = false;
+  agent.borderTiles().forEach((tile) => {
+    if (found) return;
+    const n = map.neighbors4(tile, nbuf);
+    for (let i = 0; i < n; i++) {
+      const nb = nbuf[i];
+      if (map.isWater(nb) || map.isImpassable(nb)) continue;
+      if (!game.owner(nb).isPlayer()) {
+        found = true;
+        return;
+      }
+    }
+  });
+  return found;
+}
+
 function legalActions(episode: Episode, boatMask: Uint8Array, block: OpponentBlock): Action[] {
   const agent = player(episode.game, episode.agentId);
   if (!agent.isAlive()) return ["noop"];
   if (episode.game.inSpawnPhase()) return ["noop"];
-  const actions: Action[] = ["noop", "expand"];
+  const actions: Action[] = ["noop"];
+  if (!EXPAND_MASK_ENABLED || canExpand(episode)) {
+    actions.push("expand");
+  }
   if (block.attackTargetMask.some((legal) => legal)) {
     actions.push("attack_opponent");
   }
   if (
     agent.unitCount(UnitType.TransportShip) < episode.game.config().boatMaxNumber() &&
-    boatMask.some((byte) => byte !== 0)
+    boatMask.some((byte) => byte !== 0) &&
+    (!BOAT_MASK_ENABLED || hasShore(episode))
   ) {
     actions.push("boat_attack");
   }
