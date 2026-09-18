@@ -35,6 +35,7 @@ from curriculum import CurriculumScheduler
 from envs.openfront_env import (
     ACTIONS,
     OPPONENT_TILES_IDX,
+    RESIZE_DIM,
     SELF_TILES_IDX,
     SMALL_MAPS,
     OpenFrontEnv,
@@ -80,6 +81,80 @@ def mask_batch(infos: list[dict]) -> np.ndarray:
     return np.stack([info["action_mask"] for info in infos])
 
 
+# Schedules. Every function below is a pure function of the update counter
+# (plus args), never of mutable loop state. That is what makes them resume-
+# safe: checkpoints store the update number but not hyperparameters, so a
+# resume reconstructs the schedule only by recomputing it. Anything held in a
+# running variable would silently restart the anneal on every resume.
+
+
+def gamma_at(update: int, args: argparse.Namespace) -> float:
+    """Discount for this update.
+
+    Constant --gamma unless --gamma-start is set, in which case gamma anneals
+    from --gamma-start to --gamma over --gamma-anneal-updates updates,
+    beginning at --gamma-anneal-start.
+
+    The anneal is geometric in (1-gamma), not linear in gamma, so the
+    effective horizon 1/(1-gamma) grows by a constant FRACTION per update.
+    Linear-in-gamma is badly non-uniform in the horizon: 0.98 -> 0.999 moves
+    it only 50 -> 174 steps over the first 75% of the anneal, then 174 ->
+    1000 in the last 25%, dumping nearly all of the value target's
+    non-stationarity into the end.
+    """
+    if args.gamma_start is None:
+        return args.gamma
+    progress = (update - args.gamma_anneal_start) / args.gamma_anneal_updates
+    if progress <= 0.0:
+        return args.gamma_start
+    if progress >= 1.0:
+        return args.gamma  # exact, rather than 1 - (1-gamma) with float drift
+    ratio = (1.0 - args.gamma) / (1.0 - args.gamma_start)
+    return 1.0 - (1.0 - args.gamma_start) * ratio**progress
+
+
+def horizon_steps(gamma: float) -> int:
+    """gamma's effective horizon, 1/(1-gamma), in decision steps. One decision
+    step is 1.0s of game time (ticks-per-step 10 x msPerTick 100)."""
+    return round(1.0 / (1.0 - gamma))
+
+
+def rollout_at(update: int, args: argparse.Namespace) -> int:
+    """Rollout length (decision steps per env) for this update.
+
+    --rollout-length exactly, unless --rollout-match-horizon is set: then the
+    rollout is sized to exactly one discount horizon of this update's gamma,
+    so it grows with the gamma anneal. Collecting past the point the return
+    stops weighting buys nothing for credit assignment, and stopping short of
+    it truncates the return at the bootstrap more often than it has to.
+    """
+    if not args.rollout_match_horizon:
+        return args.rollout_length
+    return horizon_steps(gamma_at(update, args))
+
+
+def steps_before(update: int, args: argparse.Namespace) -> int:
+    """Decision steps per env collected by updates [0, update). Recomputed from
+    the schedule on resume rather than read from a counter, for the reason in
+    the section comment above."""
+    return sum(rollout_at(u, args) for u in range(update))
+
+
+def eval_due(update: int, steps_prev: int, steps_now: int, args: argparse.Namespace) -> bool:
+    """Whether to run an eval after this update.
+
+    With --eval-every-steps, evals fire each time cumulative per-env decision
+    steps cross a multiple of it. That keeps "eval n" meaning the same amount
+    of gameplay when the rollout length varies -- which analysis/README.md
+    relies on as the one deliberately-comparable cross-run axis. Keyed on
+    update count instead, 60 updates is 3000 steps at T=50 but 60000 at
+    T=1000. For a constant rollout the two are identical.
+    """
+    if args.eval_every_steps > 0:
+        return steps_prev // args.eval_every_steps != steps_now // args.eval_every_steps
+    return (update + 1) % args.eval_every == 0
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument(
@@ -90,11 +165,18 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--num-envs", type=int, default=4)
     p.add_argument("--rollout-length", type=int, default=64)
+    p.add_argument(
+        "--rollout-match-horizon", action="store_true",
+        help="size every update's rollout to one discount horizon of that update's "
+             "gamma, round(1/(1-gamma)), so it grows as gamma anneals. --rollout-length "
+             "is ignored when set",
+    )
     p.add_argument("--ticks-per-step", type=int, default=10)
     # Safety cap only -- see OpenFrontEnv's max_steps docstring. Episodes
     # (training and eval alike) should end via a real win/loss
     # (Episode.isDone()), not by running out of decision steps.
     p.add_argument("--max-episode-steps", type=int, default=20000)
+
     p.add_argument(
         "--updates", type=int, default=0,
         help="stop after this many updates; 0 (default) or negative runs indefinitely",
@@ -107,7 +189,25 @@ def parse_args() -> argparse.Namespace:
              "reproduces plain Adam. BBF uses 0.1 to offset the overfitting "
              "that reusing each transition many times invites",
     )
-    p.add_argument("--gamma", type=float, default=0.99)
+    p.add_argument(
+        "--gamma", type=float, default=0.99,
+        help="discount; with --gamma-start set, the FINAL value the anneal reaches",
+    )
+    p.add_argument(
+        "--gamma-start", type=float, default=None,
+        help="anneal gamma from this value to --gamma, geometrically in (1-gamma) "
+             "(see gamma_at). Unset (default) keeps gamma constant at --gamma",
+    )
+    p.add_argument(
+        "--gamma-anneal-updates", type=int, default=0,
+        help="length of the gamma anneal, in updates; required with --gamma-start",
+    )
+    p.add_argument(
+        "--gamma-anneal-start", type=int, default=0,
+        help="update at which the anneal begins. 0 for a cold start; set it to the "
+             "checkpoint's update count to warm-start a schedule from an existing run, "
+             "which would otherwise resume already past the end of the anneal",
+    )
     p.add_argument("--gae-lambda", type=float, default=0.95)
     p.add_argument("--clip-eps", type=float, default=0.2)
     p.add_argument("--entropy-coef", type=float, default=0.02)
@@ -144,6 +244,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--checkpoint-dir", default=str(Path(__file__).parent / "checkpoints"))
     p.add_argument("--checkpoint-every", type=int, default=20, help="updates between checkpoints")
     p.add_argument("--eval-every", type=int, default=20, help="updates between eval episodes")
+    p.add_argument(
+        "--eval-every-steps", type=int, default=0,
+        help="decision steps per env between eval episodes; overrides --eval-every when "
+             "positive. Use it whenever the rollout length varies (see eval_due)",
+    )
     p.add_argument("--eval-dir", default=str(Path(__file__).parent / "replays"))
     p.add_argument("--log-csv", default=str(Path(__file__).parent / "checkpoints" / "train_log.csv"))
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -317,9 +422,33 @@ def run_eval_episode(args: argparse.Namespace, net: ActorCritic, device: torch.d
 
 def main() -> None:
     args = parse_args()
+    if args.gamma_start is not None:
+        if args.gamma_anneal_updates <= 0:
+            sys.exit("--gamma-start needs a positive --gamma-anneal-updates")
+        if not (0.0 < args.gamma_start < 1.0 and 0.0 < args.gamma < 1.0):
+            sys.exit("--gamma-start and --gamma must both lie strictly inside (0, 1)")
+    if args.rollout_match_horizon and not 0.0 < args.gamma < 1.0:
+        sys.exit("--rollout-match-horizon needs gamma strictly inside (0, 1)")
+    # The replay is written by the Node env subprocess, which runs with
+    # cwd=env-bridge/ -- a relative --eval-dir would land there, not where
+    # it was typed. Resolve against Python's cwd before handing it over.
+    args.eval_dir = str(Path(args.eval_dir).resolve())
     device = torch.device(args.device)
     map_desc = args.map if args.map else f"random from SMALL_MAPS ({len(SMALL_MAPS)} maps)"
     print(f"device={device} num_envs={args.num_envs} map={map_desc}")
+    if args.gamma_start is not None or args.rollout_match_horizon:
+        end = args.gamma_anneal_start + args.gamma_anneal_updates
+        peak_rollout = max(rollout_at(args.gamma_anneal_start, args), rollout_at(end, args))
+        # tile_grid dominates the rollout buffer, and ppo_update's flatten
+        # np.stack()s a second full copy -- hence x2. A 1500x1500 version of
+        # this arithmetic is what OOM-killed training before (openfront_env.py).
+        grid_gb = 2 * peak_rollout * args.num_envs * RESIZE_DIM * RESIZE_DIM / 1e9
+        print(
+            f"schedule: gamma {gamma_at(args.gamma_anneal_start, args):.4f} -> {gamma_at(end, args):.4f} "
+            f"over updates {args.gamma_anneal_start}-{end}; rollout "
+            f"{rollout_at(args.gamma_anneal_start, args)} -> {rollout_at(end, args)} steps; "
+            f"peak tile_grid memory ~{grid_gb:.1f}GB"
+        )
 
     scheduler = CurriculumScheduler(window=args.curriculum_window)
     vec_env = VecEnv(
@@ -363,28 +492,47 @@ def main() -> None:
 
     log_path = Path(args.log_csv)
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    log_is_new = not log_path.exists()
+    log_columns = [
+        "update", "difficulty", "win_rate", "mean_reward", "policy_loss",
+        "value_loss", "entropy", "approx_kl", "stopped_early", "episodes", "seconds",
+        "type_entropy", *[f"type_prob_{a}" for a in ACTIONS], "gamma", "rollout_length",
+    ]
+    log_is_new = not log_path.exists() or log_path.stat().st_size == 0
+    if not log_is_new:
+        # Appending rows wider than an existing log's header would leave every
+        # later row misaligned. Keep writing that log's own schema instead,
+        # and say so -- a varying gamma that goes unlogged is exactly the
+        # silent-hyperparameter problem the run_*.sh launchers exist to stop.
+        with open(log_path, newline="") as fh:
+            existing = next(csv.reader(fh), None) or log_columns
+        dropped = [c for c in log_columns if c not in existing]
+        if dropped:
+            print(f"  NOTE: {log_path} predates columns {dropped}; not logging them to it. "
+                  f"Point --log-csv at a new file to record them.")
+            if "gamma" in dropped and (args.gamma_start is not None or args.rollout_match_horizon):
+                sys.exit(f"refusing to run a gamma/rollout schedule into {log_path}, "
+                         f"which cannot record it -- pass a new --log-csv")
+        log_columns = existing
     log_file = open(log_path, "a", newline="")
-    log_writer = csv.writer(log_file)
+    log_writer = csv.DictWriter(log_file, fieldnames=log_columns, extrasaction="ignore")
     if log_is_new:
-        log_writer.writerow(
-            ["update", "difficulty", "win_rate", "mean_reward", "policy_loss",
-             "value_loss", "entropy", "approx_kl", "stopped_early", "episodes", "seconds",
-             "type_entropy", *[f"type_prob_{a}" for a in ACTIONS]]
-        )
+        log_writer.writeheader()
 
     obs_list, info_list = vec_env.reset()
     batch = obs_to_batch(obs_list)
     action_mask = mask_batch(info_list)
 
     update_iter = range(start_update, args.updates) if args.updates > 0 else itertools.count(start_update)
+    steps_done = steps_before(start_update, args)
     for update in update_iter:
         t0 = time.time()
+        gamma = gamma_at(update, args)
+        rollout_length = rollout_at(update, args)
         buffer = RolloutBuffer()
         episode_outcomes: list[bool] = []  # True = AGENT won
         reward_sum = 0.0
 
-        for _ in range(args.rollout_length):
+        for _ in range(rollout_length):
             actions_t, log_probs_t, values_t = net.act(*net_inputs(batch, action_mask, device))
             actions_np = actions_t.cpu().numpy()
 
@@ -433,7 +581,7 @@ def main() -> None:
             buffer,
             last_values,
             device,
-            gamma=args.gamma,
+            gamma=gamma,
             lam=args.gae_lambda,
             clip_eps=args.clip_eps,
             entropy_coef=args.entropy_coef,
@@ -443,7 +591,8 @@ def main() -> None:
         )
 
         win_rate = (sum(episode_outcomes) / len(episode_outcomes)) if episode_outcomes else float("nan")
-        mean_reward = reward_sum / (args.rollout_length * args.num_envs)
+        mean_reward = reward_sum / (rollout_length * args.num_envs)
+        steps_prev, steps_done = steps_done, steps_done + rollout_length
         elapsed = time.time() - t0
         early_flag = " EARLY-STOP" if stats["stopped_early"] else ""
         type_probs_str = " ".join(f"{a}={p:.2f}" for a, p in zip(ACTIONS, type_probs))
@@ -452,13 +601,20 @@ def main() -> None:
             f"episodes={len(episode_outcomes):3d} win_rate={win_rate:.2f} "
             f"mean_reward={mean_reward:+.4f} policy_loss={stats['policy_loss']:+.4f} "
             f"value_loss={stats['value_loss']:.4f} entropy={stats['entropy']:.3f} "
-            f"kl={stats['approx_kl']:.4f} ({elapsed:.1f}s){early_flag}\n"
+            f"kl={stats['approx_kl']:.4f} gamma={gamma:.4f} T={rollout_length} ({elapsed:.1f}s){early_flag}\n"
             f"  type_probs[{type_probs_str}] type_entropy={type_entropy:.3f}"
         )
         log_writer.writerow(
-            [update, scheduler.difficulty, win_rate, mean_reward, stats["policy_loss"],
-             stats["value_loss"], stats["entropy"], stats["approx_kl"], stats["stopped_early"],
-             len(episode_outcomes), elapsed, type_entropy, *type_probs]
+            {
+                "update": update, "difficulty": scheduler.difficulty, "win_rate": win_rate,
+                "mean_reward": mean_reward, "policy_loss": stats["policy_loss"],
+                "value_loss": stats["value_loss"], "entropy": stats["entropy"],
+                "approx_kl": stats["approx_kl"], "stopped_early": stats["stopped_early"],
+                "episodes": len(episode_outcomes), "seconds": elapsed,
+                "type_entropy": type_entropy,
+                **{f"type_prob_{a}": p for a, p in zip(ACTIONS, type_probs)},
+                "gamma": gamma, "rollout_length": rollout_length,
+            }
         )
         log_file.flush()
 
@@ -466,7 +622,7 @@ def main() -> None:
             save_checkpoint(latest_path, net, optimizer, scheduler, update + 1)
             print(f"  checkpoint saved: {latest_path}")
 
-        if (update + 1) % args.eval_every == 0:
+        if eval_due(update, steps_prev, steps_done, args):
             # Captured before record_episode() below, which can promote and
             # change scheduler.difficulty as a side effect -- both the
             # milestone check and the printed "eval vs X" line must refer to

@@ -28,6 +28,20 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+# ARCHIVED 2026-09-13 at update 11360. This run now lives in
+# checkpoints/archive/run_2026-09-11_bbf-adamw_gamma098_rollout50/, and
+# checkpoints/ holds the gamma-anneal run. Running the command below as-is
+# would resume THAT run's latest.pt under this run's constant gamma=0.98 and
+# 50-step rollout -- silently, since checkpoints do not store hyperparameters.
+# Kept for provenance. To genuinely resume this run, copy the archive folder
+# out to its own directory and pass --checkpoint-dir/--log-csv/--eval-dir
+# pointing at it.
+if [ "${I_KNOW_THIS_RUN_IS_ARCHIVED:-}" != "1" ]; then
+  echo "run_bbf_gamma098.sh: this run is archived; see the comment in this script." >&2
+  echo "The live run is ./run_gamma_anneal.sh." >&2
+  exit 1
+fi
+
 exec /home/developer/miniconda/envs/openfront-rl/bin/python -u train.py \
   --num-envs 10 \
   --rollout-length 50 \
