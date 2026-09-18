@@ -15,12 +15,28 @@ sections — not the roadmap — are the live spec for anything already built.
 
 ## Running training
 
-Resume the current run with `training/run_bbf_gamma098.sh`, never by
-retyping the `train.py` command. Checkpoints store weights, optimizer state
-and curriculum position but **not** hyperparameters, so a resume that omits a
-flag does not fail — it silently continues under argparse defaults, flipping
-`gamma` 0.98→0.99 and rollout 50→64 mid-run with nothing in the logs to
+Resume the current run with `training/run_gamma_anneal_shaping_only_beta2.sh`
+(the gamma anneal with `--reward-mode shaping_only --potential-beta 2`),
+never by retyping the `train.py` command. The two previous anneal runs are
+archived at
+`training/checkpoints/archive/run_2026-09-17_gamma-anneal098-0999_shaping-only/`
+and `.../run_2026-09-13_gamma-anneal098-0999_rollout-horizon/`; their
+launchers `training/run_gamma_anneal_shaping_only.sh` and
+`training/run_gamma_anneal.sh` are disabled, like `run_bbf_gamma098.sh`.
+Checkpoints store weights, optimizer state and curriculum position but
+**not** hyperparameters, so a resume that omits a flag does not fail — it
+silently continues under argparse defaults, restoring the ±1 terminal
+reward, flattening the shaping potential back to linear, dropping the gamma
+schedule and snapping the rollout to 64 mid-run with nothing in the logs to
 record it.
+
+The live run always uses the regular `training/checkpoints/` and
+`training/replays/` (flat — the replay server does not read subfolders).
+Finished runs go to `training/checkpoints/archive/run_<date>_<descriptor>/`
+with `README.md`, `latest.pt`, `train_log.csv`, `train_stdout.log`,
+`notified_milestones.json` and `replays/`; see the existing folders there.
+When archiving, disable the old launcher and repoint that run's `analysis/`
+scripts at the archive, or both will silently read the next run's files.
 
 Python lives in the `openfront-rl` conda env:
 `/home/developer/miniconda/envs/openfront-rl/bin/python`. The base env has no

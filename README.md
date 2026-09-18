@@ -35,6 +35,11 @@ MuZero/EfficientZero, action/observation space, phased milestones).
     `GET /game/:id` from a directory of `Episode.toGameRecord()` dumps, so
     an episode can be watched in the real OpenFrontIO browser client — see
     "Watching a game" below.
+- `tests/` — every test for this project's own code (OpenFrontIO's own suite
+  stays upstream). Plain scripts, no pytest; `tests/run_all.sh` runs all eight
+  sequentially in ~13 min. See `tests/README.md` for what each covers, which
+  need a live env-bridge, and why the policy-driven ones pin a fixed archived
+  checkpoint rather than `latest.pt`.
 - `training/` — Python.
   - `envs/openfront_env.py` — `gymnasium.Env` wrapping `EnvServer.ts` over a
     subprocess. Single-agent: AGENT is controlled by `step(action)`;
@@ -42,13 +47,6 @@ MuZero/EfficientZero, action/observation space, phased milestones).
   - `curriculum.py` — `CurriculumScheduler`: windowed win-rate promotion/
     demotion through Easy → Medium → Hard → Impossible, now driven by real
     training via `train.py`.
-  - `smoke_test.py` — full-stack round-trip check using a random
-    (legal-action-masked) policy; not the actual training loop.
-  - `smoke_test_multiopp.py` — checks the properties that make the opponent
-    encoder count-agnostic (one network across 1/5/10 slots, padding
-    contributing nothing, permutation invariance, the pointer head never
-    targeting a masked-off slot). These can't be covered by training while
-    `MAX_OPPONENTS` is 1, since nothing is ever padded or ambiguous then.
   - `models/network.py` — the actor-critic network: a small CNN (strided
     convs + adaptive pooling, so it works across map sizes unchanged) over
     the one-hot tile-ownership grid, concatenated with an MLP over the six
@@ -70,12 +68,24 @@ MuZero/EfficientZero, action/observation space, phased milestones).
     construction as training — see `GameSetup.ts` — so it's watchable in
     the real client and verifiable via `npm run replay:game`, not an
     approximation of what training saw).
-  - `run_bbf_gamma098.sh` — launches (**and resumes**) the current run with
-    its hyperparameters pinned. Checkpoints store weights, optimizer state
-    and curriculum position but *not* hyperparameters, so a resume that
-    forgets a flag does not fail — it silently continues the same checkpoint
-    under argparse defaults, flipping `gamma` 0.98→0.99 and rollout 50→64
-    mid-run with nothing in the logs to say so. Always resume via the script.
+  - `run_*.sh` — one pinned launcher per run, which launches **and
+    resumes** it. Checkpoints store weights, optimizer state and curriculum
+    position but *not* hyperparameters, so a resume that forgets a flag does
+    not fail — it silently continues the same checkpoint under argparse
+    defaults with nothing in the logs to say so.
+    - `run_gamma_anneal_shaping_only_beta2.sh` — **the current run**: the
+      gamma anneal with `--reward-mode shaping_only --potential-beta 2`,
+      otherwise identical to `run_gamma_anneal_shaping_only.sh`. Its header
+      comment carries the memory and wall-time costs, and the reasoning for
+      beta.
+
+    The launchers below belong to archived runs and exit with an error,
+    because the live run reuses `checkpoints/`:
+    - `run_gamma_anneal_shaping_only.sh` — the shaping-only gamma anneal
+      (archived at update 2885).
+    - `run_gamma_anneal.sh` — the gamma-anneal run (archived at update 2560).
+      Its header comment carries the memory and wall-time costs.
+    - `run_bbf_gamma098.sh` — the gamma=0.98 run (archived at update 11360).
   - `oom_guard.sh`, `notify_on_finish.sh`, `notify_on_download.sh` — ops
     helpers: OOM-victim reordering for the long run, and ntfy alerts.
 - `kaggle/` — Kaggle burst-training port: `package_source.sh` builds the
@@ -110,7 +120,7 @@ shared pointer head scores each slot for `attack_opponent`'s target. No
 weight shape depends on the number of opponents, so the count is a config
 value (`MAX_OPPONENTS`), not an architectural commitment. It is **1** today —
 the same 1v1 matchup as every run so far — with the count-agnostic
-properties covered by `training/smoke_test_multiopp.py` rather than by
+properties covered by `tests/smoke_test_multiopp.py` rather than by
 training.
 
 ```mermaid
@@ -235,15 +245,20 @@ weight shape depends on it; `S` is read from the input tensor at runtime).
 ### Training (PPO) hyperparameters
 
 Not part of the network itself, but every knob governing how it's
-trained (`train.py` CLI flags / `ppo.py` defaults; **current live run's
-overrides in bold** where they differ from the default):
+trained (`train.py` CLI flags / `ppo.py` defaults; **the current run's
+overrides in bold** where they differ from the default — the shaping-only
+gamma anneal with a convex potential,
+`training/run_gamma_anneal_shaping_only_beta2.sh`):
 
-| Hyperparameter | Default | Current run |
+| Hyperparameter | Default | Current run (gamma anneal, shaping only, beta 2) |
 |---|---|---|
 | optimizer | `torch.optim.AdamW` | — |
 | learning rate (`--lr`) | 3e-4 | 3e-4 |
 | weight decay (`--weight-decay`) | 0.0 (≡ plain Adam) | **0.1** (BBF's value — see Status) |
-| discount `gamma` (`--gamma`) | 0.99 | **0.98** |
+| discount `gamma` (`--gamma`) | 0.99 | **0.999** (final value of the anneal) |
+| gamma anneal start value (`--gamma-start`) | unset (≡ constant `--gamma`) | **0.98** |
+| gamma anneal length (`--gamma-anneal-updates`) | 0 updates | **3000** |
+| gamma anneal first update (`--gamma-anneal-start`) | 0 | 0 (cold start) |
 | GAE `lambda` (`--gae-lambda`) | 0.95 | 0.95 |
 | PPO clip `epsilon` (`--clip-eps`) | 0.2 | 0.2 |
 | value loss coef (`ppo.py`'s `value_coef`) | 0.5 | 0.5 |
@@ -253,12 +268,16 @@ overrides in bold** where they differ from the default):
 | PPO epochs per update (`--epochs`) | 4 | **8** |
 | minibatch size (`--minibatch-size`) | 128 | 128 |
 | parallel envs (`--num-envs`) | 4 | **10** |
-| rollout length (`--rollout-length`) | 64 | **50** |
+| rollout length (`--rollout-length`) | 64 | ignored (see next row) |
+| rollout = one discount horizon (`--rollout-match-horizon`) | off | **on** (50→1000 steps) |
 | ticks per decision step (`--ticks-per-step`) | 10 | 10 |
 | max episode steps, safety cap (`--max-episode-steps`) | 20,000 | 20,000 |
+| reward terms (`--reward-mode`) | `shaping_and_terminal` | **`shaping_only`** |
+| shaping convexity (`--potential-beta`) | `0` (linear) | **`2`** (per-tile weight `e^{2p}`) |
 | curriculum window (`--curriculum-window`) | 12 eval episodes | 12 |
-| checkpoint interval (`--checkpoint-every`) | 20 updates | 20 |
-| eval interval (`--eval-every`) | 20 updates | **60** |
+| checkpoint interval (`--checkpoint-every`) | 20 updates | **5** (updates reach ~156s at T=1000) |
+| eval interval (`--eval-every`) | 20 updates | ignored (see next row) |
+| eval interval in steps (`--eval-every-steps`) | 0 (≡ use `--eval-every`) | **3000** |
 
 **`--weight-decay` is decoupled and applies to ≥2D parameters only** (conv
 kernels, linear weight matrices), never to biases — biases carry none of the
@@ -267,19 +286,38 @@ zero. The network has no normalization layers, so ≥2D vs 1D cleanly separates
 weights from biases. At `0.0` the optimizer is bit-identical to the previous
 plain Adam, so the flag is a true no-op by default.
 
+**Gamma can anneal.** With `--gamma-start` set, `gamma_at()` in `train.py`
+moves gamma from `--gamma-start` to `--gamma` over `--gamma-anneal-updates`,
+**geometrically in `(1-gamma)`** rather than linearly in gamma, so the effective
+horizon `1/(1-gamma)` grows by a constant fraction per update. Linear-in-gamma
+0.98→0.999 would move the horizon only 50→174 steps in the first 75% of the
+anneal and 174→1000 in the last 25%, piling the value target's
+non-stationarity into the end. The schedule is a pure function of the update
+counter — the same resume-safety argument as everywhere else, since
+checkpoints don't store hyperparameters — and `--gamma-anneal-start` offsets
+it for a warm start from an existing checkpoint. Every flag here is a no-op at
+its default. `train_log.csv` records `gamma` and `rollout_length` per update;
+a run appending to a log that predates those columns keeps that log's schema
+(with a startup note), and a *scheduled* run refuses to start against such a
+log rather than run a varying gamma unrecorded.
+
 **Several of the current run's values are coupled, not independently chosen:**
 
-- `gamma 0.98` ⇔ `rollout-length 50`. One decision step is 1.0s of game time
+- gamma ⇔ rollout length. One decision step is 1.0s of game time
   (`ticks-per-step 10` × `msPerTick 100`), and gamma's effective horizon is
-  `1/(1-0.98) = 50` steps. The rollout is sized to exactly one discount
-  horizon — collecting past the point the return stops weighting buys nothing
-  for credit assignment.
-- `eval-every 60` holds *experience between evals* constant at 3000
-  decision-steps per env (60 × rollout 50), matching the earlier runs'
-  10 × rollout 300. Eval cost is fixed (one full greedy game) while update
-  cost fell 6× with the shorter rollout, so keeping `eval-every 10` would
-  have multiplied eval overhead 6×. This is what makes eval index comparable
-  across runs in `analysis/`.
+  `1/(1-gamma)` steps. The rollout is sized to exactly one discount horizon —
+  collecting past the point the return stops weighting buys nothing for
+  credit assignment. The archived gamma=0.98 run set this by hand
+  (`--rollout-length 50`); `--rollout-match-horizon` enforces it every update
+  while gamma anneals, 50 steps at 0.98 through 1000 at 0.999.
+- `eval-every-steps 3000` holds *experience between evals* constant at 3000
+  decision-steps per env, matching the gamma=0.98 run's 60 × rollout 50 and
+  the earlier runs' 10 × rollout 300. This is what makes eval index
+  comparable across runs in `analysis/`. With a varying rollout, update-keyed
+  evals would drift from 3000 to 60000 steps apart; step-keyed evals fire
+  each time cumulative per-env decision steps cross a multiple of 3000,
+  recomputed from the schedule on resume. For a constant rollout it fires on
+  exactly the same updates as `--eval-every`.
 - `epochs 8` is BBF's replay ratio; it is paired with the weight decay
   deliberately, since reusing each transition twice as often is what the
   decay is there to offset.
@@ -287,8 +325,78 @@ plain Adam, so the flag is a true no-op by default.
 Environment/reward-side constants (`EnvServer.ts`, not network
 hyperparameters but still tunable knobs): potential-shaping coefficient
 `1.0` (i.e. the tile-share delta is used unscaled), terminal win/loss reward
-`±1` (a truncated/drawn episode scores `-1`, same as a loss), `MACRO_GRID`=32,
-`MAX_OPPONENTS`=1.
+`±1`, `MACRO_GRID`=32, `MAX_OPPONENTS`=1.
+
+**The reward has three modes** (`--reward-mode`, sent to the env server on
+every reset; applies to training and eval alike, and logged per update as
+`reward_mode` in `train_log.csv`):
+
+| mode | per step | when the engine ends the game |
+|---|---|---|
+| `shaping_and_terminal` (default) | tile-share delta, `Δ(tiles / land tiles)` | delta **+1** for an AGENT win, **−1** otherwise |
+| `shaping_only` | tile-share delta | delta only |
+| `terminal_only` | 0 | **+1** / **−1** only |
+
+- The default is bit-identical to the reward before the option existed.
+- The server echoes the mode on reset and `OpenFrontEnv` checks it, so an
+  env-bridge that predates the option fails at reset instead of silently
+  paying the default.
+- The terminal term is paid only when the **engine** ends the game: a
+  declared winner (including the 80% domination ending) or everyone dead.
+  An episode cut off by `--max-episode-steps` is truncated on the Python side
+  and gets **no** terminal term in any mode. (This corrects earlier wording
+  here that said a truncated episode scores −1; the code never did that.)
+- Under `shaping_only` the undiscounted return telescopes to *final share −
+  starting share*. That still ranks a win (the game ends with AGENT at 80%)
+  above any loss (an opponent at 80% leaves AGENT at most 20%), but a loss is
+  not negative: an agent that holds its spawn until it loses earns exactly 0,
+  and one that grows a little first earns slightly more than 0.
+- `tests/test_reward_modes.py` checks all three modes in lockstep on the
+  same seeds through real, engine-ended games.
+
+**The shaping potential can be bent convex** (`--potential-beta`, default
+`0`, sent on reset alongside `--reward-mode` and logged per update as
+`potential_beta`). It answers "a tile should be worth more when you already
+hold half the map than when you hold 1% of it":
+
+```
+Phi(p) = p                        beta = 0   (the linear tile-share delta)
+Phi(p) = (exp(beta*p) - 1)/beta   beta > 0
+```
+
+over AGENT's tile share `p`, so the per-tile weight is `Phi'(p) =
+exp(beta*p)` — `1.0` at spawn, `exp(beta)` at total control. Two properties
+are load-bearing:
+
+- **`Phi'(0) = 1` for every beta**, so beta only *adds* weight above spawn
+  and never subtracts it below. A power law `p^k` has `Phi'(0) = 0`, which
+  would erase the spawn-expand gradient this policy is already barely
+  holding (see the noop-collapse diagnosis in the 2026-09-13 archive).
+- **Constant relative growth** (`Phi''/Phi' = beta`): the weight ratio
+  between two territory levels depends only on their difference — the same
+  design principle as the gamma anneal's geometry in `(1-gamma)`.
+
+It is applied to the **state**, never to the delta. Weighting gains and
+losses differently would leave a cycle that pays to lose a tile cheaply and
+retake it dearly, forever; under a state potential a tile lost at share `p`
+costs exactly what the same tile gained at `p` paid. `Phi` stays monotone,
+so `shaping_only` keeps its ordering guarantee (the undiscounted return
+telescopes to `Phi(final) - Phi(start)`). `beta = 0` is bit-identical to the
+reward before the option existed, and `terminal_only` is unaffected.
+
+**Cost, measured** on 12 sampled-policy episodes (11,732 decision steps) from
+the paused run's checkpoint: 81% of decision steps sit at `p < 0.2`, so
+convexity multiplies a small, high-variance minority of steps. Relative to
+linear, `beta = 2` raises the per-step reward std by 1.64x while leaving the
+spawn advantage unchanged, which shrinks the spawn entropy-vs-advantage
+equilibrium `z* = dA_raw/(c*sigma)` to **0.61x**; `beta = 3` gives 2.18x and
+**0.47x**. That is the same quantity behind the noop collapse, so beta
+trades directly against it — a robust (percentile) advantage scale in place
+of the std recovers it to 0.69x / 0.57x.
+
+- `tests/test_potential_beta.py` checks the closed form step by step
+  against the engine's own tile counts, for gains and losses alike, in
+  lockstep across `beta` 0/2/5 on one seed.
 
 ## Upcoming Architecture
 
@@ -519,12 +627,15 @@ cd env-bridge
 npm run smoke -- --map onion --seed smoke-1 --ticks 300 --difficulty hard
 
 # Python: gymnasium round-trip against the same real opponent
-cd ../training
-python smoke_test.py
+cd ..
+python tests/smoke_test.py
 
 # Variable-opponent-count architecture checks (no environment needed for
 # most of it — see smoke_test_multiopp.py's docstring)
-python smoke_test_multiopp.py
+python tests/smoke_test_multiopp.py
+
+# Or every test in the project, sequentially (~13 min)
+tests/run_all.sh
 
 # Headless replay verification via OpenFrontIO's own stock tooling
 cd ../env-bridge
@@ -643,7 +754,8 @@ npm run replay:game -- ../training/replays/<gameID>.json
       no compiled kernels for this PyTorch build, and GPU utilisation was
       6-7% anyway). Verified end-to-end: a session resumed from the pushed
       checkpoint at update 1640 and ran its full 11h budget cleanly.
-- [x] BBF-style run (`training/run_bbf_gamma098.sh`, analysis in
+- [x] BBF-style run (archived at update 11360 to
+      `training/checkpoints/archive/run_2026-09-11_bbf-adamw_gamma098_rollout50/`, analysis in
       `analysis/run_2026-09-11_bbf-adamw_gamma098_rollout50/`): AdamW weight
       decay 0.1 + 8 PPO epochs (BBF's replay ratio), gamma=0.98 with the
       rollout sized to exactly its 50-step discount horizon. Two things worth
@@ -664,6 +776,54 @@ npm run replay:game -- ../training/replays/<gameID>.json
       14-28% of training episodes. Notably `self_troops_ratio` — the
       observation added specifically to fix this — has shipped, and the
       pathology persists, so it is not purely an observability gap.
+- [x] Gamma-anneal run (archived at update 2560, anneal 85% complete, to
+      `training/checkpoints/archive/run_2026-09-13_gamma-anneal098-0999_rollout-horizon/`): gamma 0.98→0.999
+      over 3000 updates with the rollout sized to one discount horizon
+      (50→644 steps by the stop), aimed at freeze mechanism (2) above. Two
+      things worth carrying forward:
+      **(1) the sampled policy improved but greedy eval did not.** Training
+      win rate 23.8% vs 15.2% for the gamma=0.98 run at equal experience
+      (z = 6.8), opening once gamma passed ~0.996. Greedy eval: 3 wins in 198
+      (all at the game's tick limit), and from eval 121 (gamma ~0.9976) 34/78
+      greedy agents never acted after spawning, vs 7/69 for gamma=0.98.
+      **(2) why: normalized advantages vs an unnormalized entropy bonus.** At
+      spawn the policy sits at ~50/50 noop/expand (gamma=0.98's expands with
+      p≈1.00). The raw advantage of expanding is unchanged, but the batch
+      advantage std it is divided by grew ~5× (value noise from estimating a
+      discounted win probability, plus terminals in nearly every
+      ~6,000-sample batch), so the 0.02 entropy bonus wins at low-signal
+      states. Full measurement, and mitigations not yet applied, in that
+      archive's `README.md` and `noop_collapse_investigation.md`. Also found:
+      KL early stops inflated by a tiny leftover minibatch when the rollout
+      length varies (fix not applied).
+- [x] Shaping-only gamma-anneal run (archived at update 2885, anneal 96%
+      complete, to
+      `training/checkpoints/archive/run_2026-09-17_gamma-anneal098-0999_shaping-only/`):
+      the archived gamma anneal's exact config plus `--reward-mode
+      shaping_only` — no ±1 when the game ends, only the tile-share delta.
+      **Greedy eval improved, training did not.** Paired on identical eval
+      indices (both runs use `--eval-every-steps 3000`, so eval *k* fires at
+      the same update, same seed, same map), mean peak territory 0.072 vs
+      0.040 over 198 pairs, paired difference **+0.032, 95% CI [+0.019,
+      +0.048]**, ahead in 122/198. Training win rate over the shared
+      experience was 24.9% vs 23.8% — indistinguishable — and cumulative tile
+      share per env 33.31 vs 33.38. The noop collapse was substantially
+      reduced (7% of evals never left spawn at evals 121–192, vs 56% for the
+      terminal-reward run over the same window) but returned to ~17% by eval
+      280, so it is reduced, not fixed.
+- [ ] Convex-potential gamma-anneal run
+      (`training/run_gamma_anneal_shaping_only_beta2.sh`) — **the current
+      run**, cold-started 2026-09-17. The archived shaping-only run's exact
+      config plus `--potential-beta 2`: `Φ(p) = (e^{2p}−1)/2`, so a tile
+      gained or lost at map share `p` is worth `e^{2p}` times the same tile
+      at spawn (1.65× at 25% territory, 5.0× at the 80% win threshold).
+      Hypothesis: OpenFrontIO's economy taxes the leader
+      (`maxTroops ∝ tiles^0.6`), so the agent has weak intrinsic reason to
+      push past the 20–30% territory band its episodes stall in; a convex
+      potential is a direct counterweight. Compare against the archived
+      shaping-only run at equal experience / eval index; its known issues are
+      again deliberately left unfixed so the comparison isolates the
+      potential.
 - [ ] Roadmap Phases 2-3 (not yet built, see the action-space-expansion
       plan): building/structure actions, then diplomacy actions
       (alliance/donate/embargo) — diplomacy explicitly gated on raising
@@ -677,27 +837,34 @@ npm run replay:game -- ../training/replays/<gameID>.json
 
 ```bash
 cd training
-./run_bbf_gamma098.sh                    # the current run, hyperparameters pinned
+./run_gamma_anneal_shaping_only_beta2.sh # the current run, hyperparameters pinned
 # or, for a one-off with your own flags:
 python train.py                          # bare defaults: 4 envs, 64-step rollouts
 # Either resumes automatically from checkpoints/latest.pt if present -- safe
 # to Ctrl-C and rerun. Progress logs to checkpoints/train_log.csv, eval
-# episodes (every --eval-every updates) land in replays/ as watchable/
+# episodes (every --eval-every updates, or --eval-every-steps decision steps
+# per env) land flat in replays/ -- the replay server does not look in
+# subfolders -- as watchable/
 # verifiable GameRecords -- see "Watching a game" above.
 ```
 
-**Resume the current run via `run_bbf_gamma098.sh`, not by retyping the
+**Resume a run via its pinned `run_*.sh` launcher, not by retyping the
 command.** Checkpoints carry weights, optimizer state and curriculum position
 but *not* hyperparameters, so a resume that forgets a flag does not fail — it
-continues the same checkpoint under argparse defaults, silently flipping
-`gamma` 0.98→0.99, rollout 50→64 and epochs 8→4 mid-run, with nothing in the
-logs to record the change. This repo has already lost a branch to a quieter
+continues the same checkpoint under argparse defaults, silently dropping any
+gamma schedule (constant `gamma` 0.99), snapping the rollout to 64 and epochs
+8→4 mid-run, with nothing in the logs to record the change. When a run is
+archived, disable its launcher (as `run_bbf_gamma098.sh` and
+`run_gamma_anneal.sh` are) — the next run reuses `checkpoints/`, so a stale
+launcher would resume the wrong run. This repo has already lost a branch to a quieter
 version of that mistake (see
 `training/checkpoints/archive/run_2026-09-07_*_LOCAL-DIVERGENT-BRANCH/`).
 
-Key flags: `--num-envs`, `--rollout-length`, `--gamma`, `--epochs`,
-`--weight-decay`, `--updates`, `--map`, `--checkpoint-dir`,
-`--checkpoint-every`, `--eval-every` (see `train.py --help` for the full
+Key flags: `--num-envs`, `--rollout-length`, `--rollout-match-horizon`,
+`--gamma`, `--gamma-start`, `--gamma-anneal-updates`, `--gamma-anneal-start`,
+`--epochs`, `--weight-decay`, `--updates`, `--map`, `--checkpoint-dir`,
+`--log-csv`, `--checkpoint-every`, `--eval-every`, `--eval-every-steps`,
+`--reward-mode` (see `train.py --help` for the full
 list — learning rate, GAE/clip/entropy coefficients and minibatch size are
 exposed too). The current run's values and the reasoning behind the coupled
 ones are in [Training (PPO) hyperparameters](#training-ppo-hyperparameters).
