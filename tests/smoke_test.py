@@ -10,7 +10,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+TRAINING = Path(__file__).resolve().parent.parent / "training"
+sys.path.insert(0, str(TRAINING))
 
 import numpy as np
 from envs.openfront_env import (
