@@ -36,9 +36,9 @@
  * Protocol (one JSON object per line each direction):
  *   -> {"cmd":"reset","seed":"...","map":"onion","difficulty":"impossible",
  *       "ticksPerStep":10,"dumpGameRecordDir":"/path/to/replays",
- *       "rewardMode":"shaping_and_terminal"}
+ *       "rewardMode":"shaping_and_terminal","potentialBeta":0}
  *   <- {"obs":{...},"legalActions":[...],"done":false,
- *       "rewardMode":"shaping_and_terminal"}
+ *       "rewardMode":"shaping_and_terminal","potentialBeta":0}
  *   -> {"cmd":"step","action":"expand"}
  *   <- {"obs":{...},"reward":0.1,"done":false,"legalActions":[...],
  *       "info":{"ticks":123,"winner":null}}
@@ -54,6 +54,11 @@
  * which terms make up the step reward -- see REWARD_MODES. The reset reply
  * echoes the mode actually in effect, so a client can detect an older
  * server that ignores the field instead of silently training on the default.
+ *
+ * `potentialBeta` (optional, on reset; default 0) bends the shaping
+ * potential so a tile is worth more the more of the map AGENT already holds
+ * -- see shapePotential(). 0 is the original linear tile-share delta,
+ * bit-identically. Echoed on reset for the same reason as `rewardMode`.
  *
  * `dumpGameRecordDir` (optional, on reset) writes a full, strictly
  * schema-valid GameRecord (Episode.toGameRecord()) to
@@ -191,6 +196,7 @@ interface ResetCmd {
   ticksPerStep?: number;
   dumpGameRecordDir?: string;
   rewardMode?: string;
+  potentialBeta?: number;
 }
 interface StepCmd {
   cmd: "step";
@@ -641,12 +647,55 @@ function legalActions(episode: Episode, boatMask: Uint8Array, block: OpponentBlo
  * riding along with an architecture change -- exactly the confound that
  * makes a regression un-attributable to either one.
  */
-function potential(episode: Episode): number {
+function potential(episode: Episode, beta: number): number {
   const agentTiles = player(episode.game, episode.agentId).numTilesOwned();
   const totalLandTiles = episode.game.map().numLandTiles();
-  return agentTiles / totalLandTiles;
+  return shapePotential(agentTiles / totalLandTiles, beta);
 }
 
+/**
+ * Convex reweighting of the tile share: how much one tile is worth depends
+ * on how much of the map AGENT already holds.
+ *
+ *   Phi(p) = p                      (beta == 0, the original linear potential)
+ *   Phi(p) = (exp(beta*p) - 1)/beta (beta  > 0)
+ *
+ * The per-tile weight is Phi'(p) = exp(beta*p): 1.0 at spawn, exp(beta) at
+ * total control. Two properties are load-bearing, and both are why this is
+ * exponential rather than a power law:
+ *
+ *   - `Phi'(0) = 1` for every beta, so beta only ADDS weight above spawn and
+ *     never subtracts it below. `p^k` has `Phi'(0) = 0`, which would erase
+ *     the spawn-expand gradient this policy is already barely holding on to
+ *     (see the noop-collapse diagnosis in the 2026-09-13 archive README).
+ *   - Constant relative growth (`Phi''/Phi' = beta`), so the weight ratio
+ *     between two territory levels depends only on their difference. Same
+ *     design principle as the gamma anneal's geometry in (1-gamma).
+ *
+ * beta == 0 returns p unchanged, bit-identically, so the default reward is
+ * exactly what it was before this parameter existed.
+ *
+ * Phi stays monotone increasing for any beta >= 0, so shaping_only keeps its
+ * ordering guarantee: the undiscounted return still telescopes to
+ * Phi(final share) - Phi(start share), which still ranks a win above any loss.
+ *
+ * Applied to the STATE, never to the delta -- weighting gains and losses
+ * differently would leave a cycle that pays to lose a tile cheaply and retake
+ * it dearly, forever. Under a state potential, a tile lost at share p costs
+ * exactly what the same tile gained at share p paid.
+ */
+function shapePotential(p: number, beta: number): number {
+  if (beta === 0) return p;
+  return Math.expm1(beta * p) / beta;
+}
+
+function parsePotentialBeta(value: number | undefined): number {
+  if (value === undefined) return 0;
+  if (!Number.isFinite(value) || value < 0) {
+    throw new Error(`potentialBeta must be a finite number >= 0, got ${value}`);
+  }
+  return value;
+}
 
 /**
  * Who actually won, per the ENGINE's own declaration -- not a guess from who
@@ -772,10 +821,12 @@ class Session {
   prevPotential = 0;
   dumpGameRecordDir: string | undefined;
   rewardMode: RewardMode = "shaping_and_terminal";
+  potentialBeta = 0;
 
   async reset(cmd: ResetCmd): Promise<object> {
     // Parsed before building the episode, so a bad mode fails fast.
     this.rewardMode = parseRewardMode(cmd.rewardMode);
+    this.potentialBeta = parsePotentialBeta(cmd.potentialBeta);
     this.episode = await Episode.create(
       cmd.map,
       cmd.seed,
@@ -785,7 +836,7 @@ class Session {
     this.height = this.episode.game.height();
     this.ticksPerStep = cmd.ticksPerStep ?? 10;
     this.dumpGameRecordDir = cmd.dumpGameRecordDir;
-    this.prevPotential = potential(this.episode);
+    this.prevPotential = potential(this.episode, this.potentialBeta);
     const { grid, boatMask } = tileGridAndBoatMask(this.episode);
     const block = opponentBlock(this.episode);
     return {
@@ -793,6 +844,7 @@ class Session {
       legalActions: legalActions(this.episode, boatMask, block),
       done: this.episode.isDone(),
       rewardMode: this.rewardMode,
+      potentialBeta: this.potentialBeta,
     };
   }
 
@@ -822,7 +874,7 @@ class Session {
     // is tracked in every mode so switching modes never changes the shaping
     // arithmetic. A Python-side max-steps truncation is not `done` here and
     // gets no terminal term in any mode.
-    const newPotential = potential(episode);
+    const newPotential = potential(episode, this.potentialBeta);
     const shaping = newPotential - this.prevPotential;
     this.prevPotential = newPotential;
     let winner: "AGENT" | "OPPONENT" | null = null;

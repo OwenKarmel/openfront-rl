@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import subprocess
 import sys
 from pathlib import Path
@@ -145,10 +146,18 @@ class OpenFrontEnv(gym.Env):
         dump_game_record_dir: str | None = None,
         recycle_every: int = 25,
         reward_mode: str = REWARD_MODES[0],
+        # Convexity of the shaping potential: Phi(p) = (exp(beta*p)-1)/beta
+        # for beta > 0, Phi(p) = p at beta == 0 (the original linear
+        # tile-share delta, bit-identical). See shapePotential() in
+        # EnvServer.ts -- the server owns the arithmetic; this is only the
+        # wire field and its validation.
+        potential_beta: float = 0.0,
     ) -> None:
         super().__init__()
         if reward_mode not in REWARD_MODES:
             raise ValueError(f"reward_mode must be one of {REWARD_MODES}, got {reward_mode!r}")
+        if not math.isfinite(potential_beta) or potential_beta < 0:
+            raise ValueError(f"potential_beta must be a finite number >= 0, got {potential_beta!r}")
         if difficulty not in DIFFICULTIES:
             raise ValueError(f"difficulty must be one of {DIFFICULTIES}, got {difficulty!r}")
         self.map_name = map_name
@@ -165,6 +174,7 @@ class OpenFrontEnv(gym.Env):
         self._node_bin = node_bin
         self.dump_game_record_dir = dump_game_record_dir
         self.reward_mode = reward_mode
+        self.potential_beta = float(potential_beta)
 
         # The env-bridge Node worker leaks ~2.5 MB per episode (measured:
         # a single worker grew 95 -> 157 MB over 25 resets, while its tsx
@@ -416,6 +426,7 @@ class OpenFrontEnv(gym.Env):
             "difficulty": self.difficulty,
             "ticksPerStep": self.ticks_per_step,
             "rewardMode": self.reward_mode,
+            "potentialBeta": self.potential_beta,
         }
         if self.dump_game_record_dir is not None:
             reset_cmd["dumpGameRecordDir"] = self.dump_game_record_dir
@@ -427,6 +438,13 @@ class OpenFrontEnv(gym.Env):
             raise RuntimeError(
                 f"env-bridge is using reward mode {raw.get('rewardMode')!r}, "
                 f"not the requested {self.reward_mode!r}"
+            )
+        if raw.get("potentialBeta") != self.potential_beta:
+            # Same trap as rewardMode: an env-bridge that predates
+            # potentialBeta silently pays the linear shaping instead.
+            raise RuntimeError(
+                f"env-bridge is using potentialBeta {raw.get('potentialBeta')!r}, "
+                f"not the requested {self.potential_beta!r}"
             )
         self._step_count = 0
         self._last_obs = raw

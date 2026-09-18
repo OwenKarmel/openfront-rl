@@ -21,6 +21,7 @@ import argparse
 import csv
 import itertools
 import json
+import math
 import subprocess
 import sys
 import time
@@ -187,6 +188,15 @@ def parse_args() -> argparse.Namespace:
     )
 
     p.add_argument(
+        "--potential-beta", type=float, default=0.0,
+        help="convexity of the shaping potential: Phi(p) = (exp(beta*p)-1)/beta over "
+             "AGENT's tile share p, so one tile is worth exp(beta*p) times what it is "
+             "worth at spawn -- gains AND losses at high territory count for more than "
+             "at low territory. 0 (default) is the linear tile-share delta, "
+             "bit-identical to before this option existed. Only affects the shaping "
+             "term, so it does nothing under --reward-mode terminal_only",
+    )
+    p.add_argument(
         "--updates", type=int, default=0,
         help="stop after this many updates; 0 (default) or negative runs indefinitely",
     )
@@ -275,6 +285,7 @@ def make_env(args: argparse.Namespace, difficulty: str, seed_prefix: str) -> Ope
         # getattr: several probe/bench scripts build a bare Namespace for
         # make_env; they predate the option and mean the default reward.
         reward_mode=getattr(args, "reward_mode", REWARD_MODES[0]),
+        potential_beta=getattr(args, "potential_beta", 0.0),
     )
 
 
@@ -441,13 +452,15 @@ def main() -> None:
             sys.exit("--gamma-start and --gamma must both lie strictly inside (0, 1)")
     if args.rollout_match_horizon and not 0.0 < args.gamma < 1.0:
         sys.exit("--rollout-match-horizon needs gamma strictly inside (0, 1)")
+    if not math.isfinite(args.potential_beta) or args.potential_beta < 0:
+        sys.exit("--potential-beta must be a finite number >= 0")
     # The replay is written by the Node env subprocess, which runs with
     # cwd=env-bridge/ -- a relative --eval-dir would land there, not where
     # it was typed. Resolve against Python's cwd before handing it over.
     args.eval_dir = str(Path(args.eval_dir).resolve())
     device = torch.device(args.device)
     map_desc = args.map if args.map else f"random from SMALL_MAPS ({len(SMALL_MAPS)} maps)"
-    print(f"device={device} num_envs={args.num_envs} map={map_desc} reward_mode={args.reward_mode}")
+    print(f"device={device} num_envs={args.num_envs} map={map_desc} reward_mode={args.reward_mode} potential_beta={args.potential_beta}")
     if args.gamma_start is not None or args.rollout_match_horizon:
         end = args.gamma_anneal_start + args.gamma_anneal_updates
         peak_rollout = max(rollout_at(args.gamma_anneal_start, args), rollout_at(end, args))
@@ -508,7 +521,7 @@ def main() -> None:
         "update", "difficulty", "win_rate", "mean_reward", "policy_loss",
         "value_loss", "entropy", "approx_kl", "stopped_early", "episodes", "seconds",
         "type_entropy", *[f"type_prob_{a}" for a in ACTIONS], "gamma", "rollout_length",
-        "reward_mode",
+        "reward_mode", "potential_beta",
     ]
     log_is_new = not log_path.exists() or log_path.stat().st_size == 0
     if not log_is_new:
@@ -527,6 +540,9 @@ def main() -> None:
                          f"which cannot record it -- pass a new --log-csv")
             if "reward_mode" in dropped and args.reward_mode != REWARD_MODES[0]:
                 sys.exit(f"refusing to run reward mode {args.reward_mode!r} into {log_path}, "
+                         f"which cannot record it -- pass a new --log-csv")
+            if "potential_beta" in dropped and args.potential_beta != 0.0:
+                sys.exit(f"refusing to run potential beta {args.potential_beta!r} into {log_path}, "
                          f"which cannot record it -- pass a new --log-csv")
         log_columns = existing
     log_file = open(log_path, "a", newline="")
@@ -631,6 +647,7 @@ def main() -> None:
                 **{f"type_prob_{a}": p for a, p in zip(ACTIONS, type_probs)},
                 "gamma": gamma, "rollout_length": rollout_length,
                 "reward_mode": args.reward_mode,
+                "potential_beta": args.potential_beta,
             }
         )
         log_file.flush()
