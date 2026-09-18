@@ -17,7 +17,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../../.." && pwd)"
 OPENFRONTIO_DIR="$REPO_ROOT/OpenFrontIO"
-REPLAYS_DIR="$REPO_ROOT/training/replays"
+REPLAYS_DIR="$REPO_ROOT/training/checkpoints/archive/run_2026-09-11_bbf-adamw_gamma098_rollout50/replays"  # archived; live replays/ is another run
 SRC_TS="$REPO_ROOT/analysis/run_2026-09-02_pre-naval_num-envs8/territory_as_game_progresses/TerritoryTimeSeries.ts"
 OUT_DIR="$HERE/series"
 

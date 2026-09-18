@@ -1,4 +1,4 @@
-"""Extracts one row per eval episode from the live run's stdout log and
+"""Extracts one row per eval episode from the run's stdout log and
 writes territory_moving_average.csv next to this file.
 
 Each `eval vs <difficulty>: {...}` line is one greedy/argmax evaluation
@@ -8,9 +8,12 @@ its high-water mark during that episode (see territory_fraction() in
 train.py -- read off tile_grid's own class proportions, so it stays valid on
 the resized map_pool canvas).
 
-Reads nohup_launch.log rather than train_stdout.log: this run is launched by
-training/run_bbf_gamma098.sh under nohup, which redirects train.py's stdout
-there. The earlier runs' train_stdout.log does not exist for this run.
+Reads the run's ARCHIVED stdout log. While live, this run was launched by
+training/run_bbf_gamma098.sh under nohup, which redirected train.py's stdout
+to checkpoints/nohup_launch.log; on archiving it was renamed train_stdout.log
+to match the other archive folders. The live checkpoints/ directory now
+belongs to a different run, so pointing back there would silently read the
+wrong run's evals.
 
 Keeps the gamma0995 version's approach of reading the update number from the
 most recent `update N` line preceding each eval, rather than computing it as
@@ -25,7 +28,7 @@ import re
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-LOG = Path("/home/developer/openfront-rl/training/checkpoints/nohup_launch.log")
+LOG = Path("/home/developer/openfront-rl/training/checkpoints/archive/run_2026-09-11_bbf-adamw_gamma098_rollout50/train_stdout.log")
 OUT = HERE / "territory_moving_average.csv"
 
 GAMMA = 0.98

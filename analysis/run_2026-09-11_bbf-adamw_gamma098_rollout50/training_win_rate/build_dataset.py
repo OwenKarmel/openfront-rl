@@ -26,7 +26,8 @@ import csv
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-LOG_CSV = Path("/home/developer/openfront-rl/training/checkpoints/train_log.csv")
+# The archived copy: the live checkpoints/ directory now belongs to another run.
+LOG_CSV = Path("/home/developer/openfront-rl/training/checkpoints/archive/run_2026-09-11_bbf-adamw_gamma098_rollout50/train_log.csv")
 OUT = HERE / "training_win_rate.csv"
 
 

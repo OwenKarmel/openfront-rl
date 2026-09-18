@@ -26,7 +26,9 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 SERIES_DIR = HERE / "series"
-REPLAYS_DIR = Path("/home/developer/openfront-rl/training/replays")
+# The archived copy: the live replays/ directory now belongs to another run.
+# Archiving used same-filesystem renames, so the mtimes this sorts on survive.
+REPLAYS_DIR = Path("/home/developer/openfront-rl/training/checkpoints/archive/run_2026-09-11_bbf-adamw_gamma098_rollout50/replays")
 EVAL_CSV = HERE.parent / "territory_moving_average" / "territory_moving_average.csv"
 OUT = HERE / "tile_gain.csv"
 

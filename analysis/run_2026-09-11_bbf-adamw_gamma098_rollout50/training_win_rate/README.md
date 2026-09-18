@@ -7,7 +7,7 @@ only; this one uses the far denser training-episode signal.
 
 ## Files
 
-- **`build_dataset.py`** — expands `training/checkpoints/train_log.csv`'s
+- **`build_dataset.py`** — expands `training/checkpoints/archive/run_2026-09-11_bbf-adamw_gamma098_rollout50/train_log.csv`'s
   per-update `win_rate` column into one row per training episode, writes
   `training_win_rate.csv`.
 - **`plot_training_win_rate.py`** — reads that CSV plus the sibling

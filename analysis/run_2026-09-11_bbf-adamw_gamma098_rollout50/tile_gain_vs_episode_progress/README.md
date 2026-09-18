@@ -9,7 +9,7 @@ slice of game time one PPO update sees.
 
 ## Files
 
-- **`run_all.sh`** — re-simulates every replay in `training/replays/` through
+- **`run_all.sh`** — re-simulates every replay in `training/checkpoints/archive/run_2026-09-11_bbf-adamw_gamma098_rollout50/replays/` through
   the real OpenFrontIO core and writes a per-tick `tick,tiles` series into
   `series/`. Reuses `TerritoryTimeSeries.ts` verbatim from
   `../../run_2026-09-02_pre-naval_num-envs8/territory_as_game_progresses/`.

@@ -8,7 +8,7 @@ identical construction -- same metric, same window, same axes limits, same
 ## Files
 
 - **`build_dataset.py`** — scrapes every `eval vs <difficulty>: {...}` line
-  from `training/checkpoints/nohup_launch.log` and writes
+  from `training/checkpoints/archive/run_2026-09-11_bbf-adamw_gamma098_rollout50/train_stdout.log` and writes
   `territory_moving_average.csv`.
 - **`plot_territory_moving_average.py`** — reads that CSV, writes
   `territory_moving_average.png`.
@@ -22,9 +22,10 @@ python build_dataset.py && python plot_territory_moving_average.py
 
 ## Differences from the earlier versions of this script
 
-**Log file.** Reads `nohup_launch.log`, not `train_stdout.log`. This run is
-launched by `training/run_bbf_gamma098.sh` under nohup, which redirects
-train.py's stdout there; no `train_stdout.log` exists for this run.
+**Log file.** Reads the archived run's `train_stdout.log`. While live, this
+run was launched by `training/run_bbf_gamma098.sh` under nohup, which
+redirected train.py's stdout to `checkpoints/nohup_launch.log`; it was renamed
+on archiving to match the other archive folders.
 
 **Eval cadence, and why the x axis is still comparable.** This run evaluates
 every 60 updates; the earlier two evaluated every 10. That was chosen to hold
