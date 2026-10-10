@@ -1,0 +1,89 @@
+run 0: ../run_2026-10-09_connected-first -- 1651 updates, 6.5h in updates + 11.4h in eval suites
+
+== easy/connected
+  updates in stage                                       0-165
+  promoted at update                                       166
+  evals                                                      3
+  eval win rate mean                                     0.365
+  eval win rate median                                    0.25
+  eval win rate max                                      0.781
+  eval mean peak territory                               0.567
+  eval mean game ticks                                    9430
+  training games                                            96
+  training win rate                                      0.135
+  P(noop)                                                0.537
+  P(expand)                                              0.285
+  P(attack_opponent)                                     0.086
+  P(boat_attack)                                         0.091
+  type-head entropy                                      0.889
+  KL early-stop rate                                     0.687
+  rollout T at end                                          59
+  update seconds (median)                                  5.5
+  eval seconds (median)                                    389
+  eval wins /64, run 0:  16 4 50
+
+== easy/small
+  updates in stage                                     166-432
+  promoted at update                                       433
+  evals                                                      6
+  eval win rate mean                                     0.482
+  eval win rate median                                    0.57
+  eval win rate max                                      0.766
+  eval mean peak territory                               0.566
+  eval mean game ticks                                   15970
+  training games                                           156
+  training win rate                                      0.622
+  P(noop)                                                0.608
+  P(expand)                                              0.179
+  P(attack_opponent)                                     0.076
+  P(boat_attack)                                         0.137
+  type-head entropy                                      0.772
+  KL early-stop rate                                     0.648
+  rollout T at end                                          77
+  update seconds (median)                                  7.4
+  eval seconds (median)                                    952
+  eval wins /64, run 0:  36 8 37 42 13 49
+
+== medium/small
+  updates in stage                                    433-1431
+  promoted at update                                      1432
+  evals                                                     44
+  eval win rate mean                                     0.167
+  eval win rate median                                   0.078
+  eval win rate max                                      0.766
+  eval mean peak territory                               0.406
+  eval mean game ticks                                   10007
+  training games                                          1512
+  training win rate                                      0.186
+  P(noop)                                                0.515
+  P(expand)                                               0.26
+  P(attack_opponent)                                      0.07
+  P(boat_attack)                                         0.155
+  type-head entropy                                      0.867
+  KL early-stop rate                                     0.759
+  rollout T at end                                         209
+  update seconds (median)                                 14.4
+  eval seconds (median)                                    574
+  eval wins /64, run 0:  0 1 15 6 3 1 1 2 0 0 2 0 0 2 1 0 1 0 0 3 2 9 6 19 2 6 26 15 18 20 32 37 17 6 4 5 15 6 35 42 45 5 10 49
+
+== hard/small
+  updates in stage                                   1432-1650
+  promoted at update                                      None
+  evals                                                     16
+  eval win rate mean                                     0.032
+  eval win rate median                                   0.016
+  eval win rate max                                      0.141
+  eval mean peak territory                               0.326
+  eval mean game ticks                                    8560
+  training games                                           639
+  training win rate                                      0.041
+  P(noop)                                                0.527
+  P(expand)                                              0.242
+  P(attack_opponent)                                      0.07
+  P(boat_attack)                                         0.161
+  type-head entropy                                      0.885
+  KL early-stop rate                                     0.772
+  rollout T at end                                         260
+  update seconds (median)                                 26.7
+  eval seconds (median)                                    519
+  eval wins /64, run 0:  5 9 5 3 2 1 0 1 1 4 0 0 1 0 0 1
