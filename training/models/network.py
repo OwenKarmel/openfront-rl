@@ -54,8 +54,14 @@ MACRO_GRID = 32  # must match MACRO_GRID in EnvServer.ts / openfront_env.py
 
 
 class ActorCritic(nn.Module):
-    def __init__(self, conv_channels: int = 32, trunk_dim: int = 256):
+    def __init__(self, conv_channels: int = 32, trunk_dim: int = 256, param_entropy_norm: bool = False):
         super().__init__()
+        # Divide each PARAMETER head's entropy (tile, player) by log(number of
+        # legal choices) in evaluate_actions(), i.e. the entropy bonus sees it
+        # in [0, 1]. Off by default: the raw sum is unchanged. See
+        # evaluate_actions() for why. Not a weight, so not in the state_dict --
+        # train.py's --param-entropy-norm sets it every run.
+        self.param_entropy_norm = param_entropy_norm
         # Four stride-2 convs roughly halve spatial size each time (e.g.
         # 512 -> 32). Split into a body (shared by both the pooled trunk
         # path and the spatial tile-head path) and the pooling step, since
@@ -266,11 +272,22 @@ class ActorCritic(nn.Module):
         )
         is_boat = (action_type == BOAT_ATTACK_IDX).float()
         is_attack = (action_type == ATTACK_OPPONENT_IDX).float()
-        entropy = (
-            type_dist.entropy()
-            + is_boat * tile_dist.entropy()
-            + is_attack * player_dist.entropy()
-        )
+        tile_entropy = tile_dist.entropy()
+        player_entropy = player_dist.entropy()
+        if self.param_entropy_norm:
+            # The raw tile entropy runs up to ln(1024) = 6.9 nats against the
+            # type head's ln(4) = 1.4, so under one shared entropy coefficient
+            # the bonus pulls hardest on keeping boat TARGETS uniform. Measured
+            # on the connected-first run at update 305: the tile head sat at
+            # 88-93% of its maximum entropy over 240-510 legal cells -- boats
+            # to effectively random cells, 20% of the army each. Normalized,
+            # each head's term is a fraction of ITS OWN maximum. n <= 1 legal
+            # choice has zero entropy; the clamp only avoids 0/0.
+            tile_n = tile_target_mask.reshape(tile_entropy.shape[0], -1).sum(-1).float()
+            player_n = attack_target_mask.sum(-1).float()
+            tile_entropy = tile_entropy / torch.log(tile_n.clamp_min(2.0))
+            player_entropy = player_entropy / torch.log(player_n.clamp_min(2.0))
+        entropy = type_dist.entropy() + is_boat * tile_entropy + is_attack * player_entropy
         return log_prob, entropy, value
 
     @torch.no_grad()

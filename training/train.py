@@ -232,6 +232,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--clip-eps", type=float, default=0.2)
     p.add_argument("--entropy-coef", type=float, default=0.02)
     p.add_argument(
+        "--param-entropy-norm", action="store_true",
+        help="divide the tile/player heads' entropy by log(#legal choices) in the entropy "
+             "bonus, so each contributes a fraction of its own maximum instead of up to "
+             "ln(1024) nats against the type head's ln(4) (see network.py). The logged "
+             "`entropy` is then that normalized bonus entropy; type_entropy is unaffected",
+    )
+    p.add_argument(
         "--target-kl",
         type=float,
         default=0.03,
@@ -649,7 +656,8 @@ def main() -> None:
         map_desc = "set per curriculum stage"
     else:
         map_desc = args.map if args.map else f"random from SMALL_MAPS ({len(SMALL_MAPS)} maps)"
-    print(f"device={device} num_envs={args.num_envs} map={map_desc} reward_mode={args.reward_mode} potential_beta={args.potential_beta}")
+    print(f"device={device} num_envs={args.num_envs} map={map_desc} reward_mode={args.reward_mode} potential_beta={args.potential_beta} "
+          f"param_entropy_norm={args.param_entropy_norm}")
     # The env-bridge's env-var gated behaviours are set by the launcher's
     # environment, not by a flag here, so record them in the log explicitly.
     # Every env's reset checks the Node worker really runs with them.
@@ -674,7 +682,7 @@ def main() -> None:
 
     scheduler = CurriculumScheduler(ladder=args.curriculum, promote_threshold=args.promote_threshold)
 
-    net = ActorCritic().to(device)
+    net = ActorCritic(param_entropy_norm=args.param_entropy_norm).to(device)
     # AdamW rather than Adam so --weight-decay is *decoupled* (applied as
     # p -= lr*wd*p, not folded into the gradient and thus into Adam's second
     # moment, where an adaptive optimizer largely cancels it out again).
@@ -719,7 +727,7 @@ def main() -> None:
         "update", "difficulty", "win_rate", "mean_reward", "policy_loss",
         "value_loss", "entropy", "approx_kl", "stopped_early", "episodes", "seconds",
         "type_entropy", *[f"type_prob_{a}" for a in ACTIONS], "gamma", "rollout_length",
-        "reward_mode", "potential_beta", "maps",
+        "reward_mode", "potential_beta", "maps", "param_entropy_norm",
     ]
     log_is_new = not log_path.exists() or log_path.stat().st_size == 0
     if not log_is_new:
@@ -741,6 +749,9 @@ def main() -> None:
                          f"which cannot record it -- pass a new --log-csv")
             if "potential_beta" in dropped and args.potential_beta != 0.0:
                 sys.exit(f"refusing to run potential beta {args.potential_beta!r} into {log_path}, "
+                         f"which cannot record it -- pass a new --log-csv")
+            if "param_entropy_norm" in dropped and args.param_entropy_norm:
+                sys.exit(f"refusing to run --param-entropy-norm into {log_path}, "
                          f"which cannot record it -- pass a new --log-csv")
             if "maps" in dropped and args.curriculum != "difficulty":
                 sys.exit(f"refusing to run curriculum {args.curriculum!r}, whose stages change the map "
@@ -865,6 +876,7 @@ def main() -> None:
                 "reward_mode": args.reward_mode,
                 "potential_beta": args.potential_beta,
                 "maps": maps_label(args, scheduler.maps),
+                "param_entropy_norm": args.param_entropy_norm,
             }
         )
         log_file.flush()
