@@ -53,8 +53,66 @@ NUM_TILE_CLASSES = 4  # neutral land, self, ANY opponent, water -- see tileGrid(
 MACRO_GRID = 32  # must match MACRO_GRID in EnvServer.ts / openfront_env.py
 
 
+class BigTileHead(nn.Module):
+    """boat_attack's target head with global context and a whole-map view.
+
+    The default head is one 1x1 conv: each cell's logit sees only that cell's
+    local CNN features, nothing about the rest of the map or the game state.
+    Measured on the connected-first runs, it never learned to aim -- 95-97%
+    of its maximum entropy after 600+ updates, with or without the entropy
+    bonus on it (--param-entropy-norm made no difference). Picking a landing
+    needs both what is where (unclaimed land, own coast, the opponent) and
+    the global state (troops, territory), so this head gets:
+
+      - per cell: the CNN features resampled to the MACRO_GRID target grid,
+        the legal-target mask, and x/y coordinates
+      - global: the trunk's game-state vector, as a per-channel FiLM
+        scale/shift on every cell
+      - reach: residual blocks of dilated 3x3 convs (dilations 1,2,4,8 -> a
+        61-cell receptive field), so every cell sees the whole 32x32 grid
+
+    The output conv is zero-initialized, so it starts uniform over legal
+    cells like the default head does."""
+
+    def __init__(self, in_channels: int, trunk_dim: int, width: int = 64, dilations=(1, 2, 4, 8)):
+        super().__init__()
+        self.inp = nn.Conv2d(in_channels + 3, width, kernel_size=1)  # + mask, x, y
+        self.film = nn.Linear(trunk_dim, 2 * width)
+        self.blocks = nn.ModuleList(
+            nn.Sequential(
+                nn.Conv2d(width, width, 3, padding=d, dilation=d),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(width, width, 3, padding=d, dilation=d),
+            )
+            for d in dilations
+        )
+        self.out = nn.Conv2d(width, 1, kernel_size=1)
+        nn.init.zeros_(self.out.weight)
+        nn.init.zeros_(self.out.bias)
+        ramp = torch.linspace(-1.0, 1.0, MACRO_GRID)
+        self.register_buffer("coords", torch.stack(torch.meshgrid(ramp, ramp, indexing="ij")), persistent=False)
+
+    def forward(self, feat_map: torch.Tensor, trunk_feat: torch.Tensor, tile_target_mask: torch.Tensor):
+        """-> (B, MACRO_GRID^2) unmasked logits."""
+        b = feat_map.shape[0]
+        x = F.adaptive_avg_pool2d(feat_map, MACRO_GRID)
+        mask = tile_target_mask.reshape(b, 1, MACRO_GRID, MACRO_GRID).float()
+        h = F.relu(self.inp(torch.cat([x, mask, self.coords.expand(b, -1, -1, -1)], dim=1)))
+        scale, shift = self.film(trunk_feat).chunk(2, dim=-1)
+        h = h * (1 + scale[..., None, None]) + shift[..., None, None]
+        for block in self.blocks:
+            h = F.relu(h + block(h))
+        return self.out(h).flatten(1)
+
+
 class ActorCritic(nn.Module):
-    def __init__(self, conv_channels: int = 32, trunk_dim: int = 256, param_entropy_norm: bool = False):
+    def __init__(
+        self,
+        conv_channels: int = 32,
+        trunk_dim: int = 256,
+        param_entropy_norm: bool = False,
+        tile_head: str = "small",
+    ):
         super().__init__()
         # Divide each PARAMETER head's entropy (tile, player) by log(number of
         # legal choices) in evaluate_actions(), i.e. the entropy bonus sees it
@@ -86,7 +144,15 @@ class ActorCritic(nn.Module):
         # the feature map's actual size (which varies with the real map's
         # pixel dimensions) -- same size-invariance trick as `pool` above,
         # just producing a spatial map instead of a single vector.
-        self.tile_head_conv = nn.Conv2d(conv_channels, 1, kernel_size=1)
+        # tile_head="big" swaps in BigTileHead instead (train.py's --tile-head);
+        # the default keeps this exact module, so existing checkpoints load.
+        if tile_head not in ("small", "big"):
+            raise ValueError(f"tile_head must be 'small' or 'big', got {tile_head!r}")
+        self.tile_head = tile_head
+        if tile_head == "small":
+            self.tile_head_conv = nn.Conv2d(conv_channels, 1, kernel_size=1)
+        else:
+            self.tile_head_big = BigTileHead(conv_channels, trunk_dim)
 
         self.scalar_mlp = nn.Sequential(
             nn.Linear(NUM_SELF_FEATURES, 64),
@@ -181,8 +247,11 @@ class ActorCritic(nn.Module):
         type_logits = self.type_head(trunk_feat)
         type_logits = type_logits.masked_fill(~action_mask, -1e9)
 
-        tile_logits = self.tile_head_conv(feat_map)  # (B, 1, H', W')
-        tile_logits = F.adaptive_avg_pool2d(tile_logits, MACRO_GRID).flatten(1)  # (B, MACRO_GRID^2)
+        if self.tile_head == "big":
+            tile_logits = self.tile_head_big(feat_map, trunk_feat, tile_target_mask)
+        else:
+            tile_logits = self.tile_head_conv(feat_map)  # (B, 1, H', W')
+            tile_logits = F.adaptive_avg_pool2d(tile_logits, MACRO_GRID).flatten(1)  # (B, MACRO_GRID^2)
         tile_mask_flat = tile_target_mask.reshape(tile_logits.shape[0], -1).bool()
         tile_logits = tile_logits.masked_fill(~tile_mask_flat, -1e9)
 
