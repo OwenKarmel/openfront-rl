@@ -87,3 +87,8 @@ class VecEnv:
     def set_difficulty(self, difficulty: str) -> None:
         for env in self.envs:
             env.difficulty = difficulty
+
+    def set_map_pool(self, map_pool: list[str] | None) -> None:
+        """Takes effect at each env's next reset, like set_difficulty()."""
+        for env in self.envs:
+            env.map_pool = map_pool

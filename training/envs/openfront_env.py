@@ -91,6 +91,24 @@ SMALL_MAPS = [
     "tourney1", "tourney2", "tourney3", "tourney4", "yellowsea", "yenisei",
 ]
 
+# The SMALL_MAPS where a random spawn's own landmass holds at least half the
+# map's land -- i.e. where most of the game can be played without a boat.
+# Land attacks stop at water, so on the rest of the pool the agent must cross
+# water to grow past its spawn landmass at all. Measured with
+# env-bridge/src/mapLandmasses.ts (spawnShare = expected share of the land in
+# a random spawn's landmass):
+#
+#   yellowsea 99.3%   caucasus 97.0%   fingerlakes 80.1%   italia 66.7%   pangaea 54.3%
+#
+# Only the first three reach the 80% domination threshold overland. Every
+# other SMALL_MAPS entry is under 50%, as low as 2.0% (labyrinth); the pool
+# averages ~36%. Used by the "connected-first" curriculum ladder (see
+# curriculum.py) to learn the land game before island maps are added.
+CONNECTED_MAPS = ["yellowsea", "caucasus", "fingerlakes", "italia", "pangaea"]
+
+# Named map pools a curriculum stage can select (see curriculum.py's Stage).
+MAP_POOLS = {"small": SMALL_MAPS, "connected": CONNECTED_MAPS}
+
 # Env-var gated behaviours of EnvServer.ts, keyed by the name its reset reply
 # echoes them under ("envFlags"). Each is off unless the variable is exactly
 # "1" when the Node worker starts.
