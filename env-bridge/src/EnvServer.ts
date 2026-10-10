@@ -24,7 +24,8 @@
  *   "attack_opponent"  — attack one specific opponent across a shared land
  *                         border (needs playerIdx — see StepCmd)
  *   "boat_attack"      — send a transport ship across water to invade any
- *                         opponent's territory (needs macroX/macroY — see StepCmd)
+ *                         opponent's territory, or (with OPENFRONT_NEUTRAL_BOATS=1)
+ *                         to land on unowned land (needs macroX/macroY — see StepCmd)
  *
  * Decision cadence: one JSON "step" call advances `ticksPerStep` simulation
  * ticks (default 10), applying AGENT's chosen intent on the first of those
@@ -38,7 +39,8 @@
  *       "ticksPerStep":10,"dumpGameRecordDir":"/path/to/replays",
  *       "rewardMode":"shaping_and_terminal","potentialBeta":0}
  *   <- {"obs":{...},"legalActions":[...],"done":false,
- *       "rewardMode":"shaping_and_terminal","potentialBeta":0}
+ *       "rewardMode":"shaping_and_terminal","potentialBeta":0,
+ *       "envFlags":{"expandMask":false,"boatMask":false,"neutralBoats":false}}
  *   -> {"cmd":"step","action":"expand"}
  *   <- {"obs":{...},"reward":0.1,"done":false,"legalActions":[...],
  *       "info":{"ticks":123,"winner":null}}
@@ -60,10 +62,17 @@
  * -- see shapePotential(). 0 is the original linear tile-share delta,
  * bit-identically. Echoed on reset for the same reason as `rewardMode`.
  *
+ * `envFlags` (reset reply only) reports which of the env-var gated
+ * behaviours this process is running with -- OPENFRONT_EXPAND_MASK,
+ * OPENFRONT_BOAT_MASK, OPENFRONT_NEUTRAL_BOATS. They are read once at
+ * startup, so the echo is what lets the Python side fail fast when it set a
+ * variable that an older server does not know about.
+ *
  * `dumpGameRecordDir` (optional, on reset) writes a full, strictly
  * schema-valid GameRecord (Episode.toGameRecord()) to
- * <dir>/<wireGameID>.json once the episode ends (done:true from step) or
- * the session is closed, whichever comes first — watchable in the real
+ * <dir>/<wireGameID>.json once the episode ends (done:true from step), the
+ * next reset arrives, or the session is closed, whichever comes first — so a
+ * game the client truncated is still written, partial. Watchable in the real
  * OpenFrontIO client via ReplayServer.ts, and verifiable headlessly with
  * OpenFrontIO's own `npm run replay:game` — see README.
  */
@@ -287,7 +296,8 @@ function opponents(episode: Episode): Player[] {
  * sea") -- split out as its own class now that boat_attack needs it.
  *
  * The boat mask is a CHEAP heuristic (any OPPONENT-owned tile in the
- * macro-cell -> legal), not the real targetTransportTile()/
+ * macro-cell -> legal; with NEUTRAL_BOATS_ENABLED, any unowned passable land
+ * tile too), not the real targetTransportTile()/
  * closestReachableShore() check -- deliberately deferred, see
  * resolveBoatTarget()'s comment for why and for where the real check
  * actually happens (once, only for the one macro-cell chosen, only on the
@@ -342,6 +352,14 @@ function tileGridAndBoatMask(episode: Episode): { grid: Uint8Array; boatMask: Ui
         boatMask[bitIdx >> 3] |= 1 << (bitIdx & 7);
       } else {
         grid[y * w + x] = 0;
+        // Unowned land is a boat destination too when enabled -- see
+        // NEUTRAL_BOATS_ENABLED. Same cheap any-tile-in-cell heuristic as
+        // the opponent case above; resolveBoatTarget() stays the authority.
+        if (NEUTRAL_BOATS_ENABLED && isNeutralBoatTarget(game, ref)) {
+          const mx = Math.min(MACRO_GRID - 1, Math.floor((x * MACRO_GRID) / w));
+          const bitIdx = my * MACRO_GRID + mx;
+          boatMask[bitIdx >> 3] |= 1 << (bitIdx & 7);
+        }
       }
     }
   }
@@ -382,10 +400,11 @@ function tileGridAndBoatMask(episode: Episode): { grid: Uint8Array; boatMask: Ui
  *
  * Scans only the chosen macro-cell's own pixel rectangle (bounded by
  * roughly (w/MACRO_GRID)*(h/MACRO_GRID) tiles, not the whole map) for one
- * representative OPPONENT-owned tile, then runs the same real check
- * intentFor() used to always defer to when the mask alone said "legal".
- * Returns null if the macro-cell truly has no OPPONENT tile (stale/false
- * heuristic pick) or no real reachable shore near it.
+ * representative OPPONENT-owned tile -- or, with NEUTRAL_BOATS_ENABLED, an
+ * unowned land tile, whichever the scan reaches first -- then runs the same
+ * real check intentFor() used to always defer to when the mask alone said
+ * "legal". Returns null if the macro-cell truly has no such tile
+ * (stale/false heuristic pick) or no real reachable shore near it.
  */
 function resolveBoatTarget(episode: Episode, macroX: number, macroY: number): number | null {
   const game = episode.game;
@@ -393,10 +412,19 @@ function resolveBoatTarget(episode: Episode, macroX: number, macroY: number): nu
   const w = game.width();
   const h = game.height();
   const agent = player(game, episode.agentId);
-  const x0 = Math.floor((macroX * w) / MACRO_GRID);
-  const x1 = Math.min(w, Math.floor(((macroX + 1) * w) / MACRO_GRID));
-  const y0 = Math.floor((macroY * h) / MACRO_GRID);
-  const y1 = Math.min(h, Math.floor(((macroY + 1) * h) / MACRO_GRID));
+  // Cell bounds. tileGridAndBoatMask() puts tile x in cell floor(x*G/w), so
+  // cell mx is exactly [ceil(mx*w/G), ceil((mx+1)*w/G)). The legacy bounds
+  // floor both ends instead: on a map whose size is not a multiple of G
+  // (most of SMALL_MAPS) that drops the cell's last row/column and adds the
+  // previous cell's, so a cell legal only because of land in that strip
+  // resolves to nothing -- a silent no-op. Kept on the default path so a run
+  // picking this file up mid-run is unaffected; neutral targets, whose small
+  // slivers of unowned land hit the strip far more often, use exact bounds.
+  const edge = NEUTRAL_BOATS_ENABLED ? Math.ceil : Math.floor;
+  const x0 = edge((macroX * w) / MACRO_GRID);
+  const x1 = Math.min(w, edge(((macroX + 1) * w) / MACRO_GRID));
+  const y0 = edge((macroY * h) / MACRO_GRID);
+  const y1 = Math.min(h, edge(((macroY + 1) * h) / MACRO_GRID));
   let representative: number | null = null;
   for (let y = y0; y < y1 && representative === null; y++) {
     for (let x = x0; x < x1; x++) {
@@ -406,7 +434,10 @@ function resolveBoatTarget(episode: Episode, macroX: number, macroY: number): nu
       // player, and TransportShipExecution resolves whose shore it
       // actually lands on when the intent executes.
       const owner = game.owner(ref);
-      if (owner.isPlayer() && owner !== agent) {
+      if (
+        (owner.isPlayer() && owner !== agent) ||
+        (NEUTRAL_BOATS_ENABLED && !owner.isPlayer() && isNeutralBoatTarget(game, ref))
+      ) {
         representative = ref;
         break;
       }
@@ -530,6 +561,36 @@ const EXPAND_MASK_ENABLED = process.env.OPENFRONT_EXPAND_MASK === "1";
  * through to intentFor()'s existing logged no-op.
  */
 const BOAT_MASK_ENABLED = process.env.OPENFRONT_BOAT_MASK === "1";
+
+/**
+ * Opt-in: let boat_attack land on UNOWNED land, not only on an opponent's.
+ * OFF by default, so a run that does not set OPENFRONT_NEUTRAL_BOATS=1 keeps
+ * the opponent-only targets bit-identically (the live run picks this file up
+ * mid-run when its env workers recycle -- same reasoning as the masks above).
+ *
+ * Why. Land attacks stop at water (AttackExecution.addNeighbors() only walks
+ * 4-neighbour land), so without this the agent's whole reachable world is
+ * the landmass it spawned on plus whatever an opponent owns. Measured with
+ * src/mapLandmasses.ts: across SMALL_MAPS that landmass averages ~36% of a
+ * map's land, and only caucasus, fingerlakes and yellowsea reach the 80%
+ * domination threshold overland. The Nation AI already boats onto neutral
+ * land (AiAttackBehavior's sendBoatAttackToNearbyTerraNullius() and
+ * attackWithRandomBoat(), which looks for unowned targets first), and so
+ * does a human; the engine supports it end to end -- canBuildTransportShip()
+ * and TransportShipExecution both accept a TerraNullius destination. Only
+ * this file was restricting it.
+ */
+const NEUTRAL_BOATS_ENABLED = process.env.OPENFRONT_NEUTRAL_BOATS === "1";
+
+/**
+ * Whether an unowned land tile counts as a boat destination: passable, and
+ * not fallout -- the same exclusions AiAttackBehavior applies before the
+ * Nation AI attacks neutral land. Callers have already checked isWater() and
+ * that nobody owns it.
+ */
+function isNeutralBoatTarget(game: Game, ref: number): boolean {
+  return !game.isImpassable(ref) && !game.hasFallout(ref);
+}
 
 /**
  * Whether AGENT owns any shore tile, i.e. has somewhere to launch a boat
@@ -824,6 +885,10 @@ class Session {
   potentialBeta = 0;
 
   async reset(cmd: ResetCmd): Promise<object> {
+    // A dump requested for the previous episode is still pending if that
+    // episode never reached done here -- the Python side cut it off at its
+    // step cap (e.g. a capped eval game). Write it before it is replaced.
+    this.flushRecord();
     // Parsed before building the episode, so a bad mode fails fast.
     this.rewardMode = parseRewardMode(cmd.rewardMode);
     this.potentialBeta = parsePotentialBeta(cmd.potentialBeta);
@@ -845,6 +910,11 @@ class Session {
       done: this.episode.isDone(),
       rewardMode: this.rewardMode,
       potentialBeta: this.potentialBeta,
+      envFlags: {
+        expandMask: EXPAND_MASK_ENABLED,
+        boatMask: BOAT_MASK_ENABLED,
+        neutralBoats: NEUTRAL_BOATS_ENABLED,
+      },
     };
   }
 

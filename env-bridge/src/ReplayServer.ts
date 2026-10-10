@@ -99,9 +99,15 @@ function main(): void {
     // Dumped filenames are `<timestamp>_<gameID>.json` (chronologically
     // sortable -- see EnvServer.ts's flushRecord()), plus bare
     // `<gameID>.json` for older files predating that change -- match either.
-    const fileName = fs
+    // Several files can share a gameID: train.py's eval suite replays the
+    // same fixed seeds every eval, and the gameID is derived from the seed.
+    // Serve the newest, i.e. the latest checkpoint's game; older ones stay on
+    // disk for the headless tools, which take a file path.
+    const matches = fs
       .readdirSync(opts.dir)
-      .find((f) => f === `${gameID}.json` || f.endsWith(`_${gameID}.json`));
+      .filter((f) => f === `${gameID}.json` || f.endsWith(`_${gameID}.json`))
+      .sort();
+    const fileName: string | undefined = matches[matches.length - 1];
     if (fileName === undefined) {
       console.log(`GET /game/${gameID} -> 404 (no match in ${opts.dir})`);
       res.writeHead(404).end();

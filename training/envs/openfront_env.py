@@ -23,6 +23,7 @@ from __future__ import annotations
 import base64
 import json
 import math
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -89,6 +90,21 @@ SMALL_MAPS = [
     "italia", "labyrinth", "morethanluck", "onion", "pangaea", "sierpinski",
     "tourney1", "tourney2", "tourney3", "tourney4", "yellowsea", "yenisei",
 ]
+
+# Env-var gated behaviours of EnvServer.ts, keyed by the name its reset reply
+# echoes them under ("envFlags"). Each is off unless the variable is exactly
+# "1" when the Node worker starts.
+ENV_FLAGS = {
+    "OPENFRONT_EXPAND_MASK": "expandMask",
+    "OPENFRONT_BOAT_MASK": "boatMask",
+    "OPENFRONT_NEUTRAL_BOATS": "neutralBoats",
+}
+
+
+def requested_env_flags() -> dict[str, bool]:
+    """Which ENV_FLAGS this process's environment turns on -- what every Node
+    worker it spawns will inherit."""
+    return {var: os.environ.get(var) == "1" for var in ENV_FLAGS}
 
 # Fixed canvas every episode's tile_grid is resized to (nearest-neighbor)
 # when map_pool is used. Deliberately NOT "pad with water to the pool's
@@ -446,6 +462,19 @@ class OpenFrontEnv(gym.Env):
                 f"env-bridge is using potentialBeta {raw.get('potentialBeta')!r}, "
                 f"not the requested {self.potential_beta!r}"
             )
+        # Same trap again for the env-var gated behaviours: a worker that
+        # predates a flag ignores the variable, and one spawned before the
+        # variable changed is running the old setting. Either way the run
+        # would not be what its launcher says.
+        server_flags = raw.get("envFlags")
+        for var, wanted in requested_env_flags().items():
+            running = None if server_flags is None else server_flags.get(ENV_FLAGS[var])
+            if bool(running) != wanted:
+                raise RuntimeError(
+                    f"{var} is {'1' if wanted else 'unset'} here, but the env-bridge reports "
+                    f"{ENV_FLAGS[var]}={running!r}"
+                    + (" (it predates envFlags)" if server_flags is None else "")
+                )
         self._step_count = 0
         self._last_obs = raw
         return self._to_gym_obs(raw), {
@@ -464,7 +493,12 @@ class OpenFrontEnv(gym.Env):
                 if self._proc.stdin:
                     self._proc.stdin.write(json.dumps({"cmd": "close"}) + "\n")
                     self._proc.stdin.flush()
-            except (BrokenPipeError, OSError):
+                # "close" makes the worker write any pending GameRecord dump
+                # and exit by itself; terminating it straight away could kill
+                # it mid-write and lose the dump.
+                self._proc.wait(timeout=10)
+            except (BrokenPipeError, OSError, subprocess.TimeoutExpired):
                 pass
-            self._proc.terminate()
+            if self._proc.poll() is None:
+                self._proc.terminate()
             self._proc = None
