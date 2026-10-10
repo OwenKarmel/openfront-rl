@@ -19,8 +19,13 @@ QUIET=${1:-}
 TESTS=(
   test_schedules.py
   test_eval_cadence.py
+  test_curriculum.py
+  test_param_entropy_norm.py
+  test_big_tile_head.py
   smoke_test.py
   smoke_test_multiopp.py
+  test_neutral_boats.py
+  test_eval_suite.py
   test_expand_mask.py
   test_boat_mask.py
   test_reward_modes.py

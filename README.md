@@ -35,18 +35,21 @@ MuZero/EfficientZero, action/observation space, phased milestones).
     `GET /game/:id` from a directory of `Episode.toGameRecord()` dumps, so
     an episode can be watched in the real OpenFrontIO browser client — see
     "Watching a game" below.
+  - `src/mapLandmasses.ts` — per map, how much of the land a spawn can reach
+    without a boat (land attacks stop at water). What picked
+    `CONNECTED_MAPS`; see [Curriculum and evaluation](#curriculum-and-evaluation).
 - `tests/` — every test for this project's own code (OpenFrontIO's own suite
-  stays upstream). Plain scripts, no pytest; `tests/run_all.sh` runs all eight
-  sequentially in ~13 min. See `tests/README.md` for what each covers, which
+  stays upstream). Plain scripts, no pytest; `tests/run_all.sh` runs all thirteen
+  sequentially in ~15 min. See `tests/README.md` for what each covers, which
   need a live env-bridge, and why the policy-driven ones pin a fixed archived
   checkpoint rather than `latest.pt`.
 - `training/` — Python.
   - `envs/openfront_env.py` — `gymnasium.Env` wrapping `EnvServer.ts` over a
     subprocess. Single-agent: AGENT is controlled by `step(action)`;
     OPPONENT (the Nation AI) needs no action, it plays itself.
-  - `curriculum.py` — `CurriculumScheduler`: windowed win-rate promotion/
-    demotion through Easy → Medium → Hard → Impossible, now driven by real
-    training via `train.py`.
+  - `curriculum.py` — `CurriculumScheduler`: a ladder of (difficulty, map
+    pool) stages (`LADDERS`), promotion-only, gated on the win rate of a
+    sampled-policy eval suite — see [Curriculum and evaluation](#curriculum-and-evaluation).
   - `models/network.py` — the actor-critic network: a small CNN (strided
     convs + adaptive pooling, so it works across map sizes unchanged) over
     the one-hot tile-ownership grid, concatenated with an MLP over the six
@@ -63,11 +66,17 @@ MuZero/EfficientZero, action/observation space, phased milestones).
     against the real Nation-AI opponent, runs PPO updates, feeds episode
     outcomes into `CurriculumScheduler`, checkpoints (resumable — safe to
     stop and restart across, e.g., Kaggle's 12h session cap), and
-    periodically runs a greedy eval episode that dumps a real, verifiable
-    `GameRecord` of how the current policy actually plays (same
+    periodically runs an eval suite: `--eval-episodes` games on fixed seeds,
+    played by the sampled policy, logged per suite and per episode, with a
+    real, verifiable `GameRecord` dumped for the lowest seeds (same
     construction as training — see `GameSetup.ts` — so it's watchable in
     the real client and verifiable via `npm run replay:game`, not an
     approximation of what training saw).
+  - `eval_checkpoint.py` — plays a checkpoint (or, with `--scripted`, a
+    10-line troop-threshold policy on the same action space) through
+    `train.py`'s own eval suite against each difficulty, on the same fixed
+    seeds, one CSV row per game. For comparing final checkpoints and
+    setting a reference bar.
   - `run_*.sh` — one pinned launcher per run, which launches **and
     resumes** it. Checkpoints store weights, optimizer state and curriculum
     position but *not* hyperparameters, so a resume that forgets a flag does
@@ -78,6 +87,25 @@ MuZero/EfficientZero, action/observation space, phased milestones).
       otherwise identical to `run_gamma_anneal_shaping_only.sh`. Its header
       comment carries the memory and wall-time costs, and the reasoning for
       beta.
+    - `run_connected_first_bighead.sh` — **the run to replicate next, on
+      the GTX 1660 box** (see
+      `analysis/run_2026-10-09_connected-first_big-tile-head/REPLICATE.md`).
+      The beta=2 run's hyperparameters plus all three env-bridge flags
+      (`OPENFRONT_EXPAND_MASK`, `OPENFRONT_BOAT_MASK`,
+      `OPENFRONT_NEUTRAL_BOATS`), `--curriculum connected-first`, sampled
+      eval suites and `--tile-head big`. Its own directories
+      (`checkpoints/run3_big_tile_head/`, `replays/run3_big_tile_head/`), so
+      it never touches `checkpoints/latest.pt`; `--device cuda:1` as pinned
+      (pass `--device cuda:0` on a one-GPU box). Python path overridable via
+      `OPENFRONT_PYTHON`.
+
+    Finished 2026-10-10 on the RTX 5000 Ada workstation, archived and
+    disabled like the ones below (each refuses to run without
+    `I_KNOW_THIS_RUN_IS_ARCHIVED=1`):
+    - `run_connected_first.sh` — the connected-first run (same as the
+      big-head launcher without `--tile-head big`), archived at update 1650.
+    - `run_connected_first_paramnorm.sh` — its `--param-entropy-norm` arm,
+      stopped at update ~642 (hypothesis refuted, see Status).
 
     The launchers below belong to archived runs and exit with an error,
     because the live run reuses `checkpoints/`:
@@ -274,7 +302,8 @@ gamma anneal with a convex potential,
 | max episode steps, safety cap (`--max-episode-steps`) | 20,000 | 20,000 |
 | reward terms (`--reward-mode`) | `shaping_and_terminal` | **`shaping_only`** |
 | shaping convexity (`--potential-beta`) | `0` (linear) | **`2`** (per-tile weight `e^{2p}`) |
-| curriculum window (`--curriculum-window`) | 12 eval episodes | 12 |
+| curriculum ladder (`--curriculum`) | `difficulty` | `difficulty` (predates ladders) |
+| promotion gate (`--promote-threshold`, `--eval-episodes`) | 0.75 win rate over a 64-episode sampled eval suite | n/a — ran under the old greedy 9-of-12 window (see [Curriculum and evaluation](#curriculum-and-evaluation)) |
 | checkpoint interval (`--checkpoint-every`) | 20 updates | **5** (updates reach ~156s at T=1000) |
 | eval interval (`--eval-every`) | 20 updates | ignored (see next row) |
 | eval interval in steps (`--eval-every-steps`) | 0 (≡ use `--eval-every`) | **3000** |
@@ -398,6 +427,75 @@ of the std recovers it to 0.69x / 0.57x.
   against the engine's own tile counts, for gains and losses alike, in
   lockstep across `beta` 0/2/5 on one seed.
 
+## Curriculum and evaluation
+
+Built 2026-10-09; no training run has used it yet —
+`training/run_connected_first.sh` is the first launcher that does.
+
+**Eval suites.** Every eval (`--eval-every` / `--eval-every-steps`) runs
+`run_eval_suite()` in `train.py`: `--eval-episodes` (default 64) games played
+by the **sampled** policy — the one PPO optimizes and every training episode
+is played with — on fixed seeds `eval-suite-<difficulty>-<maps>-<k>`,
+k = 0..N−1. The seed fixes the map (drawn from the stage's pool), the spawns
+and the opponent, so two suites at the same stage differ only in the policy.
+Games run `--eval-envs` (default 16) at a time, one batched forward per step
+across the live envs. Each suite writes one row to `checkpoints/eval_log.csv`
+(wins, win rate, 95% Wilson interval, truncations, mean and max peak
+territory, mean ticks, wall time) and one row per game to
+`checkpoints/eval_episodes.csv`. A `GameRecord` is dumped for every seed below
+`--eval-replays` (default 1), including a game cut off by `--eval-max-steps`.
+`--eval-difficulties easy,impossible` adds suites against other difficulties
+— logged, but only the curriculum's own difficulty gates promotion.
+
+Why not greedy: the single greedy (argmax) episode this replaced is a
+different policy from the one being trained. Argmax turns the near-50/50
+noop/expand split the policy holds at spawn into "never act" (34/78 greedy
+evals in the 2026-09-13 gamma anneal never acted after spawning), and greedy
+eval won 3/198 there while the sampled policy won ~24% of training episodes —
+so the 9-of-12 greedy gate never opened, and every run since has trained
+against easy only.
+
+**Cost.** A suite is up to `--eval-episodes / --eval-envs` rounds of full
+games, and a competent policy's games against easy run long: a scripted
+troop-threshold policy (one-off measurement, 2026-10-09, script not in the
+repo) won 44/44 games against easy on `SMALL_MAPS` with exact masks on, but its
+games averaged ~80k ticks and 34 of the wins came at the engine's 170-minute
+limit (102,000 ticks), where the largest player is declared the winner. So
+expect several minutes per suite at 16 workers late in training. Raise
+`--eval-envs` where there are cores (it does not change training).
+
+**Promotion.** The current stage's suite win rate ≥ `--promote-threshold`
+(0.75) promotes to the next stage. At 64 episodes its standard error near the
+threshold is ~5pp, against ~12pp for the old 12-episode window. Still
+promotion-only — see `curriculum.py` for why demotion was removed.
+
+**Ladders** (`--curriculum`; stored in every checkpoint, and a resume under a
+different ladder refuses to start, since a stage index means a different
+stage on another ladder):
+
+| ladder | stages |
+|---|---|
+| `difficulty` (default) | easy → medium → hard → impossible, all on the launch pool (`--map`, else `SMALL_MAPS`) |
+| `connected-first` | easy/`connected` → easy/`small` → medium/`small` → hard/`small` → impossible/`small` |
+
+Each `connected-first` promotion changes exactly one of difficulty and map
+pool, so a regression after a promotion is attributable. `connected` is
+`CONNECTED_MAPS` (`openfront_env.py`): the `SMALL_MAPS` where a random spawn's
+own landmass holds at least half the land. Land attacks stop at water
+(`AttackExecution.addNeighbors()` walks 4-neighbour land only), so everywhere
+else growing past the spawn landmass takes a boat. Measured with
+`env-bridge/src/mapLandmasses.ts` (`spawnShare`: expected share of the land in
+the landmass a random land tile falls in):
+
+| map | spawnShare | | map | spawnShare |
+|---|---|---|---|---|
+| yellowsea | 99.3% | | italia | 66.7% |
+| caucasus | 97.0% | | pangaea | 54.3% |
+| fingerlakes | 80.1% | | *every other `SMALL_MAPS` entry* | 2.0% (labyrinth) – 49.6% (bosphorusstraits) |
+
+Only the first three reach the 80% domination threshold overland; the pool
+averages ~36%.
+
 ## Upcoming Architecture
 
 Phase 1 of the roadmap (multi-opponent support + the variable-N opponent
@@ -472,9 +570,11 @@ Concretely this also means:
   (only legal for opponents that are alive and share a land border)
 - `boat_attack` — send a transport ship (troops + a destination tile) across
   water to invade opponent territory, including territory AGENT has no
-  land border with. This is what lets the agent cross water at all — before
-  this action existed, an agent landlocked behind an opponent's coastal ring
-  (all land routes blocked) had no way to ever reach the rest of the map.
+  land border with — and, with `OPENFRONT_NEUTRAL_BOATS=1`, to land on
+  unowned land, as the Nation AI and a human can. This is what lets the agent
+  cross water at all — before this action existed, an agent landlocked
+  behind an opponent's coastal ring (all land routes blocked) had no way to
+  ever reach the rest of the map.
 
 Both targeted actions are parameterized, so the action is `[action_type,
 macro_tile_idx, player_idx]` — each parameter read only for its own type.
@@ -486,19 +586,39 @@ than treating it as a no-op.
 `boat_attack` is spatially targeted: `macro_tile_idx` picks a cell in a fixed 32×32
 "macro-tile" grid (independent of the real map's pixel size — same
 size-invariance trick the network's `AdaptiveAvgPool2d` already relies on).
-`EnvServer.ts`'s `macroCellToTile()` translates the chosen cell into one
-real tile server-side; the real engine (`canBuildTransportShip`) then
-resolves the actual landing shore itself, so the network only ever needs to
-point at "roughly here," not a literal tile. Legal macro-cells are provided
-as `boat_target_mask` in the observation (see below) — the network's
-`tile_head` (`models/network.py`) is masked over exactly this, the same
-`-1e9`-on-illegal-logits pattern the action-type head already used.
+`EnvServer.ts`'s `resolveBoatTarget()` picks one target tile in the chosen
+cell and runs the engine's real `targetTransportTile()` check on it, only on
+the step `boat_attack` is actually sampled; the engine then resolves the
+actual landing shore itself, so the network only ever needs to point at
+"roughly here," not a literal tile. Legal macro-cells are provided as
+`boat_target_mask` in the observation (see below) — a cheap heuristic (any
+opponent tile in the cell; with `OPENFRONT_NEUTRAL_BOATS=1` any unowned
+passable land too), so a pick can still resolve to nothing and be a no-op.
+The network's `tile_head` (`models/network.py`) is masked over exactly this,
+the same `-1e9`-on-illegal-logits pattern the action-type head already used.
 
 Still missing: structure builds and diplomacy (alliances, donations,
 embargoes) — reuse this same macro-tile targeting machinery once added; see
 the action-space-expansion plan for the phased roadmap.
 `legal_actions`/`action_mask`/`boat_target_mask` are provided every
 `reset()`/`step()` so a policy never needs to guess legality.
+
+### Env-var gated behaviours
+
+Three behaviours of `EnvServer.ts` are switched by environment variables the
+Node worker reads at startup, **off unless set to exactly `1`**, so a live run
+whose workers recycle onto a newer `EnvServer.ts` mid-run is unaffected:
+
+| variable | when set |
+|---|---|
+| `OPENFRONT_EXPAND_MASK` | `expand` is legal only when an unowned land tile borders AGENT. Otherwise a nothing-to-take `expand` is an exact no-op (troops refunded) that earns what `noop` earns |
+| `OPENFRONT_BOAT_MASK` | `boat_attack` is legal only when AGENT owns a shore tile — the engine's own landlocked check |
+| `OPENFRONT_NEUTRAL_BOATS` | `boat_attack` may target unowned land as well as opponent land, and resolves a cell with its exact bounds (the default bounds miss each cell's last row and column on maps whose size is not a multiple of 32) |
+
+Every reset reply echoes them as `envFlags`, and `OpenFrontEnv` raises if a
+worker's flags differ from its own environment's (an older bridge, or a
+worker spawned before a variable changed). `train.py` prints them at startup.
+Set them in the launcher — `run_connected_first.sh` turns all three on.
 
 ## Watching a game
 
@@ -537,7 +657,10 @@ automatically during training) and just want to watch it:
    e.g. for `training/replays/2026-09-02T10-20-27-000_39500512.json` →
    `http://localhost:9000/game/39500512`. If you're reaching this
    environment through a port-forward/tunnel, both 9000 and 8787 need to be
-   forwarded.
+   forwarded. Eval-suite replays repeat their gameID at every eval (the seed
+   is fixed per stage — see [Curriculum and evaluation](#curriculum-and-evaluation)),
+   so when several files share one, ReplayServer serves the newest; to watch
+   an older one, move it to its own `--dir`.
 
 - **Quick debugging** (works today): any observation's `tile_grid` (Python)
   / `obs.tileGrid` (Node) is a flat ownership array (0=neutral, 1=agent,
@@ -824,6 +947,71 @@ npm run replay:game -- ../training/replays/<gameID>.json
       shaping-only run at equal experience / eval index; its known issues are
       again deliberately left unfixed so the comparison isolates the
       potential.
+- [x] Sampled-policy eval suites, curriculum ladders with map pools, and
+      neutral-land boats (built 2026-10-09, not yet trained — see
+      [Curriculum and evaluation](#curriculum-and-evaluation) and
+      [Env-var gated behaviours](#env-var-gated-behaviours)). Motivated by
+      three findings: the greedy 9-of-12 gate had kept every run on easy;
+      land attacks stop at water, and a random spawn's landmass averages
+      ~36% of a `SMALL_MAPS` map's land, so on most maps AGENT could not grow
+      without boating into the opponent; and the exact masks, built for the
+      no-op `expand`/`boat_attack` loops, had never been used in training.
+      **Resuming an older run with this `train.py` changes its eval and
+      promotion gate** to suites (`--eval-episodes 64`) — finish or archive
+      it on the previous commit to keep it comparable.
+- [x] Connected-first run (`training/run_connected_first.sh`, 2026-10-09/10,
+      RTX 5000 Ada workstation, archived at update 1650; logs, summary and
+      final checkpoint in `analysis/run_2026-10-09_connected-first/`) — the
+      beta=2 run's hyperparameters with all three env-bridge flags on,
+      `--curriculum connected-first` and sampled eval suites. Several changes
+      at once, so not a single-variable comparison against the beta=2 run.
+      **First run ever to leave easy:** promoted to easy on all 22 maps at
+      update 166 (50/64), to medium at 433 (49/64), to hard at 1432 (49/64),
+      then 0–9/64 at hard with no upward trend. Eval win rate swings hard
+      between consecutive suites on the same seeds (e.g. 50/64 → 4/64), so
+      the whole policy flips, not single maps. Final checkpoint vs
+      impossible: 1/64.
+- [x] Parameter-entropy-norm arm (`training/run_connected_first_paramnorm.sh`,
+      started 2026-10-09 beside the connected-first run). The entropy bonus
+      sums the type head's entropy (≤ ln 4) with the sampled parameter head's
+      raw entropy (tile head ≤ ln 1024), so it pulls hardest on keeping boat
+      targets uniform. Measured on the connected-first run's update-305
+      checkpoint: tile head at 88–93% of maximum entropy over 240–510 legal
+      cells, `boat_attack` sampled on up to 22% of steps, and both eval
+      collapses (4/64 at update 114, 8/64 at 263, after 50/64 and 36/64)
+      followed a rise in `boat_attack` probability. `--param-entropy-norm`
+      divides each parameter head's entropy by log(#legal choices); nothing
+      else differs, eval seeds included. Its logged `entropy` is the
+      normalized bonus — compare `type_entropy` across the two runs.
+      **Refuted; stopped at update ~642.** The tile head stayed at 95–96% of
+      its maximum entropy (the connected-first run's: 96–97%), so the bonus
+      was not what held it flat; the arm never left its first stage (best
+      eval 20/64), boating up to 30% of steps and rarely waiting (`noop`
+      ~25% vs ~58%). One seed per arm, so the worse play may be seed variance.
+- [x] Big-tile-head arm (`training/run_connected_first_bighead.sh`, started
+      2026-10-09 in the paramnorm arm's slot). `--tile-head big` swaps the
+      1x1-conv target head for `BigTileHead` (`network.py`): per-cell legal
+      mask and x/y coordinates, the trunk's game state as FiLM, and dilated
+      residual convs spanning the 32×32 grid (~330k parameters; whole network
+      199k → 530k). Supervised on "the legal cell nearest AGENT's territory"
+      it reaches ~98–99% vs ~64% for the default head
+      (`tests/test_big_tile_head.py`) — so the default head is not hopeless
+      under a direct signal, and a weak, delayed RL signal may still be the
+      main obstacle. Prediction: tile-head entropy falls well below maximum
+      and island-map win rate improves. Only change vs `run_connected_first.sh`.
+      **Result (stopped by hand at update 1437, hard/small; analysis in
+      `analysis/run_2026-10-09_connected-first_big-tile-head/`):** promoted
+      to easy/small at 471 (57/64), medium at 508 (63/64), hard at 1373
+      (51/64) — the same curriculum reach as the connected-first run, which
+      is one other seed of the same config apart from the head, so no
+      speed-up is claimed. The head learned a little: 92–96% of maximum
+      entropy at the end vs 98–99% for the default head, and far more of its
+      boats launch (68 of 112 sampled on a tourney4 probe, vs 3 of 92). It
+      hit the KL early stop on 90–97% of updates (default head: 65–77%).
+      Final checkpoint vs impossible: 1/64 — while the 10-line scripted
+      threshold policy (`training/eval_checkpoint.py --scripted`) won 18/64
+      on the same seeds. Next: replicate on the GTX 1660 box (`REPLICATE.md`
+      in the analysis folder).
 - [ ] Roadmap Phases 2-3 (not yet built, see the action-space-expansion
       plan): building/structure actions, then diplomacy actions
       (alliance/donate/embargo) — diplomacy explicitly gated on raising
@@ -864,7 +1052,9 @@ Key flags: `--num-envs`, `--rollout-length`, `--rollout-match-horizon`,
 `--gamma`, `--gamma-start`, `--gamma-anneal-updates`, `--gamma-anneal-start`,
 `--epochs`, `--weight-decay`, `--updates`, `--map`, `--checkpoint-dir`,
 `--log-csv`, `--checkpoint-every`, `--eval-every`, `--eval-every-steps`,
-`--reward-mode` (see `train.py --help` for the full
+`--reward-mode`, `--curriculum`, `--promote-threshold`, `--eval-episodes`,
+`--eval-envs`, `--eval-difficulties`, `--eval-replays`, `--eval-max-steps`,
+`--eval-log-csv`, `--param-entropy-norm`, `--tile-head` (see `train.py --help` for the full
 list — learning rate, GAE/clip/entropy coefficients and minibatch size are
 exposed too). The current run's values and the reasoning behind the coupled
 ones are in [Training (PPO) hyperparameters](#training-ppo-hyperparameters).
@@ -895,8 +1085,8 @@ training and eval episodes short before either side actually won or lost,
 which also meant curriculum's win-rate tracking was largely driven by
 truncation-as-loss rather than real outcomes. A truncated episode (the rare
 case of actually hitting the safety cap) still has no winner and still
-counts as a loss for curriculum purposes (see `record_episode` in
-`curriculum.py`).
+counts as not won for curriculum purposes — in an eval suite as in training
+(see `run_eval_suite`/`summarize_suite` in `train.py`).
 
 **What is the agent's action space?** Four discrete action *types* per
 decision step (`ACTIONS` in `EnvServer.ts`/`openfront_env.py` — see "Action
@@ -979,9 +1169,10 @@ game state on every decision step (never cached/approximated):
   border). The pointer head is masked over exactly this, the same
   `-1e9`-on-illegal-logits pattern the other heads use.
 - **`boat_target_mask`** — a `(32, 32)` boolean macro-tile grid, `True` where
-  a `boat_attack` targeting that macro-cell would be legal (computed
-  server-side once per step via `canBuildTransportShip`, the same real-engine
-  legality the game's own UI uses — see "Action space" above). Doubles as
+  the macro-cell holds opponent land (or, with `OPENFRONT_NEUTRAL_BOATS=1`,
+  unowned passable land) — a cheap per-step heuristic; the engine's real
+  `targetTransportTile()` check runs only when `boat_attack` is sampled, so a
+  `True` cell can still turn out unreachable (see "Action space" above). Doubles as
   both the observation *and* the tile-parameter's action mask, so there's no
   separate wire field for masking — the network reads legality directly off
   what it's already shown.

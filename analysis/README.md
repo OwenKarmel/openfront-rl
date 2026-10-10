@@ -18,6 +18,15 @@ for.
 | `run_2026-09-06_winner-fix_gamma098/` | gamma=0.999 (upd 0-709) then gamma=0.98 (upd 710+) | `territory_moving_average/` |
 | `run_2026-09-07_gamma0995/` | gamma=0.995, `max_episode_steps=2500`, cold start | `territory_moving_average/` |
 | `run_2026-09-11_bbf-adamw_gamma098_rollout50/` | gamma=0.98, rollout 50, epochs 8, AdamW wd=0.1, cold start | `territory_moving_average/`, `training_win_rate/`, `tile_gain_vs_episode_progress/` |
+| `run_2026-10-09_connected-first/` | eval suites + `connected-first` + all three env-bridge flags, beta=2 hyperparameters; reached hard | logs, `summary.txt`, final checkpoint and impossible eval (no plots) |
+| `run_2026-10-09_connected-first_big-tile-head/` | the same with `--tile-head big`; reached hard. **The run to replicate on the GTX 1660 box** | logs, `summary.txt`, `summarize_run.py`, `probe_tile_head.py`, `REPLICATE.md` |
+
+Runs with eval suites (from `training/run_connected_first.sh` on) no longer
+print one `eval vs <difficulty>: {...}` line per eval for `build_dataset.py`
+to scrape. Each eval is a suite of fixed-seed episodes logged to
+`eval_log.csv` (one row per suite) and `eval_episodes.csv` (one row per game)
+beside the run's checkpoint — read those instead. Their win rates are not
+comparable with the earlier runs' greedy single-episode evals.
 
 ## Cross-run comparison is mostly confounded — check before comparing
 

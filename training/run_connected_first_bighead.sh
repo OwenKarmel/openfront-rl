@@ -1,4 +1,11 @@
 #!/bin/bash
+# FINISHED on the RTX 5000 Ada workstation 2026-10-10 at update 1437 (stopped
+# by hand at hard/small); archived to
+# checkpoints/archive/run_2026-10-09_connected-first_big-tile-head/ and
+# committed under analysis/run_2026-10-09_connected-first_big-tile-head/.
+# Left ENABLED on purpose: it is the run to replicate on the GTX 1660 box --
+# see REPLICATE.md in that analysis folder (pass --device cuda:0 there).
+#
 # Launches (or resumes) the BIG-TILE-HEAD arm of the connected-first run,
 # config pinned. Runs in parallel with run_connected_first.sh, so it has its
 # own checkpoint, log and replay directories (and the second GPU) -- never

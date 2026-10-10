@@ -1,4 +1,8 @@
 #!/bin/bash
+# STOPPED 2026-10-09 at update ~642 to free its slot for run_connected_first_bighead.sh:
+# the normalization left the tile head at 95-96% of max entropy (hypothesis
+# refuted) and the run never left stage 1. Resumable from its own checkpoint.
+#
 # Launches (or resumes) the PARAMETER-ENTROPY-NORM arm of the connected-first
 # run, config pinned. Runs in parallel with run_connected_first.sh, so it has
 # its own checkpoint, log and replay directories (and the second GPU) --
@@ -28,6 +32,18 @@
 
 set -euo pipefail
 cd "$(dirname "$0")"
+
+# ARCHIVED 2026-10-10 at update 642. This run now lives in
+# checkpoints/archive/run_2026-10-09_connected-first_paramnorm/ (logs, summary and final checkpoint also
+# committed nowhere else -- see README Status for its result). Kept for provenance; running the command
+# below as-is would start a NEW run in checkpoints/run2_param_entropy_norm/ under this config. To genuinely
+# resume this run, copy the archive folder out to its own directory and pass
+# --checkpoint-dir/--log-csv/--eval-log-csv/--eval-dir pointing at it.
+if [ "${I_KNOW_THIS_RUN_IS_ARCHIVED:-}" != "1" ]; then
+  echo "run_connected_first_paramnorm.sh: this run is archived; see the comment in this script." >&2
+  echo "To replicate the big-tile-head run, see analysis/run_2026-10-09_connected-first_big-tile-head/REPLICATE.md." >&2
+  exit 1
+fi
 
 export OPENFRONT_EXPAND_MASK=1
 export OPENFRONT_BOAT_MASK=1
