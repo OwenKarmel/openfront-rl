@@ -59,6 +59,19 @@ checkpoint and resumed with `--eval-every-steps 12000` (was 3000; evals were
 ~60% of wall time) — set in the launcher. Check liveness with `ps`, not `pgrep -f train.py`,
 which matches its own command line.
 
+**Status 2026-11-24 (branch `tier0-attacksize`):** run5 died at 17:49 UTC
+during update 5415 — an OOM kill (`mem_log.csv`: the cgroup's `oom_kill`
+counter rose 22 → 23 with the trainer at 4.4 GB RSS and climbing). It is left
+paused at its update-5415 `latest.pt`. Its successor is run6,
+`training/run_bighead_attacksize.sh` (`checkpoints/run6_bighead_attacksize/`):
+run4's flags, `--init-from` run4's update-5310 checkpoint, plus the Tier-0
+fixes (`--kl-stop epoch --value-norm --adv-norm minibatch`, canary evals,
+`--eval-report-exclude-maps labyrinth`) and `--attack-size-head`. The
+launcher header and the README Status entry carry the reasons and the success
+bar. Relaunching the launcher resumes its own `latest.pt` (`--init-from` is
+then ignored). Run `training/mem_logger.sh <pid> checkpoints/run6_bighead_attacksize/mem_log.csv 30`
+beside it, as for run5.
+
 Never resume a run by retyping the `train.py` command. Checkpoints store
 weights, optimizer state and curriculum position (plus, for connected-first
 runs, the curriculum ladder) but **not** hyperparameters, so a resume that

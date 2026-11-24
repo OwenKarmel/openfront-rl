@@ -164,10 +164,20 @@ def lockstep(seed, kinds, max_steps=3000):
 
 
 print("4. fraction 0.20 vs head off")
-for seed in (0, 2):
+# The first two seeds whose game actually launches boats (on some, AGENT
+# never gets a legal boat_attack, and the comparison would cover nothing).
+with_boats = 0
+for seed in range(6):
     steps, first, _, _, winners, boats, m = lockstep(seed, ("boat",))
+    if boats == 0:
+        print(f"  (seed {seed} ({m}): no boat_attack ever legal -- skipped)")
+        continue
+    with_boats += 1
     check(f"boats only, seed {seed} ({m}): identical for all {steps} steps to the engine's end "
-          f"({boats} boat_attack steps, winner {winners[0]})", first is None and boats > 0)
+          f"({boats} boat_attack steps, winner {winners[0]})", first is None)
+    if with_boats == 2:
+        break
+check("two seeds with boats compared", with_boats == 2)
 for seed in (0, 1):
     steps, first, kind, troops, winners, _, m = lockstep(seed, ("expand", "attack"), max_steps=600)
     rel = abs(troops[1] - troops[0]) / troops[0] if troops else float("nan")
