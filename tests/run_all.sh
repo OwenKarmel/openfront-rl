@@ -22,6 +22,9 @@ TESTS=(
   test_curriculum.py
   test_param_entropy_norm.py
   test_big_tile_head.py
+  test_ppo_tier0.py
+  test_attack_size_head.py
+  test_init_from.py
   smoke_test.py
   smoke_test_multiopp.py
   test_neutral_boats.py
@@ -29,6 +32,7 @@ TESTS=(
   test_selfplay.py
   test_expand_mask.py
   test_boat_mask.py
+  test_attack_size.py
   test_reward_modes.py
   test_potential_beta.py
 )

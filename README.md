@@ -78,6 +78,9 @@ MuZero/EfficientZero, action/observation space, phased milestones).
     construction as training — see `GameSetup.ts` — so it's watchable in
     the real client and verifiable via `npm run replay:game`, not an
     approximation of what training saw).
+  - `eval_vs_script.py` (in `analysis/`) — per-map eval win rates of a run
+    over time against the scripted baseline on the same seeds; see
+    [Curriculum and evaluation](#curriculum-and-evaluation).
   - `eval_checkpoint.py` — plays a checkpoint (or, with `--scripted`, a
     10-line troop-threshold policy on the same action space) through
     `train.py`'s own eval suite against each difficulty, on the same fixed
@@ -105,9 +108,17 @@ MuZero/EfficientZero, action/observation space, phased milestones).
       (pass `--device cuda:0` on a one-GPU box). Python path overridable via
       `OPENFRONT_PYTHON`.
 
-    - `run_bighead_selfplay_terminal.sh` — **the current run on the GTX
-      1660 box** (`checkpoints/run5_bighead_selfplay_terminal/`, started
-      2026-11-23): run4's (`run_bighead_hard_terminal.sh`) config warm-started
+    - `run_bighead_attacksize.sh` — **run6, the next run on the GTX 1660
+      box** (`checkpoints/run6_bighead_attacksize/`, prepared 2026-11-24):
+      run4's config warm-started with `--init-from` its final checkpoint, plus
+      the Tier-0 fixes (`--kl-stop epoch --value-norm --adv-norm minibatch`,
+      canary evals, `--eval-report-exclude-maps labyrinth`) and
+      `--attack-size-head`. Without `--attack-size-head` it is the
+      Tier-0-only control. Header has the reasons and the success bar.
+    - `run_bighead_selfplay_terminal.sh` — run5 on the GTX 1660 box
+      (`checkpoints/run5_bighead_selfplay_terminal/`, started 2026-11-23;
+      died 2026-11-24 17:49 UTC of an OOM kill, left paused at its update-5415
+      checkpoint for run6): run4's (`run_bighead_hard_terminal.sh`) config warm-started
       from its final checkpoint (update 5310, hard/small) with
       `--reward-mode terminal_only` and self-play at
       `--expert-frac 1,1,0.5,0.5,0.5` — see [Self-play](#self-play) — and,
@@ -260,7 +271,7 @@ flowchart TD
     TRF --> V1
     V1 --> VALOUT(["value (B,)<br/>V(s), fed to GAE in ppo.py"])
 
-    TYPEOUT -.-> COMPOSE["log_prob = log_prob(type)<br/>+ 1[type==boat_attack] · log_prob(tile)<br/>+ 1[type==attack_opponent] · log_prob(player_idx)<br/>entropy: same 3-term structure<br/>(masked-sum composition, network.py act()/evaluate_actions())"]
+    TYPEOUT -.-> COMPOSE["log_prob = log_prob(type)<br/>+ 1[type==boat_attack] · log_prob(tile)<br/>+ 1[type==attack_opponent] · log_prob(player_idx)<br/>[+ 1[type∈{expand,attack,boat}] · log_prob(attack_frac)<br/>  — only with --attack-size-head]<br/>entropy: same structure<br/>(masked-sum composition, network.py act()/evaluate_actions())"]
     TILEOUT -.-> COMPOSE
     PLAYEROUT -.-> COMPOSE
 ```
@@ -281,6 +292,24 @@ flowchart TD
 | `type_head` | `Linear` | `(B,256)` → `(B,4)` | `NUM_ACTIONS`=4; masked with `-1e9` on illegal types | 1,028 |
 | `value_head` | `Linear` | `(B,256)` → `(B,1)` | — | 257 |
 | **Total** | | | | **199,319** |
+| *`attack_frac_head` (only with `--attack-size-head`)* | `Linear` | `(B,256)` → `(B,5)` | `NUM_ATTACK_FRACTIONS`=5; unmasked; zero weights, bias for P(20%)=0.9 | *1,285* |
+
+**Optional attack-size head** (`--attack-size-head`, off by default). A
+`Linear(trunk_feat → 5)` categorical over `ATTACK_FRACTIONS = (0.10, 0.20,
+0.35, 0.50, 0.75)` of AGENT's *current* troops, read for `expand`,
+`attack_opponent` and `boat_attack` and composed into `log_prob`/entropy by
+the same masked sum as the tile and player heads (with
+`--param-entropy-norm`, its entropy is divided by `log 5`). Initialized with
+zero weights and a bias putting P(20%) = 0.9 and 0.025 on each other choice in
+every state, so a warm start begins close to the fixed 20% every earlier run
+used. Unmasked: the engine has no minimum attack size (an attack with under
+one troop deletes itself on its first tick, as today's 20% already would at
+under 5 troops). Off, the module does not exist — same `state_dict`, same
+init draws — and `act()` does not sample it, so every sampled action is
+unchanged (`tests/test_ppo_tier0.py` checks this against the pre-change code).
+`train_log.csv` records the head's mean probabilities as
+`attack_frac_prob_<fraction>`. See [Action space](#action-space) for the wire
+side.
 
 Architecture-level constants (`network.py`): `conv_channels=32`,
 `trunk_dim=256`, `NUM_TILE_CLASSES=4`, `NUM_SELF_FEATURES=4`,
@@ -312,6 +341,9 @@ gamma anneal with a convex potential,
 | entropy coef (`--entropy-coef`) | 0.02 | 0.02 (lowered from an earlier 0.04 — see Status) |
 | max grad norm (`ppo.py`'s `max_grad_norm`) | 0.5 | 0.5 |
 | target KL / early-stop (`--target-kl`) | 0.03 (abort epoch loop past 1.5×) | 0.03 |
+| KL early-stop granularity (`--kl-stop`) | `minibatch` (k1 per minibatch vs 1.5× target) | `minibatch` (run6: **`epoch`**) |
+| advantage normalization (`--adv-norm`) | `batch` (whole rollout) | `batch` (run6: **`minibatch`**) |
+| value-target normalization (`--value-norm`) | off | off (run6: **on**, PopArt) |
 | PPO epochs per update (`--epochs`) | 4 | **8** |
 | minibatch size (`--minibatch-size`) | 128 | 128 |
 | parallel envs (`--num-envs`) | 4 | **10** |
@@ -326,6 +358,54 @@ gamma anneal with a convex potential,
 | checkpoint interval (`--checkpoint-every`) | 20 updates | **5** (updates reach ~156s at T=1000) |
 | eval interval (`--eval-every`) | 20 updates | ignored (see next row) |
 | eval interval in steps (`--eval-every-steps`) | 0 (≡ use `--eval-every`) | **3000** |
+
+**Tier-0 PPO options (2026-11-24; `ppo.py`).** All three are no-ops at their
+defaults — `ppo_update()` is then bit-identical to the code before them,
+checked against verbatim copies of the old `ppo.py`/`network.py` in
+`tests/reference/` by `tests/test_ppo_tier0.py`. `train_log.csv` records
+the settings and, in every mode, `grad_steps`, `epochs_completed`,
+`approx_kl_k3` and `last_epoch_kl` per update.
+
+- `--kl-stop epoch`. The default checks the k1 estimate `mean(old_logp −
+  logp)` after every 128-sample minibatch — including a leftover partial
+  one, which can be a handful of samples — and ends the whole update past
+  1.5× `--target-kl`. In the last three runs it fired on 93–100% of updates
+  while mean approx_kl was 0.004–0.011: noise alone was ending updates, and
+  nobody knew how many of the 8 epochs ran. k1 can also be negative, so it
+  misses a large KL in one direction entirely (the test shows a k3 of 16 that
+  k1 reports as −3). `epoch` uses the k3 estimator `mean((ratio − 1) − log
+  ratio)` (unbiased, ≥ 0), averages it over each epoch weighted by minibatch
+  size, and stops only *between* epochs when that mean exceeds `--target-kl`
+  itself. The partial minibatch is folded into the last full one, so every
+  step sees ≥ `--minibatch-size` samples and nothing is dropped:
+  `grad_steps` is `epochs × floor(T·N / minibatch)` when no stop fires.
+- `--adv-norm minibatch` normalizes advantages per minibatch (population
+  std) instead of once over the rollout.
+- `--value-norm`: PopArt (van Hasselt et al. 2016, "Preserving Outputs
+  Precisely"). `ValueNormalizer` keeps a debiased EMA (`VALUE_NORM_BETA` =
+  0.99 per update, ~100-update time constant; std floored at 0.01) of the
+  GAE returns' mean and second moment. The value head predicts *normalized*
+  values; `ppo_update()` denormalizes them (and the bootstrap) for GAE,
+  updates the statistics, rescales the head (`w' = w·σ/σ'`, `b' = (σb + μ −
+  μ')/σ'`) so its denormalized output is unchanged, and fits it to
+  normalized targets. Value clipping happens in normalized space, so the
+  clip is 0.2 *standard deviations* of the return, not 0.2 raw units, and
+  `value_loss` is in normalized units — not comparable with a run without
+  the flag. Why: the 2026-09-13 noop collapse
+  (`training/checkpoints/archive/run_2026-09-13_*/noop_collapse_investigation.md`)
+  traced to the advantage std growing ~5× under gamma 0.999 with terminal
+  rewards. The statistics are saved in checkpoints (`value_norm`); a
+  checkpoint without them (any earlier run) starts at identity — mean 0,
+  std 1, so the loaded head's output is read exactly as before — and a
+  checkpoint *with* them refuses to resume without `--value-norm`.
+  `value_norm_mean`/`value_norm_std` are logged per update.
+
+`ppo_update()` also copies the rollout's tile grids to the device one step
+at a time, dropping each from the buffer as it goes, instead of
+`np.stack()`ing a second full host copy first. Numerically identical; it
+removes the update's largest host-memory peak — ~2.1 GB at 8 envs × T=1000,
+measured in run5's `mem_log.csv` (train RSS 3.6 → 5.6 GB at every update),
+~2.6 GB at 10 envs.
 
 **`--weight-decay` is decoupled and applies to ≥2D parameters only** (conv
 kernels, linear weight matrices), never to biases — biases carry none of the
@@ -482,6 +562,48 @@ games averaged ~80k ticks and 34 of the wins came at the engine's 170-minute
 limit (102,000 ticks), where the largest player is declared the winner. So
 expect several minutes per suite at 16 workers late in training. Raise
 `--eval-envs` where there are cores (it does not change training).
+
+**Cheaper evaluation (2026-11-24).** run4 played 1,033 suites — 66,112
+games, ~311 h — against ~290 h of training. Two knobs, both off by default:
+
+- **Canary** (`--canary-every-steps`, `--canary-episodes`): a logged-only
+  eval of `--canary-episodes` games at the stage's difficulty, on a fixed
+  subset of the stage's own eval seeds, every `--canary-every-steps`
+  decision steps per env (skipped on an update that runs a full suite). The
+  subset is **stratified by map**: `canary_seeds()` goes round-robin over the
+  maps in order of their first eval seed, taking each map's lowest unused
+  seed — the map of seed k is computed without playing it
+  (`eval_seed_maps()`, the env's own seeded draw). Fixed per stage, so canary
+  rows are comparable with each other, and each canary game is also a
+  full-suite game, seed for seed. On hard/small, 16 canary games cover 16 of
+  the 20 maps the 64 eval seeds use. Canary rows go to `eval_log.csv` with
+  `kind=canary` and `gates_curriculum=False`; they never promote and dump no
+  replays.
+- Full suites (`--eval-every-steps`, `--eval-episodes`) are unchanged and
+  still gate promotion (`kind=suite`).
+
+`train_log.csv` records `train_seconds_total` (rollout + update) and
+`eval_seconds_total` (suites + canaries), cumulative and carried in
+checkpoints (`wall_seconds`), so `eval / (train + eval)` is the share of wall
+time spent evaluating; each eval line prints it too. Eval time lands in the
+row of the update *after* the eval.
+
+**Per-map reporting.** 1,075 of run4's 1,096 hard eval wins were on
+labyrinth; without it, run4 won 21 of 60,947 hard eval games. The headline
+win rate hid that. `--eval-report-exclude-maps labyrinth` (reporting only;
+promotion still counts every game) fills `wins_excl`, `episodes_excl` and
+`excluded_maps` in `eval_log.csv`, and every full suite prints a per-map
+wins line. Logs written before these columns keep their own header (with a
+note) unless a canary or an exclusion needs the new columns, in which case
+the run refuses to start into them.
+
+`analysis/eval_vs_script.py <run dir>` builds per-map win rates over time
+from `eval_episodes.csv` (full suites only) into
+`<run>/per_map_win_rates.csv`, plays `eval_checkpoint.py --scripted` once
+per stage (and `--difficulties`) on that stage's eval seeds under the env
+flags the run logged, caching it as
+`<run>/script_baseline_<difficulty>_<maps>_<n>.csv`, and prints agent vs
+script per map, with and without the excluded maps.
 
 **Promotion.** The current stage's suite win rate ≥ `--promote-threshold`
 (0.75) promotes to the next stage. At 64 episodes its standard error near the
@@ -652,7 +774,11 @@ Concretely this also means:
   ever reach the rest of the map.
 
 Both targeted actions are parameterized, so the action is `[action_type,
-macro_tile_idx, player_idx]` — each parameter read only for its own type.
+macro_tile_idx, player_idx, attack_frac_idx]` — each parameter read only for
+its own type(s). `attack_frac_idx` is the attack-size head's (below); with
+the head off it is the default index and nothing reads it. There was no
+reserved slot before it — the roadmap's "`unit_type_idx` slot" never existed
+in `RolloutBuffer` — so Phase 2's `unit_type_idx` will need a new slot 4.
 `player_idx` indexes the padded opponent array (see Architecture above);
 its legal values are given by `attack_target_mask`, and unlike the boat
 mask that one is exact, so the env-bridge rejects an unmasked pick rather
@@ -671,6 +797,36 @@ opponent tile in the cell; with `OPENFRONT_NEUTRAL_BOATS=1` any unowned
 passable land too), so a pick can still resolve to nothing and be a no-op.
 The network's `tile_head` (`models/network.py`) is masked over exactly this,
 the same `-1e9`-on-illegal-logits pattern the action-type head already used.
+
+**Attack size** (`--attack-size-head`, off by default). Every attack used to
+send 20% of AGENT's troops: `intentFor()` sends `troops: null` for land
+attacks, which `AttackExecution.init()` turns into `Config.attackAmount()` =
+`troops/5`, and `boatAttackAmount()` = `floor(troops/5)` for boats. The
+Nation AI instead sends `troops − reserve` (reserve 30–40% of the cap) once
+it reaches a 50–60% trigger (`AiAttackBehavior.ts`). With the head on,
+`OpenFrontEnv` sends `attackSizeHead: true` on reset (echoed back and
+checked, like `rewardMode`) and `troopFraction` = `ATTACK_FRACTIONS[i]` on
+every `expand`/`attack_opponent`/`boat_attack` step; `intentFor()` sends
+`troops: fraction × troops()` for a land attack and `floor(fraction ×
+troops())` for a boat — no engine change, since `AttackIntentSchema.troops`
+is already a nullable float. With the head off nothing is sent and the old
+paths run unchanged; a stray `troopFraction` is rejected.
+
+*Fraction 0.20 vs the head off* (`tests/test_attack_size.py`, measured
+2026-11-24 at hard with a deterministic scripted policy):
+
+- **Boats: identical, every step, through the engine's end** — the old path
+  already sized boats in `intentFor()`.
+- **Land attacks: not identical.** `GameImpl.executeNextTick()` ticks the
+  running executions first and `init()`s new ones at the *end* of the tick,
+  so the `null` path computes `troops/5` after one more tick of troop growth
+  and combat than a count fixed in `intentFor()`. On the first expand of
+  seed 0 (tourney3) that is 107 vs 106 tiles and 23,050 vs 23,120 troops
+  after the step (the explicit attack is ~0.3% smaller); from there the games
+  diverge chaotically, and 3 of 6 lockstep games ended differently. The real
+  client sizes attacks the explicit way (`ClientGameRunner`: `troops() *
+  attackRatio` at intent time), so the explicit path is the
+  production-faithful one; the old `null` path is the outlier.
 
 Still missing: structure builds and diplomacy (alliances, donations,
 embargoes) — reuse this same macro-tile targeting machinery once added; see
@@ -1087,6 +1243,24 @@ npm run replay:game -- ../training/replays/<gameID>.json
       threshold policy (`training/eval_checkpoint.py --scripted`) won 18/64
       on the same seeds. Next: replicate on the GTX 1660 box (`REPLICATE.md`
       in the analysis folder).
+- [ ] **Run6: Tier-0 fixes + attack-size head** (`training/run_bighead_attacksize.sh`,
+      `checkpoints/run6_bighead_attacksize/`, prepared 2026-11-24). Warm
+      start from run4's update-5310 checkpoint (hard/small) via `--init-from`
+      with every run4 flag, plus `--kl-stop epoch --value-norm --adv-norm
+      minibatch`, a 16-game canary every 10,000 steps/env and full 64-game
+      suites every 50,000, `--eval-report-exclude-maps labyrinth`, and
+      `--attack-size-head`. Five changes at once — the same launcher without
+      `--attack-size-head` is the Tier-0-only control, and about a day of it
+      is the cleaner check of the four fixes alone. The evidence behind each
+      change: the KL stop fired on 93–100% of updates at mean approx_kl
+      0.004–0.011; run4 spent more wall time evaluating than training; 1,075
+      of its 1,096 hard eval wins were on labyrinth (21 of ~61,000 without);
+      and a scripted troop-threshold policy wins 18/64 vs impossible where
+      every RL checkpoint wins 1/64, while the agent could not choose its
+      attack size at all. **Success bar:** vs impossible on the stage's eval
+      seeds, at least the script's 18/64; hard win rate excluding labyrinth
+      well above run4's 21/~61,000; eval under 15% of wall time; full epochs
+      actually running (`epochs_completed` = 8 on most updates).
 - [ ] Roadmap Phases 2-3 (not yet built, see the action-space-expansion
       plan): building/structure actions, then diplomacy actions
       (alliance/donate/embargo) — diplomacy explicitly gated on raising
@@ -1135,10 +1309,27 @@ Key flags: `--num-envs`, `--rollout-length`, `--rollout-match-horizon`,
 `--reward-mode`, `--curriculum`, `--promote-threshold`, `--eval-episodes`,
 `--eval-envs`, `--eval-difficulties`, `--eval-replays`, `--eval-max-steps`,
 `--eval-log-csv`, `--param-entropy-norm`, `--tile-head`, `--expert-frac`,
-`--selfplay-pool-size`, `--selfplay-snapshot-every`, `--selfplay-latest-prob` (see `train.py --help` for the full
+`--selfplay-pool-size`, `--selfplay-snapshot-every`, `--selfplay-latest-prob`, `--kl-stop`,
+`--adv-norm`, `--value-norm`, `--attack-size-head`, `--init-from`,
+`--canary-every-steps`, `--canary-episodes`, `--eval-report-exclude-maps` (see `train.py --help` for the full
 list — learning rate, GAE/clip/entropy coefficients and minibatch size are
 exposed too). The current run's values and the reasoning behind the coupled
 ones are in [Training (PPO) hyperparameters](#training-ppo-hyperparameters).
+
+**Warm starts (`--init-from <checkpoint>`).** Starts a *new* run directory
+from another run's checkpoint: weights, update count (so gamma, rollout
+length and the eval schedule continue where that run was), curriculum stage,
+and — checked like a resume — its ladder. Only parameters of a module a flag
+adds (today: the attack-size head) may be missing from it; any other missing
+or unexpected parameter is an error. The optimizer state of every matched
+parameter is carried over **by name** (adding a head shifts AdamW's
+positional param groups, so the source state is loaded into a rebuilt
+source-shaped optimizer and moved across); a new parameter gets none, i.e.
+AdamW starts its moments at zero and its step count at 0, exactly like a
+freshly initialized parameter. Value-norm statistics come along if the source
+has them, else identity. If the run directory already has `latest.pt`, that
+is resumed and `--init-from` is ignored, so relaunching a launcher that
+carries `--init-from` is safe.
 
 ## FAQ
 
