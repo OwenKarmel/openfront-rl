@@ -36,6 +36,8 @@ changes at all.
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -51,6 +53,16 @@ NUM_SELF_FEATURES = 4  # tiles, troops, troops_ratio, gold -- see SELF_FEATURES 
 NUM_OPPONENT_FEATURES = 6
 NUM_TILE_CLASSES = 4  # neutral land, self, ANY opponent, water -- see tileGrid() in EnvServer.ts
 MACRO_GRID = 32  # must match MACRO_GRID in EnvServer.ts / openfront_env.py
+EXPAND_IDX = 1  # must match ACTIONS.index("expand") in openfront_env.py
+# The attack-size head's choices: len(ATTACK_FRACTIONS) in openfront_env.py,
+# which maps index -> fraction of current troops (index 1 = 0.20, the size
+# every attack had before the head existed).
+NUM_ATTACK_FRACTIONS = 5
+DEFAULT_ATTACK_FRACTION_IDX = 1
+# Initial P(default fraction) of a fresh attack-size head (zero weights, so
+# the same in every state); the rest is spread evenly over the others. Close
+# to 1 so a warm start begins close to the always-20% behaviour it learned.
+ATTACK_FRACTION_INIT_PROB = 0.9
 
 
 class BigTileHead(nn.Module):
@@ -112,6 +124,7 @@ class ActorCritic(nn.Module):
         trunk_dim: int = 256,
         param_entropy_norm: bool = False,
         tile_head: str = "small",
+        attack_size_head: bool = False,
     ):
         super().__init__()
         # Divide each PARAMETER head's entropy (tile, player) by log(number of
@@ -185,6 +198,23 @@ class ActorCritic(nn.Module):
         self.type_head = nn.Linear(trunk_dim, NUM_ACTIONS)
         self.value_head = nn.Linear(trunk_dim, 1)
 
+        # How many troops an expand / attack_opponent / boat_attack sends, as
+        # an index into openfront_env.py's ATTACK_FRACTIONS (train.py's
+        # --attack-size-head). Built only when on, so the default network has
+        # exactly the original parameters (same state_dict keys, same init
+        # RNG draws) and existing checkpoints load unchanged. Zero weights and
+        # a bias putting ATTACK_FRACTION_INIT_PROB on 20%: it starts as the
+        # same distribution in every state, mostly today's fixed size.
+        self.use_attack_size_head = attack_size_head
+        if attack_size_head:
+            self.attack_frac_head = nn.Linear(trunk_dim, NUM_ATTACK_FRACTIONS)
+            other = (1.0 - ATTACK_FRACTION_INIT_PROB) / (NUM_ATTACK_FRACTIONS - 1)
+            bias = torch.full((NUM_ATTACK_FRACTIONS,), math.log(other))
+            bias[DEFAULT_ATTACK_FRACTION_IDX] = math.log(ATTACK_FRACTION_INIT_PROB)
+            with torch.no_grad():
+                self.attack_frac_head.weight.zero_()
+                self.attack_frac_head.bias.copy_(bias)
+
     def _features(
         self,
         tile_grid: torch.Tensor,
@@ -230,7 +260,8 @@ class ActorCritic(nn.Module):
         attack_target_mask: torch.Tensor,
         action_mask: torch.Tensor,
     ):
-        """Returns (type_logits, tile_logits, player_logits, value).
+        """Returns (type_logits, tile_logits, player_logits, value) -- see
+        _heads() for the attack-size logits too.
         action_mask: (B, NUM_ACTIONS) bool, True = legal action type.
         tile_target_mask: (B, MACRO_GRID, MACRO_GRID) bool, True = legal
         boat_attack destination. attack_target_mask: (B, slots) bool, True =
@@ -240,6 +271,25 @@ class ActorCritic(nn.Module):
         act()/evaluate_actions(). An all-False parameter mask is fine: every
         logit becomes -1e9, so the distribution is uniform and finite rather
         than NaN, and its term is gated out anyway."""
+        return self._heads(
+            tile_grid, self_features, opponent_features, opponent_mask,
+            tile_target_mask, attack_target_mask, action_mask,
+        )[:4]
+
+    def _heads(
+        self,
+        tile_grid: torch.Tensor,
+        self_features: torch.Tensor,
+        opponent_features: torch.Tensor,
+        opponent_mask: torch.Tensor,
+        tile_target_mask: torch.Tensor,
+        attack_target_mask: torch.Tensor,
+        action_mask: torch.Tensor,
+    ):
+        """forward()'s four outputs plus the attack-size logits (B,
+        NUM_ATTACK_FRACTIONS), or None when the head is off. Unmasked: the
+        engine has no minimum attack size (an attack under one troop just
+        ends on its first tick), so no fraction is ever illegal."""
         trunk_feat, feat_map, opponent_emb = self._features(
             tile_grid, self_features, opponent_features, opponent_mask
         )
@@ -259,7 +309,8 @@ class ActorCritic(nn.Module):
         player_logits = player_logits.masked_fill(~attack_target_mask, -1e9)
 
         value = self.value_head(trunk_feat).squeeze(-1)
-        return type_logits, tile_logits, player_logits, value
+        frac_logits = self.attack_frac_head(trunk_feat) if self.use_attack_size_head else None
+        return type_logits, tile_logits, player_logits, value, frac_logits
 
     @torch.no_grad()
     def act(
@@ -273,13 +324,17 @@ class ActorCritic(nn.Module):
         action_mask: torch.Tensor,
     ):
         """Sample an action for rollout collection.
-        Returns (action, log_prob, value) -- action is (B, 3) int:
-        [action_type, macro_tile_idx, player_idx]. Each parameter is only
-        meaningful (and only contributes to log_prob) for its own action
-        type -- macro_tile_idx for boat_attack, player_idx for
-        attack_opponent; otherwise it's still a validly-sampled index
-        (harmless, ignored server-side and by the composition below)."""
-        type_logits, tile_logits, player_logits, value = self.forward(
+        Returns (action, log_prob, value) -- action is (B, 4) int:
+        [action_type, macro_tile_idx, player_idx, attack_frac_idx]. Each
+        parameter is only meaningful (and only contributes to log_prob) for
+        its own action types -- macro_tile_idx for boat_attack, player_idx
+        for attack_opponent, attack_frac_idx for all three attack types;
+        otherwise it's still a validly-sampled index (harmless, ignored
+        server-side and by the composition below). With the attack-size head
+        off, attack_frac_idx is DEFAULT_ATTACK_FRACTION_IDX and NOT sampled,
+        so the random stream -- and every sampled action -- is exactly what
+        it was before the head existed."""
+        type_logits, tile_logits, player_logits, value, frac_logits = self._heads(
             tile_grid, self_features, opponent_features, opponent_mask,
             tile_target_mask, attack_target_mask, action_mask,
         )
@@ -289,27 +344,47 @@ class ActorCritic(nn.Module):
         action_type = type_dist.sample()
         tile_idx = tile_dist.sample()
         player_idx = player_dist.sample()
+        if frac_logits is not None:
+            frac_dist = torch.distributions.Categorical(logits=frac_logits)
+            frac_idx = frac_dist.sample()
+        else:
+            frac_dist = None
+            frac_idx = torch.full_like(action_type, DEFAULT_ATTACK_FRACTION_IDX)
 
         log_prob = self._compose_log_prob(
-            action_type, tile_idx, player_idx, type_dist, tile_dist, player_dist
+            action_type, tile_idx, player_idx, type_dist, tile_dist, player_dist, frac_idx, frac_dist
         )
 
-        action = torch.stack([action_type, tile_idx, player_idx], dim=-1)
+        action = torch.stack([action_type, tile_idx, player_idx, frac_idx], dim=-1)
         return action, log_prob, value
 
     @staticmethod
-    def _compose_log_prob(action_type, tile_idx, player_idx, type_dist, tile_dist, player_dist):
+    def _compose_log_prob(
+        action_type, tile_idx, player_idx, type_dist, tile_dist, player_dist, frac_idx=None, frac_dist=None
+    ):
         """Masked-sum composition: the type term always counts, each
         parameter term only when its own type was the one sampled. Keeps
         log_prob a single scalar per transition, so ppo.py's ratio/clip math
-        is unchanged by having more parameter heads."""
+        is unchanged by having more parameter heads. The attack-size term
+        (only with that head) counts for expand, attack_opponent and
+        boat_attack alike."""
         is_boat = (action_type == BOAT_ATTACK_IDX).float()
         is_attack = (action_type == ATTACK_OPPONENT_IDX).float()
-        return (
+        log_prob = (
             type_dist.log_prob(action_type)
             + is_boat * tile_dist.log_prob(tile_idx)
             + is_attack * player_dist.log_prob(player_idx)
         )
+        if frac_dist is not None:
+            log_prob = log_prob + ActorCritic._is_sized(action_type) * frac_dist.log_prob(frac_idx)
+        return log_prob
+
+    @staticmethod
+    def _is_sized(action_type: torch.Tensor) -> torch.Tensor:
+        """1.0 where the action type sends troops (and so reads attack_frac_idx)."""
+        return (
+            (action_type == EXPAND_IDX) | (action_type == ATTACK_OPPONENT_IDX) | (action_type == BOAT_ATTACK_IDX)
+        ).float()
 
     def evaluate_actions(
         self,
@@ -323,21 +398,24 @@ class ActorCritic(nn.Module):
         actions: torch.Tensor,
     ):
         """Used during PPO updates: log_prob/entropy of given actions, plus
-        value. actions: (B, 3) int, [action_type, macro_tile_idx,
-        player_idx]."""
+        value. actions: (B, 3 or 4) int, [action_type, macro_tile_idx,
+        player_idx(, attack_frac_idx)] -- slot 3 is read only with the
+        attack-size head."""
         action_type = actions[:, 0]
         tile_idx = actions[:, 1]
         player_idx = actions[:, 2]
-        type_logits, tile_logits, player_logits, value = self.forward(
+        type_logits, tile_logits, player_logits, value, frac_logits = self._heads(
             tile_grid, self_features, opponent_features, opponent_mask,
             tile_target_mask, attack_target_mask, action_mask,
         )
         type_dist = torch.distributions.Categorical(logits=type_logits)
         tile_dist = torch.distributions.Categorical(logits=tile_logits)
         player_dist = torch.distributions.Categorical(logits=player_logits)
+        frac_dist = torch.distributions.Categorical(logits=frac_logits) if frac_logits is not None else None
+        frac_idx = actions[:, 3] if frac_dist is not None else None
 
         log_prob = self._compose_log_prob(
-            action_type, tile_idx, player_idx, type_dist, tile_dist, player_dist
+            action_type, tile_idx, player_idx, type_dist, tile_dist, player_dist, frac_idx, frac_dist
         )
         is_boat = (action_type == BOAT_ATTACK_IDX).float()
         is_attack = (action_type == ATTACK_OPPONENT_IDX).float()
@@ -357,6 +435,11 @@ class ActorCritic(nn.Module):
             tile_entropy = tile_entropy / torch.log(tile_n.clamp_min(2.0))
             player_entropy = player_entropy / torch.log(player_n.clamp_min(2.0))
         entropy = type_dist.entropy() + is_boat * tile_entropy + is_attack * player_entropy
+        if frac_dist is not None:
+            frac_entropy = frac_dist.entropy()
+            if self.param_entropy_norm:
+                frac_entropy = frac_entropy / math.log(NUM_ATTACK_FRACTIONS)
+            entropy = entropy + self._is_sized(action_type) * frac_entropy
         return log_prob, entropy, value
 
     @torch.no_grad()
@@ -385,3 +468,25 @@ class ActorCritic(nn.Module):
         probs = F.softmax(type_logits, dim=-1)
         dist = torch.distributions.Categorical(probs=probs)
         return probs.mean(dim=0), dist.entropy().mean()
+
+    @torch.no_grad()
+    def attack_frac_diagnostics(
+        self,
+        tile_grid: torch.Tensor,
+        self_features: torch.Tensor,
+        opponent_features: torch.Tensor,
+        opponent_mask: torch.Tensor,
+        tile_target_mask: torch.Tensor,
+        attack_target_mask: torch.Tensor,
+        action_mask: torch.Tensor,
+    ):
+        """Mean attack-size probabilities over the batch, (NUM_ATTACK_FRACTIONS,),
+        like type_diagnostics() -- or None with the head off. Averaged over
+        every state, not only those where an attack type is sampled."""
+        frac_logits = self._heads(
+            tile_grid, self_features, opponent_features, opponent_mask,
+            tile_target_mask, attack_target_mask, action_mask,
+        )[4]
+        if frac_logits is None:
+            return None
+        return F.softmax(frac_logits, dim=-1).mean(dim=0)
