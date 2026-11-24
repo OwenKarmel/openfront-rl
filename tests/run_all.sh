@@ -26,6 +26,7 @@ TESTS=(
   smoke_test_multiopp.py
   test_neutral_boats.py
   test_eval_suite.py
+  test_selfplay.py
   test_expand_mask.py
   test_boat_mask.py
   test_reward_modes.py

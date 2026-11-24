@@ -38,6 +38,7 @@ import {
   Turn,
   Winner,
 } from "../../OpenFrontIO/src/core/Schemas";
+import { getSpawnTiles } from "../../OpenFrontIO/src/core/execution/Util";
 import { simpleHash } from "../../OpenFrontIO/src/core/Util";
 import { createPartialGameRecord } from "../../OpenFrontIO/src/core/Util";
 import { NodeGameMapLoader } from "../../OpenFrontIO/tests/perf/fullgame/NodeGameMapLoader";
@@ -57,6 +58,37 @@ const PRODUCTION_MAPS_DIR = path.join(
 // PseudoRandom.nextID() returns feeds determinism — see wireGameID below),
 // so a fixed constant is fine.
 export const AGENT_CLIENT_ID = "AGENTAAA";
+/**
+ * OPPONENT's wire clientID in a self-play episode (opponentKind "policy"),
+ * where it is a second Human player steered from Python instead of a
+ * Nation AI. Same 8-alphanumeric constraint as AGENT_CLIENT_ID.
+ */
+export const OPPONENT_CLIENT_ID = "OPPONENT";
+
+/**
+ * Who plays OPPONENT:
+ *   - "nation" (default): a built-in Nation AI (NationExecution) at the
+ *     episode's difficulty -- the "expert" opponent every run before
+ *     self-play used, construction unchanged.
+ *   - "policy": a second Human player (OPPONENT_CLIENT_ID) whose intents the
+ *     client sends every step, i.e. a copy of the learning policy. Humans get
+ *     the base economy (Config.ts: startManpower 25k, maxTroops x1 -- what
+ *     the Nation AI gets at Hard), so both seats play under the same rules.
+ */
+export const OPPONENT_KINDS = ["nation", "policy"] as const;
+export type OpponentKind = (typeof OPPONENT_KINDS)[number];
+
+/**
+ * One player's point of view: whose territory is "self", which clientID its
+ * intents are stamped with, and who its opponents are. Every observation,
+ * legality check, intent and reward in EnvServer.ts is computed for a Seat,
+ * so the same code serves AGENT and (in self-play) OPPONENT.
+ */
+export interface Seat {
+  selfId: string;
+  clientID: string;
+  opponentIds: string[];
+}
 
 /**
  * How many Nation-AI opponents each episode is built with. Must stay <=
@@ -200,6 +232,8 @@ export class Episode {
    * play N opponents. Currently always length 1 -- see NUM_NATIONS.
    */
   opponentIds: string[];
+  /** See OpponentKind. */
+  opponentKind: OpponentKind;
   lastHash: HashUpdate | undefined;
   lastWinner: Winner | undefined;
   fatalError: string | undefined;
@@ -216,6 +250,7 @@ export class Episode {
     gameConfig: GameConfig,
     agentId: string,
     opponentIds: string[],
+    opponentKind: OpponentKind,
   ) {
     this.runner = runner;
     this.game = runner.game;
@@ -223,6 +258,21 @@ export class Episode {
     this.gameConfig = gameConfig;
     this.agentId = agentId;
     this.opponentIds = opponentIds;
+    this.opponentKind = opponentKind;
+  }
+
+  /** AGENT's point of view -- the seat rewards and `winner` are scored for. */
+  agentSeat(): Seat {
+    return { selfId: this.agentId, clientID: AGENT_CLIENT_ID, opponentIds: this.opponentIds };
+  }
+
+  /** OPPONENT's point of view; only defined in self-play, where OPPONENT is
+   * the one other player and AGENT is its one opponent. */
+  opponentSeat(): Seat {
+    if (this.opponentKind !== "policy") {
+      throw new Error("opponentSeat() is only defined for a self-play (opponentKind policy) episode");
+    }
+    return { selfId: this.opponentIds[0], clientID: OPPONENT_CLIENT_ID, opponentIds: [this.agentId] };
   }
 
   /**
@@ -243,8 +293,10 @@ export class Episode {
     mapName: string,
     seed: string,
     difficulty: Difficulty,
+    opponentKind: OpponentKind,
   ): Promise<Episode> {
     const gameID = wireGameID(seed);
+    const selfPlay = opponentKind === "policy";
     const { gameMap, miniGameMap, nations, additionalNations, gameMapType } =
       await resolveMap(mapName);
 
@@ -261,8 +313,9 @@ export class Episode {
       difficulty,
       // Numeric, not "default": exactly NUM_NATIONS Nation-AI opponents,
       // drawn (deterministically, given the seed) from the map's real
-      // manifest nations by createNationsForGame below.
-      nations: NUM_NATIONS,
+      // manifest nations by createNationsForGame below. None in self-play,
+      // where OPPONENT is the second human in gameStart.players instead.
+      nations: selfPlay ? "disabled" : NUM_NATIONS,
       donateGold: false,
       donateTroops: false,
       bots: 0,
@@ -282,6 +335,9 @@ export class Episode {
           username: "Agent",
           clanTag: null,
         },
+        ...(selfPlay
+          ? [{ clientID: OPPONENT_CLIENT_ID, username: "Opponent", clanTag: null }]
+          : []),
       ],
     };
 
@@ -308,7 +364,9 @@ export class Episode {
     const config = new Config(gameConfig, null, false);
     const game = createGame(humans, nationList, gameMap, miniGameMap, config);
     const agentId = humans[0].id;
-    const opponentIds = game.nations().map((n) => n.playerInfo.id);
+    const opponentIds = selfPlay
+      ? humans.slice(1).map((h) => h.id)
+      : game.nations().map((n) => n.playerInfo.id);
 
     const episode = new Episode(
       new GameRunner(game, new Executor(game, gameID, undefined), (gu) => {
@@ -325,6 +383,7 @@ export class Episode {
       gameConfig,
       agentId,
       opponentIds,
+      opponentKind,
     );
     episode.runner.init();
     return episode;
@@ -334,9 +393,24 @@ export class Episode {
     mapName: string,
     seed: string,
     difficulty: Difficulty,
+    opponentKind: OpponentKind = "nation",
   ): Promise<Episode> {
-    const episode = await Episode.build(mapName, seed, difficulty);
-    const game = episode.game;
+    const episode = await Episode.build(mapName, seed, difficulty, opponentKind);
+    if (opponentKind === "policy") {
+      episode.spawnBothHumans(mapName);
+    } else {
+      episode.spawnAgent(mapName);
+    }
+    episode.finishSpawnPhase();
+    return episode;
+  }
+
+  /**
+   * The Nation-AI episode's spawn: AGENT alone (the Nation spawns itself).
+   */
+  private spawnAgent(mapName: string): void {
+    const episode = this;
+    const game = this.game;
 
     // AGENT spawns at a uniformly random point on the map (snapped to the
     // nearest land tile) -- previously a fixed point (15% across, 50%
@@ -377,6 +451,63 @@ export class Episode {
         `AGENT failed to spawn on map ${mapName} after ${MAX_SPAWN_ATTEMPTS} random attempts`,
       );
     }
+  }
+
+  /**
+   * The self-play episode's spawn: AGENT and OPPONENT, both humans, at
+   * independent uniformly random land points.
+   *
+   * Both intents go in ONE turn, unlike spawnAgent()'s retry-until-it-takes
+   * loop. In Singleplayer the first human spawn ends the spawn phase
+   * (SpawnExecution.tick() calls endSpawnPhase()), and a spawn intent is only
+   * honoured if it was queued while the phase was still on -- so a second
+   * human issued on a later turn would be silently ignored. Two intents
+   * queued in the same turn are both initialised during the phase and both
+   * land. The retry therefore happens BEFORE sending, on the same predicate
+   * SpawnExecution uses for an explicit tile (getSpawnTiles(..., false)
+   * non-empty), and the two picks are kept minDistanceBetweenPlayers() apart
+   * (the engine's own random-spawn spacing) so neither spawn's radius-4 blob
+   * eats the other's.
+   *
+   * AGENT's draw sequence is the same PRNG stream spawnAgent() uses; the
+   * opponent gets its own stream, so neither shifts the other.
+   */
+  private spawnBothHumans(mapName: string): void {
+    const game = this.game;
+    const MAX_SPAWN_ATTEMPTS = 200;
+    const pick = (stream: string, avoid: number | null): number => {
+      const rng = new PseudoRandom(simpleHash(`${this.wireGameID()}:${stream}`));
+      for (let attempt = 0; attempt < MAX_SPAWN_ATTEMPTS; attempt++) {
+        const tile = findLandTile(game, rng.nextInt(0, game.width()), rng.nextInt(0, game.height()));
+        if (getSpawnTiles(game, tile, false).length === 0) continue;
+        if (avoid !== null && game.manhattanDist(avoid, tile) < game.config().minDistanceBetweenPlayers()) {
+          continue;
+        }
+        return tile;
+      }
+      throw new Error(`no valid ${stream} tile on map ${mapName} after ${MAX_SPAWN_ATTEMPTS} attempts`);
+    };
+    const agentTile = pick("agentSpawn", null);
+    const opponentTile = pick("opponentSpawn", agentTile);
+    this.runTick([
+      { type: "spawn", tile: agentTile, clientID: AGENT_CLIENT_ID },
+      { type: "spawn", tile: opponentTile, clientID: OPPONENT_CLIENT_ID },
+    ]);
+    // Intents are initialised at the end of the tick they arrive on and run
+    // on the next one (GameImpl.executeNextTick()), so the spawns land one
+    // tick later.
+    this.runTick();
+    for (const clientID of [AGENT_CLIENT_ID, OPPONENT_CLIENT_ID]) {
+      const p = game.playerByClientID(clientID);
+      if (!p || p.numTilesOwned() === 0) {
+        throw new Error(`${clientID} failed to spawn on map ${mapName}`);
+      }
+    }
+  }
+
+  /** Plays out whatever is left of the spawn phase. */
+  private finishSpawnPhase(): void {
+    const episode = this;
 
     // Real numSpawnPhaseTurns() (100 for Singleplayer) — not shortened.
     // Nothing strategic happens during it beyond idle waiting (EnvServer.ts
@@ -392,8 +523,6 @@ export class Episode {
       }
       episode.runTick();
     }
-
-    return episode;
   }
 
   /** Advances one tick, applying the given intents this turn. Throws on a fatal sim error. */
@@ -427,10 +556,16 @@ export class Episode {
   }
 
   isDone(): boolean {
-    return (
-      this.lastWinner !== undefined ||
-      !this.game.players().some((p) => p.isAlive())
-    );
+    if (this.lastWinner !== undefined) return true;
+    // Self-play ends at the first elimination. Against a Nation AI the game
+    // reliably reaches the engine's 80% win check after AGENT dies, because
+    // the Nation keeps expanding; a frozen policy snapshot need not, and
+    // would leave AGENT's seat stepping a dead player until the 170-minute
+    // hard limit. EnvServer.ts's resolveWinner() scores this by survival.
+    if (this.opponentKind === "policy") {
+      return [this.agentId, ...this.opponentIds].some((id) => !this.game.player(id).isAlive());
+    }
+    return !this.game.players().some((p) => p.isAlive());
   }
 
   /**
@@ -447,6 +582,9 @@ export class Episode {
    * `npm run replay:game`.
    */
   toGameRecord(): GameRecord {
+    // Must list the same humans, in the same order, as build()'s
+    // gameStart.players -- a replay rebuilds the players (and their PRNG-drawn
+    // ids) from this list.
     const players: PlayerRecord[] = [
       {
         clientID: AGENT_CLIENT_ID,
@@ -455,6 +593,9 @@ export class Episode {
         persistentID: null,
         stats: {},
       },
+      ...(this.opponentKind === "policy"
+        ? [{ clientID: OPPONENT_CLIENT_ID, username: "Opponent", clanTag: null, persistentID: null, stats: {} }]
+        : []),
     ];
     const partial = createPartialGameRecord(
       this.gameID,

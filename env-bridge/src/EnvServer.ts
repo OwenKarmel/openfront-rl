@@ -8,7 +8,9 @@
  * built-in Nation-AI (NationExecution — the same code driving Nation bots in
  * production games, difficulty selectable per episode, drawn from the map's
  * real manifest — see GameSetup.ts) making its own decisions every tick.
- * There is nothing to send opponents actions for.
+ * There is nothing to send opponents actions for -- except in self-play
+ * (`opponentKind` "policy", below), where OPPONENT is a second controlled
+ * player.
  *
  * Opponents are reported as a fixed-width, masked ARRAY of MAX_OPPONENTS
  * slots rather than one singular OPPONENT block, so neither the wire format
@@ -62,6 +64,20 @@
  * -- see shapePotential(). 0 is the original linear tile-share delta,
  * bit-identically. Echoed on reset for the same reason as `rewardMode`.
  *
+ * `opponentKind` (optional, on reset; default "nation") picks who plays
+ * OPPONENT -- see OPPONENT_KINDS in GameSetup.ts. "nation" is the built-in
+ * Nation AI, exactly as before the option existed. "policy" is self-play:
+ * OPPONENT is a second Human player, and then
+ *   - every step MUST carry `opponentAction`, OPPONENT's intent for the same
+ *     tick, in the same shape as AGENT's
+ *     ({"action":...,"macroX":..,"macroY":..,"playerIdx":..});
+ *   - every reset/step reply carries `opponent: {obs, legalActions}`, the
+ *     observation and legality from OPPONENT's own seat (its territory is
+ *     class 1, AGENT's is class 2, AGENT is its opponent slot 0) -- the same
+ *     encoding AGENT gets, so one network can play either seat.
+ * Reward and `winner` are always AGENT's. The reset reply echoes
+ * `opponentKind` for the same fail-fast reason as `rewardMode`.
+ *
  * `envFlags` (reset reply only) reports which of the env-var gated
  * behaviours this process is running with -- OPENFRONT_EXPAND_MASK,
  * OPENFRONT_BOAT_MASK, OPENFRONT_NEUTRAL_BOATS. They are read once at
@@ -82,7 +98,14 @@ import readline from "readline";
 import { Difficulty, Game, Player, UnitType } from "../../OpenFrontIO/src/core/game/Game";
 import { targetTransportTile } from "../../OpenFrontIO/src/core/game/TransportShipUtils";
 import { StampedIntent } from "../../OpenFrontIO/src/core/Schemas";
-import { AGENT_CLIENT_ID, Episode, NUM_NATIONS } from "./GameSetup";
+import {
+  AGENT_CLIENT_ID,
+  Episode,
+  NUM_NATIONS,
+  OPPONENT_KINDS,
+  OpponentKind,
+  Seat,
+} from "./GameSetup";
 
 // boat_attack's target macro-cell is a cheap heuristic (see
 // tileGridAndBoatMask() below), not the real canBuildTransportShip check --
@@ -206,9 +229,11 @@ interface ResetCmd {
   dumpGameRecordDir?: string;
   rewardMode?: string;
   potentialBeta?: number;
+  opponentKind?: string;
 }
-interface StepCmd {
-  cmd: "step";
+/** One player's choice for a step -- AGENT's lives at the top level of
+ * StepCmd, OPPONENT's (self-play only) under StepCmd.opponentAction. */
+interface ActionChoice {
   action: Action;
   // Only meaningful (and required) when action === "boat_attack": a cell in
   // the MACRO_GRID x MACRO_GRID grid, translated to a real tile server-side
@@ -220,10 +245,24 @@ interface StepCmd {
   // reports (so the network's pointer head and this share one indexing).
   playerIdx?: number;
 }
+interface StepCmd extends ActionChoice {
+  cmd: "step";
+  /** Required iff the episode's opponentKind is "policy". */
+  opponentAction?: ActionChoice;
+}
 interface CloseCmd {
   cmd: "close";
 }
 type Cmd = ResetCmd | StepCmd | CloseCmd;
+
+function parseOpponentKind(name: string | undefined): OpponentKind {
+  if (name === undefined) return "nation";
+  const kind = OPPONENT_KINDS.find((k) => k === name);
+  if (kind === undefined) {
+    throw new Error(`unknown opponentKind "${name}": expected one of ${OPPONENT_KINDS.join(", ")}`);
+  }
+  return kind;
+}
 
 function parseDifficulty(name: string | undefined): Difficulty {
   if (name === undefined) return Difficulty.Medium;
@@ -281,10 +320,10 @@ function player(game: Game, playerId: string): Player {
   return game.player(playerId);
 }
 
-/** Every opponent AGENT is still contesting — used wherever "is this tile/
- * player hostile" is asked, so no call site assumes exactly one. */
-function opponents(episode: Episode): Player[] {
-  return episode.opponentIds.map((id) => player(episode.game, id));
+/** Every opponent the seat is still contesting — used wherever "is this
+ * tile/player hostile" is asked, so no call site assumes exactly one. */
+function opponents(episode: Episode, seat: Seat): Player[] {
+  return seat.opponentIds.map((id) => player(episode.game, id));
 }
 
 /**
@@ -317,12 +356,12 @@ function opponents(episode: Episode): Player[] {
  * base64 string decodes via one C-level call on both ends instead of
  * parsing hundreds of thousands of JSON tokens.
  */
-function tileGridAndBoatMask(episode: Episode): { grid: Uint8Array; boatMask: Uint8Array } {
+function tileGridAndBoatMask(episode: Episode, seat: Seat): { grid: Uint8Array; boatMask: Uint8Array } {
   const game = episode.game;
   const map = game.map();
   const w = game.width();
   const h = game.height();
-  const agent = player(game, episode.agentId);
+  const agent = player(game, seat.selfId);
   const grid = new Uint8Array(w * h);
   const boatMask = new Uint8Array(Math.ceil((MACRO_GRID * MACRO_GRID) / 8));
   for (let y = 0; y < h; y++) {
@@ -406,12 +445,12 @@ function tileGridAndBoatMask(episode: Episode): { grid: Uint8Array; boatMask: Ui
  * "legal". Returns null if the macro-cell truly has no such tile
  * (stale/false heuristic pick) or no real reachable shore near it.
  */
-function resolveBoatTarget(episode: Episode, macroX: number, macroY: number): number | null {
+function resolveBoatTarget(episode: Episode, seat: Seat, macroX: number, macroY: number): number | null {
   const game = episode.game;
   const map = game.map();
   const w = game.width();
   const h = game.height();
-  const agent = player(game, episode.agentId);
+  const agent = player(game, seat.selfId);
   // Cell bounds. tileGridAndBoatMask() puts tile x in cell floor(x*G/w), so
   // cell mx is exactly [ceil(mx*w/G), ceil((mx+1)*w/G)). The legacy bounds
   // floor both ends instead: on a map whose size is not a multiple of G
@@ -472,10 +511,10 @@ interface OpponentBlock {
  * legalActions(), since both need it and sharesBorderWith() is the
  * expensive part (it walks AGENT's border tiles, once per opponent).
  */
-function opponentBlock(episode: Episode): OpponentBlock {
+function opponentBlock(episode: Episode, seat: Seat): OpponentBlock {
   const game = episode.game;
-  const agent = player(game, episode.agentId);
-  const live = opponents(episode);
+  const agent = player(game, seat.selfId);
+  const live = opponents(episode, seat);
   const list: OpponentObs[] = [];
   const opponentMask: boolean[] = [];
   const attackTargetMask: boolean[] = [];
@@ -500,6 +539,7 @@ function opponentBlock(episode: Episode): OpponentBlock {
 
 function observation(
   episode: Episode,
+  seat: Seat,
   width: number,
   height: number,
   grid: Uint8Array,
@@ -512,7 +552,7 @@ function observation(
     // Base64 of the raw Uint8Array bytes -- see tileGridAndBoatMask()'s comment.
     tileGridB64: Buffer.from(grid.buffer).toString("base64"),
     boatTargetMacroMaskB64: Buffer.from(boatMask.buffer).toString("base64"),
-    self: playerObs(episode.game, player(episode.game, episode.agentId)),
+    self: playerObs(episode.game, player(episode.game, seat.selfId)),
     // Plain JSON arrays, not base64: MAX_OPPONENTS is small (single digits
     // to low tens), so this is a handful of objects per line -- nothing like
     // the w*h tile grid that forced a packed encoding.
@@ -598,9 +638,9 @@ function isNeutralBoatTarget(game: Game, ref: number): boolean {
  * early-out rather than the engine's Array.from(...).some(...), to avoid
  * materialising the whole border set every step.
  */
-function hasShore(episode: Episode): boolean {
+function hasShore(episode: Episode, seat: Seat): boolean {
   const game = episode.game;
-  const agent = player(game, episode.agentId);
+  const agent = player(game, seat.selfId);
   let found = false;
   agent.borderTiles().forEach((tile) => {
     if (found) return;
@@ -638,10 +678,10 @@ function hasShore(episode: Episode): boolean {
  * the engine's own long-game profiles). Negligible next to the full w*h
  * tile_grid scan tileGridAndBoatMask() already does every step.
  */
-function canExpand(episode: Episode): boolean {
+function canExpand(episode: Episode, seat: Seat): boolean {
   const game = episode.game;
   const map = game.map();
-  const agent = player(game, episode.agentId);
+  const agent = player(game, seat.selfId);
   const nbuf: number[] = [0, 0, 0, 0];
   let found = false;
   agent.borderTiles().forEach((tile) => {
@@ -659,12 +699,12 @@ function canExpand(episode: Episode): boolean {
   return found;
 }
 
-function legalActions(episode: Episode, boatMask: Uint8Array, block: OpponentBlock): Action[] {
-  const agent = player(episode.game, episode.agentId);
+function legalActions(episode: Episode, seat: Seat, boatMask: Uint8Array, block: OpponentBlock): Action[] {
+  const agent = player(episode.game, seat.selfId);
   if (!agent.isAlive()) return ["noop"];
   if (episode.game.inSpawnPhase()) return ["noop"];
   const actions: Action[] = ["noop"];
-  if (!EXPAND_MASK_ENABLED || canExpand(episode)) {
+  if (!EXPAND_MASK_ENABLED || canExpand(episode, seat)) {
     actions.push("expand");
   }
   if (block.attackTargetMask.some((legal) => legal)) {
@@ -673,7 +713,7 @@ function legalActions(episode: Episode, boatMask: Uint8Array, block: OpponentBlo
   if (
     agent.unitCount(UnitType.TransportShip) < episode.game.config().boatMaxNumber() &&
     boatMask.some((byte) => byte !== 0) &&
-    (!BOAT_MASK_ENABLED || hasShore(episode))
+    (!BOAT_MASK_ENABLED || hasShore(episode, seat))
   ) {
     actions.push("boat_attack");
   }
@@ -790,19 +830,14 @@ function resolveWinner(episode: Episode): "AGENT" | "OPPONENT" | null {
   // No declared winner -- the game ended by elimination instead (or every
   // player died). Fall back to survival.
   const agentAlive = player(episode.game, episode.agentId).isAlive();
-  const anyOpponentAlive = opponents(episode).some((o) => o.isAlive());
+  const anyOpponentAlive = opponents(episode, episode.agentSeat()).some((o) => o.isAlive());
   if (agentAlive && !anyOpponentAlive) return "AGENT";
   if (!agentAlive && anyOpponentAlive) return "OPPONENT";
   return null;
 }
 
-function intentFor(
-  action: Action,
-  episode: Episode,
-  macroX: number | undefined,
-  macroY: number | undefined,
-  playerIdx: number | undefined,
-): StampedIntent | null {
+function intentFor(episode: Episode, seat: Seat, choice: ActionChoice): StampedIntent | null {
+  const { action, macroX, macroY, playerIdx } = choice;
   switch (action) {
     case "noop":
       return null;
@@ -811,7 +846,7 @@ function intentFor(
         type: "attack",
         targetID: null,
         troops: null,
-        clientID: AGENT_CLIENT_ID,
+        clientID: seat.clientID,
       };
     case "attack_opponent": {
       if (playerIdx === undefined) {
@@ -822,18 +857,18 @@ function intentFor(
       // so a slot outside the episode's real opponents means the caller
       // ignored the mask -- a protocol bug worth surfacing, not an
       // expected miss to swallow as a no-op.
-      const targetID = episode.opponentIds[playerIdx];
+      const targetID = seat.opponentIds[playerIdx];
       if (targetID === undefined) {
         throw new Error(
           `attack_opponent playerIdx ${playerIdx} is not a real opponent ` +
-            `(episode has ${episode.opponentIds.length})`,
+            `(episode has ${seat.opponentIds.length})`,
         );
       }
       return {
         type: "attack",
         targetID,
         troops: null,
-        clientID: AGENT_CLIENT_ID,
+        clientID: seat.clientID,
       };
     }
     case "boat_attack": {
@@ -851,14 +886,14 @@ function intentFor(
       // (like "noop") rather than throwing, consistent with the rest of
       // this module's stance on unreachable boat picks. Logged (not
       // silenced) so a persistently high rate would still be visible.
-      const dst = resolveBoatTarget(episode, macroX, macroY);
+      const dst = resolveBoatTarget(episode, seat, macroX, macroY);
       if (dst === null) {
         console.warn(
           `boat_attack macro-cell (${macroX},${macroY}) has no verified target -- treating as noop`,
         );
         return null;
       }
-      const agent = player(episode.game, episode.agentId);
+      const agent = player(episode.game, seat.selfId);
       const owner = episode.game.owner(dst);
       // Unlike AttackIntent, BoatAttackIntent.troops is a required
       // (non-nullable) float on the wire schema -- boatAttackAmount() is the
@@ -868,7 +903,7 @@ function intentFor(
         type: "boat",
         troops,
         dst,
-        clientID: AGENT_CLIENT_ID,
+        clientID: seat.clientID,
       };
     }
   }
@@ -892,24 +927,25 @@ class Session {
     // Parsed before building the episode, so a bad mode fails fast.
     this.rewardMode = parseRewardMode(cmd.rewardMode);
     this.potentialBeta = parsePotentialBeta(cmd.potentialBeta);
+    const opponentKind = parseOpponentKind(cmd.opponentKind);
     this.episode = await Episode.create(
       cmd.map,
       cmd.seed,
       parseDifficulty(cmd.difficulty),
+      opponentKind,
     );
     this.width = this.episode.game.width();
     this.height = this.episode.game.height();
     this.ticksPerStep = cmd.ticksPerStep ?? 10;
     this.dumpGameRecordDir = cmd.dumpGameRecordDir;
     this.prevPotential = potential(this.episode, this.potentialBeta);
-    const { grid, boatMask } = tileGridAndBoatMask(this.episode);
-    const block = opponentBlock(this.episode);
     return {
-      obs: observation(this.episode, this.width, this.height, grid, boatMask, block),
-      legalActions: legalActions(this.episode, boatMask, block),
+      ...this.seatView(this.episode, this.episode.agentSeat()),
+      ...this.opponentView(this.episode),
       done: this.episode.isDone(),
       rewardMode: this.rewardMode,
       potentialBeta: this.potentialBeta,
+      opponentKind,
       envFlags: {
         expandMask: EXPAND_MASK_ENABLED,
         boatMask: BOAT_MASK_ENABLED,
@@ -922,8 +958,21 @@ class Session {
     if (!this.episode) throw new Error("step called before reset");
     const episode = this.episode;
 
-    const intent = intentFor(cmd.action, episode, cmd.macroX, cmd.macroY, cmd.playerIdx);
-    const intents: StampedIntent[] = intent ? [intent] : [];
+    const intents: StampedIntent[] = [];
+    const intent = intentFor(episode, episode.agentSeat(), cmd);
+    if (intent) intents.push(intent);
+    if (episode.opponentKind === "policy") {
+      if (cmd.opponentAction === undefined) {
+        throw new Error("self-play episode: step needs opponentAction");
+      }
+      // Stamped after AGENT's in the same turn. Order within a turn is the
+      // order executions are created and ticked, so AGENT's intent always
+      // goes first on a tick where both act -- a small fixed seat asymmetry.
+      const oppIntent = intentFor(episode, episode.opponentSeat(), cmd.opponentAction);
+      if (oppIntent) intents.push(oppIntent);
+    } else if (cmd.opponentAction !== undefined) {
+      throw new Error("opponentAction sent to a Nation-AI episode, which has no seat to apply it to");
+    }
 
     let done = false;
     for (let i = 0; i < this.ticksPerStep; i++) {
@@ -961,15 +1010,30 @@ class Session {
 
     if (done) this.flushRecord();
 
-    const { grid, boatMask } = tileGridAndBoatMask(episode);
-    const block = opponentBlock(episode);
     return {
-      obs: observation(episode, this.width, this.height, grid, boatMask, block),
+      ...this.seatView(episode, episode.agentSeat()),
+      ...this.opponentView(episode),
       reward,
       done,
-      legalActions: legalActions(episode, boatMask, block),
       info: { ticks: episode.game.ticks(), winner },
     };
+  }
+
+  /** A seat's observation and legal actions -- what a policy acts on. */
+  private seatView(episode: Episode, seat: Seat): { obs: object; legalActions: Action[] } {
+    const { grid, boatMask } = tileGridAndBoatMask(episode, seat);
+    const block = opponentBlock(episode, seat);
+    return {
+      obs: observation(episode, seat, this.width, this.height, grid, boatMask, block),
+      legalActions: legalActions(episode, seat, boatMask, block),
+    };
+  }
+
+  /** `{opponent: seatView}` in self-play, nothing otherwise -- so a Nation-AI
+   * reply carries exactly the fields it did before self-play existed. */
+  private opponentView(episode: Episode): { opponent?: object } {
+    if (episode.opponentKind !== "policy") return {};
+    return { opponent: this.seatView(episode, episode.opponentSeat()) };
   }
 
   /**

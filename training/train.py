@@ -46,6 +46,7 @@ from envs.openfront_env import (
 from envs.vector_env import VecEnv
 from models.network import ActorCritic
 from ppo import RolloutBuffer, ppo_update
+from selfplay import POOL_FILENAME, OpponentChooser, OpponentPool, opponent_actions, parse_expert_frac
 
 # Every observation field the network consumes, stacked across envs. Kept as
 # one dict rather than a tuple of parallel locals: the network takes seven
@@ -281,6 +282,28 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--promote-threshold", type=float, default=0.75,
         help="eval-suite win rate at which the curriculum promotes to its next stage",
+    )
+    p.add_argument(
+        "--expert-frac", default="1",
+        help="probability that a training episode's opponent is the EXPERT -- the Nation AI at "
+             "the curriculum stage's difficulty -- rather than a self-play copy of the agent "
+             "(see selfplay.py). One number for every stage, or a comma-separated list with one "
+             "entry per stage of --curriculum's ladder, so the mix can follow the curriculum. "
+             "1 (default) is all-expert: no self-play, identical to before this option existed. "
+             "Eval suites and promotion are always against the Nation AI",
+    )
+    p.add_argument(
+        "--selfplay-pool-size", type=int, default=20,
+        help="frozen snapshots of the agent kept as self-play opponents (oldest dropped first)",
+    )
+    p.add_argument(
+        "--selfplay-snapshot-every", type=int, default=20,
+        help="updates between snapshots added to the self-play pool",
+    )
+    p.add_argument(
+        "--selfplay-latest-prob", type=float, default=0.5,
+        help="probability a self-play episode's opponent is the live network rather than a "
+             "uniformly drawn snapshot from the pool (always the live one while the pool is empty)",
     )
     p.add_argument("--checkpoint-dir", default=str(Path(__file__).parent / "checkpoints"))
     p.add_argument("--checkpoint-every", type=int, default=20, help="updates between checkpoints")
@@ -650,6 +673,15 @@ def main() -> None:
         sys.exit("--eval-episodes and --eval-envs must be at least 1")
     if not 0.0 < args.promote_threshold <= 1.0:
         sys.exit("--promote-threshold must lie in (0, 1]")
+    try:
+        args.expert_fracs = parse_expert_frac(args.expert_frac, len(LADDERS[args.curriculum]))
+    except ValueError as e:
+        sys.exit(str(e))
+    selfplay = any(f < 1.0 for f in args.expert_fracs)
+    if args.selfplay_pool_size < 1 or args.selfplay_snapshot_every < 1:
+        sys.exit("--selfplay-pool-size and --selfplay-snapshot-every must be at least 1")
+    if not 0.0 <= args.selfplay_latest_prob <= 1.0:
+        sys.exit("--selfplay-latest-prob must lie in [0, 1]")
     if args.eval_difficulties != "current":
         unknown = set(args.eval_difficulties.split(",")) - set(DIFFICULTIES)
         if unknown:
@@ -671,6 +703,14 @@ def main() -> None:
     flags = " ".join(f"{var}={int(on)}" for var, on in requested_env_flags().items())
     print(f"env flags: {flags}")
     ladder = " -> ".join(f"{s.difficulty}/{maps_label(args, s.maps)}" for s in LADDERS[args.curriculum])
+    if selfplay:
+        mix = ", ".join(f"{s.difficulty}/{maps_label(args, s.maps)}={f:g}"
+                        for s, f in zip(LADDERS[args.curriculum], args.expert_fracs))
+        print(f"self-play: expert (Nation AI) fraction per stage [{mix}]; pool of "
+              f"{args.selfplay_pool_size} snapshots every {args.selfplay_snapshot_every} updates, "
+              f"live-network opponent prob {args.selfplay_latest_prob}")
+    else:
+        print("self-play: off (every training episode is against the Nation AI)")
     print(f"curriculum {args.curriculum}: {ladder}; promote at sampled eval win rate >= {args.promote_threshold} "
           f"over {args.eval_episodes} fixed-seed episodes")
     if args.gamma_start is not None or args.rollout_match_horizon:
@@ -715,12 +755,30 @@ def main() -> None:
         print(f"resumed from {latest_path} at update {start_update}, difficulty={scheduler.difficulty} "
               f"maps={maps_label(args, scheduler.maps)}")
 
+    # The self-play pool lives beside latest.pt, not inside it, so tools that
+    # only read the policy (eval_checkpoint.py, the tests) never load it.
+    pool_path = checkpoint_dir / POOL_FILENAME
+    if pool_path.exists() and not selfplay:
+        # Hyperparameters are not in checkpoints (see README): a self-play run
+        # resumed without its --expert-frac would silently go all-expert.
+        sys.exit(f"{pool_path} exists, so this run trained with self-play, but --expert-frac is all 1 "
+                 f"here. Resume it via its launcher, or archive it and start a new run.")
+    pool = OpponentPool(
+        make_net=lambda: ActorCritic(param_entropy_norm=args.param_entropy_norm, tile_head=args.tile_head),
+        device=device, max_size=args.selfplay_pool_size, latest_prob=args.selfplay_latest_prob,
+    )
+    if selfplay and pool_path.exists():
+        pool.load(pool_path)
+        print(f"  self-play pool: {len(pool)} snapshots (updates {pool.keys()}) from {pool_path}")
+    chooser = OpponentChooser(args.expert_fracs, lambda: scheduler._index, pool, args.num_envs)
+
     # Built after the checkpoint so the envs start on the resumed stage.
     vec_env = VecEnv(
         [
             (lambda i=i: make_env(args, scheduler.difficulty, seed_prefix=f"train-{i}", maps=scheduler.maps))
             for i in range(args.num_envs)
-        ]
+        ],
+        before_reset=chooser if selfplay else None,
     )
 
     # First-time-beats-{medium,hard,impossible} and first-reaches-{20,40,60}%
@@ -735,6 +793,7 @@ def main() -> None:
         "value_loss", "entropy", "approx_kl", "stopped_early", "episodes", "seconds",
         "type_entropy", *[f"type_prob_{a}" for a in ACTIONS], "gamma", "rollout_length",
         "reward_mode", "potential_beta", "maps", "param_entropy_norm", "tile_head",
+        "expert_frac", "selfplay_episodes", "selfplay_win_rate", "selfplay_pool_size",
     ]
     log_is_new = not log_path.exists() or log_path.stat().st_size == 0
     if not log_is_new:
@@ -763,6 +822,9 @@ def main() -> None:
             if "param_entropy_norm" in dropped and args.param_entropy_norm:
                 sys.exit(f"refusing to run --param-entropy-norm into {log_path}, "
                          f"which cannot record it -- pass a new --log-csv")
+            if "selfplay_episodes" in dropped and selfplay:
+                sys.exit(f"refusing to run self-play (--expert-frac {args.expert_frac}) into {log_path}, "
+                         f"which cannot record it -- pass a new --log-csv")
             if "maps" in dropped and args.curriculum != "difficulty":
                 sys.exit(f"refusing to run curriculum {args.curriculum!r}, whose stages change the map "
                          f"pool, into {log_path}, which cannot record it -- pass a new --log-csv")
@@ -783,9 +845,9 @@ def main() -> None:
         "peak_territory_frac", "final_territory_frac",
     ])
 
-    obs_list, info_list = vec_env.reset()
+    obs_list, infos = vec_env.reset()
     batch = obs_to_batch(obs_list)
-    action_mask = mask_batch(info_list)
+    action_mask = mask_batch(infos)
 
     update_iter = range(start_update, args.updates) if args.updates > 0 else itertools.count(start_update)
     steps_done = steps_before(start_update, args)
@@ -794,14 +856,23 @@ def main() -> None:
         gamma = gamma_at(update, args)
         rollout_length = rollout_at(update, args)
         buffer = RolloutBuffer()
-        episode_outcomes: list[bool] = []  # True = AGENT won
+        # True = AGENT won. Split by opponent: `episode_outcomes` (and the
+        # logged win_rate/episodes) are Nation-AI episodes only, so they mean
+        # what they meant before self-play existed.
+        episode_outcomes: list[bool] = []
+        selfplay_outcomes: list[bool] = []
         reward_sum = 0.0
 
         for _ in range(rollout_length):
             actions_t, log_probs_t, values_t = net.act(*net_inputs(batch, action_mask, device))
             actions_np = actions_t.cpu().numpy()
+            # From `infos` of the step that produced `batch`: each self-play
+            # slot's own-seat observation of the same state AGENT just saw.
+            opp_actions = (
+                opponent_actions(infos, chooser, net, obs_to_batch, net_inputs, device) if selfplay else None
+            )
 
-            next_obs_list, rewards, terms, truncs, infos = vec_env.step(actions_np)
+            next_obs_list, rewards, terms, truncs, infos = vec_env.step(actions_np, opp_actions)
             dones = terms | truncs
             reward_sum += float(rewards.sum())
 
@@ -822,7 +893,9 @@ def main() -> None:
 
             for info in infos:
                 if "episode_info" in info:
-                    episode_outcomes.append(info["episode_info"]["winner"] == "AGENT")
+                    ep = info["episode_info"]
+                    outcomes = selfplay_outcomes if ep["opponent_kind"] == "policy" else episode_outcomes
+                    outcomes.append(ep["winner"] == "AGENT")
 
             batch = obs_to_batch(next_obs_list)
             action_mask = mask_batch(infos)
@@ -859,7 +932,14 @@ def main() -> None:
         # this buffer's tile_grids alone are ~2.6GB.
         del buffer
 
+        if selfplay and (update + 1) % args.selfplay_snapshot_every == 0:
+            pool.add(update + 1, net)
+            pool.prune_cache(chooser.in_use())
+
         win_rate = (sum(episode_outcomes) / len(episode_outcomes)) if episode_outcomes else float("nan")
+        selfplay_win_rate = (
+            sum(selfplay_outcomes) / len(selfplay_outcomes) if selfplay_outcomes else float("nan")
+        )
         mean_reward = reward_sum / (rollout_length * args.num_envs)
         steps_prev, steps_done = steps_done, steps_done + rollout_length
         elapsed = time.time() - t0
@@ -872,6 +952,8 @@ def main() -> None:
             f"value_loss={stats['value_loss']:.4f} entropy={stats['entropy']:.3f} "
             f"kl={stats['approx_kl']:.4f} gamma={gamma:.4f} T={rollout_length} ({elapsed:.1f}s){early_flag}\n"
             f"  type_probs[{type_probs_str}] type_entropy={type_entropy:.3f}"
+            + (f"\n  self-play: expert_frac={chooser.expert_frac:g} episodes={len(selfplay_outcomes)} "
+               f"win_rate={selfplay_win_rate:.2f} pool={len(pool)}" if selfplay else "")
         )
         log_writer.writerow(
             {
@@ -888,12 +970,18 @@ def main() -> None:
                 "maps": maps_label(args, scheduler.maps),
                 "param_entropy_norm": args.param_entropy_norm,
                 "tile_head": args.tile_head,
+                "expert_frac": chooser.expert_frac,
+                "selfplay_episodes": len(selfplay_outcomes),
+                "selfplay_win_rate": selfplay_win_rate,
+                "selfplay_pool_size": len(pool),
             }
         )
         log_file.flush()
 
         if (update + 1) % args.checkpoint_every == 0:
             save_checkpoint(latest_path, net, optimizer, scheduler, update + 1)
+            if selfplay:
+                pool.save(pool_path)
             print(f"  checkpoint saved: {latest_path}")
 
         if eval_due(update, steps_prev, steps_done, args):
@@ -947,6 +1035,8 @@ def main() -> None:
             )
 
     save_checkpoint(latest_path, net, optimizer, scheduler, args.updates)
+    if selfplay:
+        pool.save(pool_path)
     vec_env.close()
     log_file.close()
     eval_file.close()

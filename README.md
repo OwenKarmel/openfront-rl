@@ -39,14 +39,20 @@ MuZero/EfficientZero, action/observation space, phased milestones).
     without a boat (land attacks stop at water). What picked
     `CONNECTED_MAPS`; see [Curriculum and evaluation](#curriculum-and-evaluation).
 - `tests/` — every test for this project's own code (OpenFrontIO's own suite
-  stays upstream). Plain scripts, no pytest; `tests/run_all.sh` runs all thirteen
+  stays upstream). Plain scripts, no pytest; `tests/run_all.sh` runs all fourteen
   sequentially in ~15 min. See `tests/README.md` for what each covers, which
   need a live env-bridge, and why the policy-driven ones pin a fixed archived
   checkpoint rather than `latest.pt`.
 - `training/` — Python.
   - `envs/openfront_env.py` — `gymnasium.Env` wrapping `EnvServer.ts` over a
-    subprocess. Single-agent: AGENT is controlled by `step(action)`;
-    OPPONENT (the Nation AI) needs no action, it plays itself.
+    subprocess. AGENT is controlled by `step(action)`. OPPONENT is the
+    Nation AI by default, which needs no action; with `opponent_kind="policy"`
+    it is a second Human player, steered by `step(action, opponent_action)`
+    and observed from its own seat — see [Self-play](#self-play).
+  - `selfplay.py` — per-episode opponent choice for training: the curriculum
+    stage's Nation AI ("expert") with probability `--expert-frac`, else a
+    copy of the agent from an `OpponentPool` of frozen snapshots — see
+    [Self-play](#self-play).
   - `curriculum.py` — `CurriculumScheduler`: a ladder of (difficulty, map
     pool) stages (`LADDERS`), promotion-only, gated on the win rate of a
     sampled-policy eval suite — see [Curriculum and evaluation](#curriculum-and-evaluation).
@@ -98,6 +104,19 @@ MuZero/EfficientZero, action/observation space, phased milestones).
       it never touches `checkpoints/latest.pt`; `--device cuda:1` as pinned
       (pass `--device cuda:0` on a one-GPU box). Python path overridable via
       `OPENFRONT_PYTHON`.
+
+    - `run_bighead_selfplay_terminal.sh` — **the current run on the GTX
+      1660 box** (`checkpoints/run5_bighead_selfplay_terminal/`, started
+      2026-11-23): run4's (`run_bighead_hard_terminal.sh`) config warm-started
+      from its final checkpoint (update 5310, hard/small) with
+      `--reward-mode terminal_only` and self-play at
+      `--expert-frac 1,1,0.5,0.5,0.5` — see [Self-play](#self-play) — and,
+      after its first launch died silently (probable OOM), `--num-envs 8
+      --eval-envs 6`. Several changes at once; its header has the details.
+  - `mem_logger.sh` — read-only memory sampler for a live run (`<pid>
+    <out.csv> [seconds]`): MemAvailable, cgroup memory, training and
+    EnvServer RSS, `/tmp` use and the cgroup's OOM-kill counter, so a silent
+    death can be matched against memory.
 
     Finished 2026-10-10 on the RTX 5000 Ada workstation, archived and
     disabled like the ones below (each refuses to run without
@@ -495,6 +514,62 @@ the landmass a random land tile falls in):
 
 Only the first three reach the 80% domination threshold overland; the pool
 averages ~36%.
+
+## Self-play
+
+Built 2026-11-23; no training run has used it yet. Off by default:
+`--expert-frac` defaults to 1, under which every training episode is against
+the Nation AI exactly as before (no randomness drawn, no `opponentKind` sent).
+
+**Per-episode opponent.** At every training-episode reset
+(`selfplay.OpponentChooser`, installed as `VecEnv`'s `before_reset` hook), the
+opponent is the **expert** — the Nation AI at the current curriculum stage's
+difficulty — with probability `expert_frac[stage]`, and otherwise a **policy**
+opponent: a second Human player driven by a copy of the agent's own network.
+`--expert-frac` is one number, or one entry per stage of the ladder
+(`--curriculum connected-first --expert-frac 1,1,0.75,0.5,0.5` stays
+all-expert until the agent leaves easy, then shifts toward self-play). The
+stage's map pool applies to both kinds; a promotion changes the mix for every
+episode that starts after it.
+
+**Opponent pool.** A policy opponent is the live network with probability
+`--selfplay-latest-prob` (0.5), else a uniformly drawn frozen snapshot. A
+snapshot is added every `--selfplay-snapshot-every` updates (20), keeping the
+newest `--selfplay-pool-size` (20). The pool is saved beside `latest.pt` as
+`selfplay_pool.pt` at every checkpoint and reloaded on resume; `train.py`
+refuses to resume a directory holding one with `--expert-frac` all 1, since
+that would silently drop self-play. Opponents sample from their policy as
+AGENT does (not argmax), one batched forward per distinct network per step.
+
+**What is trained.** AGENT's seat only: opponent transitions never enter the
+rollout buffer, so the PPO update is unchanged. Reward is AGENT's under the
+run's own `--reward-mode`/`--potential-beta` in both kinds of episode.
+**Evaluation and promotion are unchanged** — eval suites are always against
+the Nation AI, so a stage still means "beats `<difficulty>` on `<maps>`".
+
+**Env-bridge.** `opponentKind: "policy"` on reset builds the game with two
+Human players (`AGENTAAA`, `OPPONENT`) and no nations. Both spawn at random
+land points, in one turn (in Singleplayer the first human spawn ends the
+spawn phase, after which a new spawn intent is ignored), kept
+`minDistanceBetweenPlayers()` apart. Each step takes `opponentAction` beside
+AGENT's action, both applied on the same tick (AGENT's first). Each reply
+carries `opponent: {obs, legalActions}` encoded from OPPONENT's seat — its
+territory class 1, AGENT's class 2 — so one network plays either seat
+(`tests/test_selfplay.py` checks the two views mirror exactly). Every
+observation, mask and intent function in `EnvServer.ts` takes a `Seat`
+instead of assuming AGENT. A self-play episode ends at the first elimination
+as well as at the engine's 80% win, since a frozen opponent need not finish
+off a dead AGENT the way the Nation AI does. Its GameRecord lists both humans
+and replays in sync under `npm run replay:game`.
+
+**Caveats.** Humans get the base economy (`Config.ts`: 25k start troops,
+`maxTroops` ×1), the same as the Nation AI at hard, so a self-play opponent
+is neither handicapped like easy/medium nor boosted like impossible. AGENT's
+intent is applied before OPPONENT's on a tick where both act — a small fixed
+seat asymmetry. Logged `win_rate`/`episodes` count Nation-AI episodes only,
+so they keep their earlier meaning; `selfplay_episodes`/`selfplay_win_rate`,
+`expert_frac` and `selfplay_pool_size` are new `train_log.csv` columns, and
+`mean_reward` averages over both kinds.
 
 ## Upcoming Architecture
 
@@ -1019,7 +1094,12 @@ npm run replay:game -- ../training/replays/<gameID>.json
 - [ ] v1 milestone: train to consistently beat the Impossible-difficulty
       Nation bot 1v1 — the actual multi-hour-plus training run(s), likely
       spanning local + Kaggle sessions per the original compute plan.
-- [ ] Phase 4 (stretch): scale-up, self-play league.
+- [x] Self-play rollouts mixed with the curriculum's expert opponent
+      (built 2026-11-23, not yet trained — see [Self-play](#self-play)):
+      `--expert-frac` per curriculum stage, an opponent pool of frozen
+      snapshots, eval and promotion still against the Nation AI.
+- [ ] Phase 4 (stretch): scale-up, a fuller self-play league (e.g.
+      prioritized opponent sampling, training on both seats).
 
 ## Training
 
@@ -1054,7 +1134,8 @@ Key flags: `--num-envs`, `--rollout-length`, `--rollout-match-horizon`,
 `--log-csv`, `--checkpoint-every`, `--eval-every`, `--eval-every-steps`,
 `--reward-mode`, `--curriculum`, `--promote-threshold`, `--eval-episodes`,
 `--eval-envs`, `--eval-difficulties`, `--eval-replays`, `--eval-max-steps`,
-`--eval-log-csv`, `--param-entropy-norm`, `--tile-head` (see `train.py --help` for the full
+`--eval-log-csv`, `--param-entropy-norm`, `--tile-head`, `--expert-frac`,
+`--selfplay-pool-size`, `--selfplay-snapshot-every`, `--selfplay-latest-prob` (see `train.py --help` for the full
 list — learning rate, GAE/clip/entropy coefficients and minibatch size are
 exposed too). The current run's values and the reasoning behind the coupled
 ones are in [Training (PPO) hyperparameters](#training-ppo-hyperparameters).

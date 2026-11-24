@@ -4,12 +4,19 @@ Speaks the newline-delimited JSON protocol documented at the top of
 env-bridge/src/EnvServer.ts over a persistent subprocess: one `reset` line
 per episode, one `step` line per decision.
 
-Single-agent: this env controls "AGENT". Its opponents are real built-in
-Nation-AIs (NationExecution -- the same code driving Nation bots in
-production games) at `difficulty`, making their own decisions every tick --
-there is nothing to steer them with from Python. Curriculum is just "which
-difficulty this episode uses"; self-play against a frozen copy of the
-agent's own network is a separate, later mode (Phase 3+), not this env.
+This env controls "AGENT". Who plays OPPONENT is `opponent_kind`, read at
+every reset:
+
+- "nation" (default): a real built-in Nation AI (NationExecution -- the same
+  code driving Nation bots in production games) at `difficulty`, making its
+  own decisions every tick; nothing to steer from Python.
+- "policy": self-play. OPPONENT is a second Human player; step_send() then
+  needs its action too, and every reset/step info carries its observation
+  and action mask (`opponent_obs`, `opponent_action_mask`), encoded from its
+  own seat exactly the way AGENT's are, so the same network can play it.
+  Reward and `winner` stay AGENT's. Choosing per episode between the two --
+  and which network plays the policy seat -- is train.py's job (see
+  selfplay.py).
 
 Opponents arrive as a fixed-width, masked array of MAX_OPPONENTS slots
 (`opponent_features` + `opponent_mask`) rather than a flat opp_tiles/
@@ -49,6 +56,9 @@ DIFFICULTIES = ["easy", "medium", "hard", "impossible"]
 # (see its docstring). The first entry is the default and reproduces the
 # reward from before this option existed.
 REWARD_MODES = ["shaping_and_terminal", "shaping_only", "terminal_only"]
+# Who plays OPPONENT -- mirrors OPPONENT_KINDS in GameSetup.ts. The first
+# entry is the default and is the only opponent before self-play existed.
+OPPONENT_KINDS = ["nation", "policy"]
 
 # Must match MAX_OPPONENTS in EnvServer.ts: the fixed number of opponent
 # slots every opponent-indexed observation/mask/action is padded to.
@@ -186,8 +196,13 @@ class OpenFrontEnv(gym.Env):
         # EnvServer.ts -- the server owns the arithmetic; this is only the
         # wire field and its validation.
         potential_beta: float = 0.0,
+        # See the module docstring. Like difficulty and map_pool, a change
+        # takes effect at the next reset().
+        opponent_kind: str = OPPONENT_KINDS[0],
     ) -> None:
         super().__init__()
+        if opponent_kind not in OPPONENT_KINDS:
+            raise ValueError(f"opponent_kind must be one of {OPPONENT_KINDS}, got {opponent_kind!r}")
         if reward_mode not in REWARD_MODES:
             raise ValueError(f"reward_mode must be one of {REWARD_MODES}, got {reward_mode!r}")
         if not math.isfinite(potential_beta) or potential_beta < 0:
@@ -209,6 +224,10 @@ class OpenFrontEnv(gym.Env):
         self.dump_game_record_dir = dump_game_record_dir
         self.reward_mode = reward_mode
         self.potential_beta = float(potential_beta)
+        self.opponent_kind = opponent_kind
+        # The kind of the episode actually in progress -- opponent_kind can
+        # be changed for the NEXT episode while this one is still running.
+        self._episode_opponent_kind: str | None = None
 
         # The env-bridge Node worker leaks ~2.5 MB per episode (measured:
         # a single worker grew 95 -> 157 MB over 25 resets, while its tsx
@@ -359,7 +378,23 @@ class OpenFrontEnv(gym.Env):
         self._write(cmd)
         return self._read_reply()
 
-    def step_send(self, action) -> None:
+    @staticmethod
+    def _encode_action(action) -> dict[str, Any]:
+        """[action_type_idx, macro_tile_idx, player_idx] -> the wire's
+        {"action", "macroX"/"macroY" | "playerIdx"} (see EnvServer.ts's
+        ActionChoice)."""
+        type_idx = int(action[0])
+        choice: dict[str, Any] = {"action": ACTIONS[type_idx]}
+        if type_idx == BOAT_ATTACK_IDX:
+            tile_idx = int(action[1])
+            macro_y, macro_x = divmod(tile_idx, MACRO_GRID)
+            choice["macroX"] = macro_x
+            choice["macroY"] = macro_y
+        elif type_idx == ATTACK_OPPONENT_IDX:
+            choice["playerIdx"] = int(action[2])
+        return choice
+
+    def step_send(self, action, opponent_action=None) -> None:
         """Write half of step() only -- lets a caller (VecEnv) dispatch a
         step to every env's Node subprocess before blocking on any of their
         replies, so the ticks_per_step simulation ticks across N envs run
@@ -367,16 +402,17 @@ class OpenFrontEnv(gym.Env):
         time. Must be paired with a later step_recv().
 
         action: [action_type_idx, macro_tile_idx, player_idx] (see
-        action_space)."""
-        type_idx = int(action[0])
-        cmd: dict[str, Any] = {"cmd": "step", "action": ACTIONS[type_idx]}
-        if type_idx == BOAT_ATTACK_IDX:
-            tile_idx = int(action[1])
-            macro_y, macro_x = divmod(tile_idx, MACRO_GRID)
-            cmd["macroX"] = macro_x
-            cmd["macroY"] = macro_y
-        elif type_idx == ATTACK_OPPONENT_IDX:
-            cmd["playerIdx"] = int(action[2])
+        action_space). opponent_action: the same for OPPONENT -- required in
+        a self-play ("policy") episode, and must be None otherwise."""
+        is_selfplay = self._episode_opponent_kind == "policy"
+        if is_selfplay != (opponent_action is not None):
+            raise ValueError(
+                f"opponent_action is {'required' if is_selfplay else 'not allowed'} in a "
+                f"{self._episode_opponent_kind!r}-opponent episode"
+            )
+        cmd: dict[str, Any] = {"cmd": "step", **self._encode_action(action)}
+        if opponent_action is not None:
+            cmd["opponentAction"] = self._encode_action(opponent_action)
         self._write(cmd)
 
     def step_recv(self) -> tuple[dict[str, Any], float, bool, bool, dict[str, Any]]:
@@ -393,8 +429,21 @@ class OpenFrontEnv(gym.Env):
             "action_mask": self._legal_action_mask(raw["legalActions"]),
             "ticks": raw["info"]["ticks"],
             "winner": raw["info"]["winner"],
+            "opponent_kind": self._episode_opponent_kind,
+            **self._opponent_info(raw),
         }
         return obs, reward, terminated, truncated, info
+
+    def _opponent_info(self, raw: dict[str, Any]) -> dict[str, Any]:
+        """OPPONENT's own-seat observation and action mask, in a self-play
+        episode; nothing otherwise."""
+        opp = raw.get("opponent")
+        if opp is None:
+            return {}
+        return {
+            "opponent_obs": self._to_gym_obs(opp),
+            "opponent_action_mask": self._legal_action_mask(opp["legalActions"]),
+        }
 
     def _to_gym_obs(self, raw: dict[str, Any]) -> dict[str, Any]:
         w, h = raw["obs"]["width"], raw["obs"]["height"]
@@ -462,6 +511,10 @@ class OpenFrontEnv(gym.Env):
             "rewardMode": self.reward_mode,
             "potentialBeta": self.potential_beta,
         }
+        # Sent only when it is not the default, so a Nation-AI reset is the
+        # same command it was before self-play existed.
+        if self.opponent_kind != OPPONENT_KINDS[0]:
+            reset_cmd["opponentKind"] = self.opponent_kind
         if self.dump_game_record_dir is not None:
             reset_cmd["dumpGameRecordDir"] = self.dump_game_record_dir
         raw = self._send(reset_cmd)
@@ -480,6 +533,13 @@ class OpenFrontEnv(gym.Env):
                 f"env-bridge is using potentialBeta {raw.get('potentialBeta')!r}, "
                 f"not the requested {self.potential_beta!r}"
             )
+        # Same trap for self-play: an env-bridge that predates opponentKind
+        # would quietly play the Nation AI instead.
+        if raw.get("opponentKind", OPPONENT_KINDS[0]) != self.opponent_kind:
+            raise RuntimeError(
+                f"env-bridge is using opponentKind {raw.get('opponentKind')!r}, "
+                f"not the requested {self.opponent_kind!r}"
+            )
         # Same trap again for the env-var gated behaviours: a worker that
         # predates a flag ignores the variable, and one spawned before the
         # variable changed is running the old setting. Either way the run
@@ -495,14 +555,17 @@ class OpenFrontEnv(gym.Env):
                 )
         self._step_count = 0
         self._last_obs = raw
+        self._episode_opponent_kind = self.opponent_kind
         return self._to_gym_obs(raw), {
             "legal_actions": raw["legalActions"],
             "action_mask": self._legal_action_mask(raw["legalActions"]),
+            "opponent_kind": self._episode_opponent_kind,
+            **self._opponent_info(raw),
         }
 
-    def step(self, action: int):
+    def step(self, action, opponent_action=None):
         assert self._last_obs is not None, "call reset() before step()"
-        self.step_send(action)
+        self.step_send(action, opponent_action)
         return self.step_recv()
 
     def close(self):

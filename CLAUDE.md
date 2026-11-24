@@ -34,6 +34,31 @@ connected-first launcher still enabled; `run_connected_first.sh` and
 ones (`run_gamma_anneal_shaping_only.sh`, `run_gamma_anneal.sh`,
 `run_bbf_gamma098.sh`).
 
+**Status 2026-10-14:** the replication (`checkpoints/run3_big_tile_head/`)
+passed its checks, reached hard at update 1432, then stalled there; it is
+paused at update ~2340, resumable with its launcher plus `--device cuda:0
+--eval-envs 8`. Running instead: `training/run_bighead_hard_terminal.sh`
+(`checkpoints/run4_bighead_hard_terminal/`) — the same config with
+`--reward-mode shaping_and_terminal`, started at hard from the reference
+run's update-1435 checkpoint (see the launcher's header). Compare the two
+with `analysis/run_2026-10-14_bighead-hard-terminal/compare_stage.py`.
+
+**Status 2026-11-23:** run4 stopped at update 5310 (2026-11-06, killed from
+outside; still at hard, ~2.6% eval wins over its last ~800 updates). Running
+now: `training/run_bighead_selfplay_terminal.sh`
+(`checkpoints/run5_bighead_selfplay_terminal/`), warm-started from run4's
+final checkpoint with `--reward-mode terminal_only` and self-play
+(`--expert-frac 1,1,0.5,0.5,0.5`, see the README's Self-play section) — two
+changes at once, so not attributable to either alone. Its first launch died
+silently at update 5312 (probable OOM, unconfirmed); relaunched 21:57 UTC with
+`--num-envs 8 --eval-envs 6` (a third difference from run4) and
+`training/mem_logger.sh` writing `mem_log.csv` beside it. Resume it with its
+launcher (and restart the logger on the new PID); its `selfplay_pool.pt` must
+stay beside `latest.pt`. On 2026-11-24 (update ~5415) it was paused at a
+checkpoint and resumed with `--eval-every-steps 12000` (was 3000; evals were
+~60% of wall time) — set in the launcher. Check liveness with `ps`, not `pgrep -f train.py`,
+which matches its own command line.
+
 Never resume a run by retyping the `train.py` command. Checkpoints store
 weights, optimizer state and curriculum position (plus, for connected-first
 runs, the curriculum ladder) but **not** hyperparameters, so a resume that

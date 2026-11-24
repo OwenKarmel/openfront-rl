@@ -7,7 +7,7 @@ Run one directly, or all of them with `tests/run_all.sh`:
 
 ```bash
 /home/developer/miniconda/envs/openfront-rl/bin/python tests/test_schedules.py
-tests/run_all.sh          # all thirteen, in ascending cost order (~15min)
+tests/run_all.sh          # all fourteen, in ascending cost order (~15min)
 tests/run_all.sh -q       # same, only the per-file verdict
 ```
 
@@ -44,6 +44,7 @@ tmpfs on this box.
 | `test_eval_suite.py` | env-bridge | 20s | `run_eval_suite`: fixed seeds give the same maps every suite, workers are reused and every step is one batched `net.act()` (sampled policy), capped episodes are truncated not won, replays dumped only for seeds < `--eval-replays`, one gameID per (stage, seed) |
 | `test_expand_mask.py` | env-bridge, snapshot | 71s | `OPENFRONT_EXPAND_MASK=1`: reproduces eval `0ab47d4b` (the episode that conquered its island then pulsed forever) and measures where the mass goes once `expand` is masked off |
 | `test_boat_mask.py` | env-bridge, snapshot | 32s | `OPENFRONT_BOAT_MASK=1`: reproduces eval `cc83d2cc` (landlocked all game) and measures the same redistribution for `boat_attack` |
+| `test_selfplay.py` | env-bridge, OpenFrontIO npm | ~1min | self-play: `--expert-frac` parsing, `OpponentPool` FIFO/sampling/eviction fallback/save-load, `OpponentChooser` (expert_frac 1 is all-Nation and draws no randomness, the mix follows the stage); through a real env-bridge, the two seats' observations mirror exactly, random play by both seats ends with the right `winner`, the step guards refuse a missing/extra `opponent_action`, and the self-play GameRecord lists both humans and replays IN SYNC under `npm run replay:game` |
 | `test_reward_modes.py` | env-bridge | 3min | `--reward-mode`: the three modes in lockstep on one seed — dynamics identical, `shaping_and_terminal == shaping_only + terminal_only` exactly, and the shaping sum really is the tile-share delta at every prefix. Plus the four rejection paths |
 | `test_potential_beta.py` | env-bridge, archive | 8min | `--potential-beta`: β 0/2/5 in lockstep, reward equals `Φ(p′) − Φ(p)` exactly against the engine's own tile counts, gains and losses weighted alike by `e^{βp}`, `Φ′(0) = 1`. Plus the rejection paths |
 

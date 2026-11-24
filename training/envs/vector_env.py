@@ -20,9 +20,17 @@ from envs.openfront_env import OpenFrontEnv
 
 
 class VecEnv:
-    def __init__(self, env_fns: list[Callable[[], OpenFrontEnv]]):
+    def __init__(
+        self,
+        env_fns: list[Callable[[], OpenFrontEnv]],
+        before_reset: Callable[[int, OpenFrontEnv], None] | None = None,
+    ):
         self.envs = [fn() for fn in env_fns]
         self.n = len(self.envs)
+        # Called as before_reset(slot, env) right before every reset of a
+        # slot, auto-resets included -- the hook that picks each episode's
+        # opponent (selfplay.OpponentChooser) by setting env.opponent_kind.
+        self.before_reset = before_reset
         # One counter per env slot, strided by self.n so no two (env, episode)
         # pairs across the vector ever collide on a seed. Must keep advancing
         # on every reset -- including auto-resets in step() -- otherwise each
@@ -35,17 +43,24 @@ class VecEnv:
     def reset(self) -> tuple[list[dict], list[dict]]:
         obs, infos = [], []
         for i, env in enumerate(self.envs):
-            o, info = env.reset(seed=self._seed_counters[i])
+            o, info = self._reset_slot(i)
             obs.append(o)
             infos.append(info)
         return obs, infos
 
+    def _reset_slot(self, i: int) -> tuple[dict, dict]:
+        if self.before_reset is not None:
+            self.before_reset(i, self.envs[i])
+        return self.envs[i].reset(seed=self._seed_counters[i])
+
     def step(
-        self, actions: np.ndarray
+        self, actions: np.ndarray, opponent_actions: list | None = None
     ) -> tuple[list[dict], np.ndarray, np.ndarray, np.ndarray, list[dict]]:
         """actions: (n, 3) int array -- [action_type_idx, macro_tile_idx,
-        player_idx] per env (see OpenFrontEnv.action_space). Auto-resets any
-        env that just terminated/truncated.
+        player_idx] per env (see OpenFrontEnv.action_space). opponent_actions:
+        per env, OPPONENT's action in a self-play episode and None otherwise
+        (omit it entirely when no env is in one). Auto-resets any env that
+        just terminated/truncated.
 
         Dispatches all N envs' step commands before blocking on any reply
         (step_send/step_recv, see OpenFrontEnv) so their ticks_per_step
@@ -56,8 +71,10 @@ class VecEnv:
         between GPU forward/backward pulses, matching this loop running
         envs strictly sequentially.
         """
-        for env, action in zip(self.envs, actions):
-            env.step_send(action)
+        if opponent_actions is None:
+            opponent_actions = [None] * self.n
+        for env, action, opp_action in zip(self.envs, actions, opponent_actions):
+            env.step_send(action, opp_action)
 
         obs, rewards, terms, truncs, infos = [], [], [], [], []
         for i, env in enumerate(self.envs):
@@ -71,7 +88,7 @@ class VecEnv:
                 # the next action from.
                 episode_info = info
                 self._seed_counters[i] += self.n
-                o, info = env.reset(seed=self._seed_counters[i])
+                o, info = self._reset_slot(i)
                 info["episode_info"] = episode_info
             obs.append(o)
             rewards.append(r)
