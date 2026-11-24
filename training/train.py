@@ -33,8 +33,11 @@ import numpy as np
 import torch
 
 from curriculum import LADDERS, CurriculumScheduler
+from gymnasium.utils import seeding
+
 from envs.openfront_env import (
     ACTIONS,
+    ATTACK_FRACTIONS,
     DIFFICULTIES,
     MAP_POOLS,
     REWARD_MODES,
@@ -45,7 +48,7 @@ from envs.openfront_env import (
 )
 from envs.vector_env import VecEnv
 from models.network import ActorCritic
-from ppo import RolloutBuffer, ppo_update
+from ppo import ADV_NORM_MODES, KL_STOP_MODES, RolloutBuffer, ValueNormalizer, ppo_update
 from selfplay import POOL_FILENAME, OpponentChooser, OpponentPool, opponent_actions, parse_expert_frac
 
 # Every observation field the network consumes, stacked across envs. Kept as
@@ -240,6 +243,21 @@ def parse_args() -> argparse.Namespace:
              "only resumes under the head it was trained with",
     )
     p.add_argument(
+        "--attack-size-head", action="store_true",
+        help="add a categorical head choosing how many troops each expand/attack_opponent/"
+             "boat_attack sends, as a fraction of current troops (openfront_env.py's "
+             "ATTACK_FRACTIONS). Off (default), every attack sends troops/5 as before. Adds "
+             "weights, so a checkpoint only resumes under the setting it was trained with "
+             "(--init-from may add the head to a checkpoint without one)",
+    )
+    p.add_argument(
+        "--init-from", default=None,
+        help="warm start a NEW run directory from another run's checkpoint: weights, optimizer "
+             "state (matched parameters), update count, curriculum position and ladder. Only "
+             "the attack-size head may be missing from it. Ignored when --checkpoint-dir already "
+             "holds latest.pt, which is resumed instead, so relaunching a launcher is safe",
+    )
+    p.add_argument(
         "--param-entropy-norm", action="store_true",
         help="divide the tile/player heads' entropy by log(#legal choices) in the entropy "
              "bonus, so each contributes a fraction of its own maximum instead of up to "
@@ -250,7 +268,25 @@ def parse_args() -> argparse.Namespace:
         "--target-kl",
         type=float,
         default=0.03,
-        help="abort the rest of a PPO update's epochs/minibatches if approx_kl exceeds 1.5x this",
+        help="KL early stop threshold; see --kl-stop for how it is applied",
+    )
+    p.add_argument(
+        "--kl-stop", choices=KL_STOP_MODES, default=KL_STOP_MODES[0],
+        help="'minibatch' (default, the original): end the update after any minibatch whose k1 "
+             "approx_kl exceeds 1.5x --target-kl, trailing partial minibatch included. 'epoch': "
+             "average the k3 estimator over each epoch and stop BETWEEN epochs when that mean "
+             "exceeds --target-kl; the partial minibatch is folded into the last full one",
+    )
+    p.add_argument(
+        "--adv-norm", choices=ADV_NORM_MODES, default=ADV_NORM_MODES[0],
+        help="normalize advantages over the whole rollout ('batch', default) or per minibatch",
+    )
+    p.add_argument(
+        "--value-norm", action="store_true",
+        help="PopArt value normalization (ppo.py's ValueNormalizer): the value head predicts "
+             "returns normalized by a running mean/std, rescaled on every statistics change so "
+             "its denormalized output is preserved. The statistics are stored in checkpoints; a "
+             "checkpoint without them starts from identity (mean 0, std 1)",
     )
     p.add_argument("--epochs", type=int, default=4)
     # Kept well below the full-rollout batch size (num_envs * rollout_length,
@@ -312,6 +348,23 @@ def parse_args() -> argparse.Namespace:
         "--eval-every-steps", type=int, default=0,
         help="decision steps per env between eval suites; overrides --eval-every when "
              "positive. Use it whenever the rollout length varies (see eval_due)",
+    )
+    p.add_argument(
+        "--canary-every-steps", type=int, default=0,
+        help="decision steps per env between CANARY evals: --canary-episodes games on a fixed, "
+             "map-stratified subset of the stage's eval seeds, logged to --eval-log-csv as "
+             "kind=canary with gates_curriculum=False -- never promotes. 0 (default) = off. "
+             "Skipped on an update that runs a full suite",
+    )
+    p.add_argument(
+        "--canary-episodes", type=int, default=0,
+        help="games per canary eval (see --canary-every-steps); at most --eval-episodes",
+    )
+    p.add_argument(
+        "--eval-report-exclude-maps", default="",
+        help="comma-separated maps left out of eval_log.csv's wins_excl/episodes_excl columns "
+             "(e.g. labyrinth, where nearly all of run4's hard wins came from). Reporting only: "
+             "promotion still uses every game",
     )
     p.add_argument(
         "--eval-episodes", type=int, default=64,
@@ -388,13 +441,26 @@ def make_env(
         # make_env; they predate the option and mean the default reward.
         reward_mode=getattr(args, "reward_mode", REWARD_MODES[0]),
         potential_beta=getattr(args, "potential_beta", 0.0),
+        attack_size_head=getattr(args, "attack_size_head", False),
     )
 
 
-def save_checkpoint(path: Path, net, optimizer, scheduler: CurriculumScheduler, update: int) -> None:
+def save_checkpoint(
+    path: Path, net, optimizer, scheduler: CurriculumScheduler, update: int,
+    value_normalizer: ValueNormalizer | None = None, wall: dict | None = None,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    extra = {}
+    if value_normalizer is not None:
+        # Only with --value-norm, so a default run's checkpoint has exactly
+        # the keys it always had. Its presence is what load_checkpoint()
+        # checks to refuse a resume that forgot --value-norm.
+        extra["value_norm"] = value_normalizer.state_dict()
+    if wall is not None:
+        extra["wall_seconds"] = dict(wall)
     torch.save(
         {
+            **extra,
             "model": net.state_dict(),
             "optimizer": optimizer.state_dict(),
             "update": update,
@@ -492,7 +558,27 @@ def notify_milestones(notified: dict, checkpoint_dir: Path, difficulty: str, sum
             print(f"  *** milestone: first {threshold:.0%} peak territory vs {difficulty} -- ntfy sent ***")
 
 
-def load_checkpoint(path: Path, net, optimizer, scheduler: CurriculumScheduler) -> int:
+def check_value_norm(path: Path, ckpt: dict, value_normalizer: ValueNormalizer | None) -> None:
+    """Restore --value-norm statistics, or refuse a mismatch. A checkpoint
+    trained with them holds a value head whose outputs are NORMALIZED; read
+    as raw values, every GAE target would be silently wrong."""
+    if value_normalizer is None:
+        if "value_norm" in ckpt:
+            sys.exit(f"{path} was trained with --value-norm (its value head predicts normalized "
+                     f"returns); resume it with --value-norm, via its launcher")
+        return
+    if "value_norm" in ckpt:
+        value_normalizer.load_state_dict(ckpt["value_norm"])
+        print(f"  value-norm statistics restored: mean={value_normalizer.mean:+.4f} std={value_normalizer.std:.4f}")
+    else:
+        print("  value-norm: checkpoint has no statistics -- starting from identity (mean 0, std 1), "
+              "so the loaded value head is read exactly as before")
+
+
+def load_checkpoint(
+    path: Path, net, optimizer, scheduler: CurriculumScheduler,
+    value_normalizer: ValueNormalizer | None = None, wall: dict | None = None,
+) -> int:
     ckpt = torch.load(path, map_location=next(net.parameters()).device, weights_only=False)
     # A stage index from one ladder means a different (difficulty, maps) on
     # another, and hyperparameters are not stored in checkpoints -- so a
@@ -505,8 +591,15 @@ def load_checkpoint(path: Path, net, optimizer, scheduler: CurriculumScheduler) 
             f"{path} was trained under curriculum ladder {ckpt_ladder!r}, not {scheduler.ladder!r}. "
             f"Pass --curriculum {ckpt_ladder} to resume it, or archive it and start a new run."
         )
+    has_head = any(k.startswith("attack_frac_head.") for k in ckpt["model"])
+    if has_head != net.use_attack_size_head:
+        sys.exit(f"{path} was trained {'with' if has_head else 'without'} --attack-size-head; resume it "
+                 f"{'with' if has_head else 'without'} that flag, via its launcher")
     net.load_state_dict(ckpt["model"])
     optimizer.load_state_dict(ckpt["optimizer"])
+    check_value_norm(path, ckpt, value_normalizer)
+    if wall is not None:
+        wall.update(ckpt.get("wall_seconds", {}))
     scheduler._index = ckpt["curriculum_index"]
     # Older checkpoints carry curriculum_results: single-episode outcomes
     # (greedy evals, or before that training episodes) from a window that no
@@ -514,6 +607,72 @@ def load_checkpoint(path: Path, net, optimizer, scheduler: CurriculumScheduler) 
     # suite decides promotion from scratch.
     if ckpt.get("curriculum_mode") != "eval_suite" and ckpt.get("curriculum_results"):
         print("  (discarding the checkpoint's pre-eval-suite curriculum_results; stage kept)")
+    return ckpt["update"]
+
+
+# Parameters --init-from may find missing from the source checkpoint: those
+# of modules a flag adds on top of the network it was trained with. Anything
+# else missing (or unexpected) means a different architecture -- an error.
+INIT_FROM_NEW_PREFIXES = ("attack_frac_head.",)
+
+
+def init_from_checkpoint(
+    path: Path, net: ActorCritic, optimizer, scheduler: CurriculumScheduler,
+    value_normalizer: ValueNormalizer | None, make_optimizer,
+) -> int:
+    """--init-from: warm start this run from another run's checkpoint.
+
+    Loads the weights (only INIT_FROM_NEW_PREFIXES may be absent from it), the
+    curriculum position under the same ladder check as a resume, the update
+    count -- so every update-keyed schedule (gamma, rollout length, eval
+    cadence) continues where the source run was -- and the optimizer state of
+    every matched parameter. Parameters new in this run get no optimizer
+    state: AdamW starts their moments at zero and their step count at 0, as
+    for a fresh parameter. Value-norm statistics come along if the source has
+    them, else identity. Returns the update to start at."""
+    ckpt = torch.load(path, map_location=next(net.parameters()).device, weights_only=False)
+    ckpt_ladder = ckpt.get("curriculum_ladder", "difficulty")
+    if ckpt_ladder != scheduler.ladder:
+        sys.exit(f"--init-from {path}: trained under curriculum ladder {ckpt_ladder!r}, not "
+                 f"{scheduler.ladder!r}. Pass --curriculum {ckpt_ladder}.")
+    src_keys = set(ckpt["model"])
+    own_keys = set(net.state_dict())
+    missing = sorted(own_keys - src_keys)
+    unexpected = sorted(src_keys - own_keys)
+    bad_missing = [k for k in missing if not k.startswith(INIT_FROM_NEW_PREFIXES)]
+    if bad_missing or unexpected:
+        sys.exit(f"--init-from {path}: architecture mismatch beyond the new heads -- missing "
+                 f"{bad_missing}, unexpected {unexpected}. Check --tile-head and the other "
+                 f"architecture flags against the run it came from.")
+    net.load_state_dict(ckpt["model"], strict=False)
+
+    # The source optimizer's state is indexed by position within ITS param
+    # groups, which shift once a new head is added. Rebuild the source
+    # network's grouping (a network without the new modules), load the state
+    # there -- which also validates it -- and move each entry across by
+    # parameter name.
+    src_net = ActorCritic(
+        param_entropy_norm=net.param_entropy_norm, tile_head=net.tile_head,
+        attack_size_head=any(k.startswith("attack_frac_head.") for k in src_keys),
+    ).to(next(net.parameters()).device)
+    src_net.load_state_dict(ckpt["model"])
+    src_opt = make_optimizer(src_net)
+    src_opt.load_state_dict(ckpt["optimizer"])
+    src_params = dict(src_net.named_parameters())
+    moved, fresh = 0, []
+    for name, param in net.named_parameters():
+        src = src_params.get(name)
+        if src is not None and src in src_opt.state:
+            optimizer.state[param] = {k: (v.clone() if torch.is_tensor(v) else v)
+                                      for k, v in src_opt.state[src].items()}
+            moved += 1
+        else:
+            fresh.append(name)
+    del src_net, src_opt
+    check_value_norm(path, ckpt, value_normalizer)
+    scheduler._index = ckpt["curriculum_index"]
+    print(f"  init-from: {len(src_keys)} tensors loaded, optimizer state moved for {moved} parameters; "
+          f"new (no weights or optimizer state in the source): {fresh or 'none'}")
     return ckpt["update"]
 
 
@@ -556,8 +715,37 @@ def wilson_interval(wins: int, n: int, z: float = 1.96) -> tuple[float, float]:
     return max(0.0, centre - half), min(1.0, centre + half)
 
 
+def eval_seed_maps(args: argparse.Namespace, maps: str | None, n: int) -> list[str]:
+    """The map each eval seed 0..n-1 plays, without running anything: the
+    env draws it from the pool with gymnasium's np_random seeded by the seed
+    (OpenFrontEnv.reset). A fixed --map has one map for every seed."""
+    pool = map_pool_for(args, maps)
+    if not pool:
+        return [args.map] * n
+    return [str(seeding.np_random(k)[0].choice(pool)) for k in range(n)]
+
+
+def canary_seeds(args: argparse.Namespace, maps: str | None) -> list[int]:
+    """--canary-episodes seeds out of the stage's --eval-episodes eval seeds,
+    stratified by map: round-robin over the maps in order of their first eval
+    seed, taking each map's lowest unused seed. Fixed for a stage, so canary
+    rows are comparable with each other (and each canary game is also a
+    full-suite game, seed for seed)."""
+    by_map: dict[str, list[int]] = {}
+    for k, m in enumerate(eval_seed_maps(args, maps, args.eval_episodes)):
+        by_map.setdefault(m, []).append(k)
+    queues = list(by_map.values())
+    picked: list[int] = []
+    while len(picked) < args.canary_episodes:
+        for q in queues:
+            if q and len(picked) < args.canary_episodes:
+                picked.append(q.pop(0))
+    return sorted(picked)
+
+
 def run_eval_suite(
-    args: argparse.Namespace, net: ActorCritic, device: torch.device, difficulty: str, maps: str | None
+    args: argparse.Namespace, net: ActorCritic, device: torch.device, difficulty: str, maps: str | None,
+    seeds: list[int] | None = None, dump_replays: bool = True,
 ) -> list[dict]:
     """Plays --eval-episodes episodes on the fixed eval seeds with the SAMPLED
     policy -- the one training optimizes and the one training episodes are
@@ -571,22 +759,26 @@ def run_eval_suite(
     ends. Construction is the same as training's (see GameSetup.ts), so the
     dumped GameRecords (--eval-replays) are faithful, replayable records.
 
+    seeds: which of the suite's seeds to play (default all of 0..N-1) --
+    the canary passes a subset. dump_replays=False skips --eval-replays.
+
     Returns one dict per episode, in seed order."""
-    n = args.eval_episodes
+    seeds = list(range(args.eval_episodes)) if seeds is None else list(seeds)
+    n = len(seeds)
     max_steps = args.eval_max_steps or args.max_episode_steps
     prefix = f"{EVAL_SEED_PREFIX}-{difficulty}-{maps_label(args, maps)}"
     envs = [
         make_env(args, difficulty, prefix, maps=maps, max_steps=max_steps)
         for _ in range(min(args.eval_envs, n))
     ]
-    pending = list(range(n))
+    pending = list(seeds)
     live: dict[int, dict] = {}  # worker index -> its episode in progress
     episodes: list[dict] = []
 
     def start(w: int) -> None:
         seed = pending.pop(0)
         env = envs[w]
-        env.dump_game_record_dir = args.eval_dir if seed < args.eval_replays else None
+        env.dump_game_record_dir = args.eval_dir if dump_replays and seed < args.eval_replays else None
         obs, info = env.reset(seed=seed)
         live[w] = {"seed": seed, "map": env.map_name, "obs": obs, "info": info,
                    "peak": territory_fraction(obs)}
@@ -625,11 +817,17 @@ def run_eval_suite(
     return sorted(episodes, key=lambda e: e["seed"])
 
 
-def summarize_suite(episodes: list[dict]) -> dict:
+def summarize_suite(episodes: list[dict], exclude_maps: tuple[str, ...] = ()) -> dict:
     wins = sum(e["winner"] == "AGENT" for e in episodes)
     n = len(episodes)
     low, high = wilson_interval(wins, n)
+    kept = [e for e in episodes if e["map"] not in exclude_maps]
+    excl = {}
+    if exclude_maps:
+        excl = {"wins_excl": sum(e["winner"] == "AGENT" for e in kept), "episodes_excl": len(kept),
+                "excluded_maps": "+".join(exclude_maps)}
     return {
+        **excl,
         "episodes": n, "wins": wins, "win_rate": wins / n, "ci_low": low, "ci_high": high,
         "truncated": sum(e["truncated"] for e in episodes),
         "mean_peak_territory": float(np.mean([e["peak_territory_frac"] for e in episodes])),
@@ -638,22 +836,41 @@ def summarize_suite(episodes: list[dict]) -> dict:
     }
 
 
-def open_csv(path: Path, columns: list[str]) -> tuple:
+def per_map_line(episodes: list[dict]) -> str:
+    """'map wins/games' for every map in a suite, most games first."""
+    counts: dict[str, list[int]] = {}
+    for e in episodes:
+        c = counts.setdefault(e["map"], [0, 0])
+        c[0] += e["winner"] == "AGENT"
+        c[1] += 1
+    order = sorted(counts, key=lambda m: (-counts[m][1], m))
+    return " ".join(f"{m} {counts[m][0]}/{counts[m][1]}" for m in order)
+
+
+def open_csv(path: Path, columns: list[str], new_columns: tuple[str, ...] = ()) -> tuple:
     """Append-mode DictWriter, writing the header only for a new/empty file.
     Refuses an existing file with a different header rather than append rows
-    that would be misaligned under it."""
+    that would be misaligned under it -- except that a file whose header is
+    `columns` minus the trailing `new_columns` (written before they existed)
+    keeps its own header, with a note. Returns (file, writer, dropped)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     is_new = not path.exists() or path.stat().st_size == 0
+    dropped: list[str] = []
     if not is_new:
         with open(path, newline="") as fh:
             existing = next(csv.reader(fh), None)
-        if existing != columns:
+        old = [c for c in columns if c not in new_columns]
+        if existing == old and new_columns:
+            dropped = list(new_columns)
+            print(f"  NOTE: {path} predates columns {dropped}; not logging them to it.")
+            columns = old
+        elif existing != columns:
             sys.exit(f"{path} has columns {existing}, expected {columns} -- point the run at a new file")
     fh = open(path, "a", newline="")
     writer = csv.DictWriter(fh, fieldnames=columns, extrasaction="ignore")
     if is_new:
         writer.writeheader()
-    return fh, writer
+    return fh, writer, dropped
 
 
 def main() -> None:
@@ -682,6 +899,16 @@ def main() -> None:
         sys.exit("--selfplay-pool-size and --selfplay-snapshot-every must be at least 1")
     if not 0.0 <= args.selfplay_latest_prob <= 1.0:
         sys.exit("--selfplay-latest-prob must lie in [0, 1]")
+    if args.canary_every_steps < 0 or args.canary_episodes < 0:
+        sys.exit("--canary-every-steps and --canary-episodes must be >= 0")
+    if (args.canary_every_steps > 0) != (args.canary_episodes > 0):
+        sys.exit("--canary-every-steps and --canary-episodes go together: set both, or neither")
+    if args.canary_episodes > args.eval_episodes:
+        sys.exit("--canary-episodes must be at most --eval-episodes (canary seeds are a subset of the suite's)")
+    args.exclude_maps = tuple(m for m in args.eval_report_exclude_maps.split(",") if m)
+    unknown_maps = set(args.exclude_maps) - set(SMALL_MAPS)
+    if unknown_maps:
+        sys.exit(f"--eval-report-exclude-maps: unknown maps {sorted(unknown_maps)}")
     if args.eval_difficulties != "current":
         unknown = set(args.eval_difficulties.split(",")) - set(DIFFICULTIES)
         if unknown:
@@ -697,6 +924,13 @@ def main() -> None:
         map_desc = args.map if args.map else f"random from SMALL_MAPS ({len(SMALL_MAPS)} maps)"
     print(f"device={device} num_envs={args.num_envs} map={map_desc} reward_mode={args.reward_mode} potential_beta={args.potential_beta} "
           f"param_entropy_norm={args.param_entropy_norm} tile_head={args.tile_head}")
+    print(f"ppo: kl_stop={args.kl_stop} target_kl={args.target_kl} adv_norm={args.adv_norm} "
+          f"value_norm={args.value_norm} attack_size_head={args.attack_size_head}"
+          + (f" (fractions {list(ATTACK_FRACTIONS)})" if args.attack_size_head else ""))
+    if args.canary_every_steps > 0:
+        print(f"canary: {args.canary_episodes} games every {args.canary_every_steps} steps/env (logged only)")
+    if args.exclude_maps:
+        print(f"eval report: wins_excl/episodes_excl leave out {list(args.exclude_maps)}")
     # The env-bridge's env-var gated behaviours are set by the launcher's
     # environment, not by a flag here, so record them in the log explicitly.
     # Every env's reset checks the Node worker really runs with them.
@@ -729,31 +963,50 @@ def main() -> None:
 
     scheduler = CurriculumScheduler(ladder=args.curriculum, promote_threshold=args.promote_threshold)
 
-    net = ActorCritic(param_entropy_norm=args.param_entropy_norm, tile_head=args.tile_head).to(device)
-    # AdamW rather than Adam so --weight-decay is *decoupled* (applied as
-    # p -= lr*wd*p, not folded into the gradient and thus into Adam's second
-    # moment, where an adaptive optimizer largely cancels it out again).
-    # Biases are excluded: they carry none of the overfitting risk weight
-    # decay targets, and shrinking them just drags the logits toward zero.
-    # The network has no normalization layers, so >=2D vs 1D fully separates
-    # "weights" from "biases" here -- revisit this split if one is ever added.
-    decayed = [p for p in net.parameters() if p.requires_grad and p.dim() >= 2]
-    not_decayed = [p for p in net.parameters() if p.requires_grad and p.dim() < 2]
-    optimizer = torch.optim.AdamW(
-        [
-            {"params": decayed, "weight_decay": args.weight_decay},
-            {"params": not_decayed, "weight_decay": 0.0},
-        ],
-        lr=args.lr,
-    )
+    def make_net() -> ActorCritic:
+        return ActorCritic(param_entropy_norm=args.param_entropy_norm, tile_head=args.tile_head,
+                           attack_size_head=args.attack_size_head)
+
+    def make_optimizer(model: ActorCritic) -> torch.optim.AdamW:
+        # AdamW rather than Adam so --weight-decay is *decoupled* (applied as
+        # p -= lr*wd*p, not folded into the gradient and thus into Adam's second
+        # moment, where an adaptive optimizer largely cancels it out again).
+        # Biases are excluded: they carry none of the overfitting risk weight
+        # decay targets, and shrinking them just drags the logits toward zero.
+        # The network has no normalization layers, so >=2D vs 1D fully separates
+        # "weights" from "biases" here -- revisit this split if one is ever added.
+        decayed = [p for p in model.parameters() if p.requires_grad and p.dim() >= 2]
+        not_decayed = [p for p in model.parameters() if p.requires_grad and p.dim() < 2]
+        return torch.optim.AdamW(
+            [
+                {"params": decayed, "weight_decay": args.weight_decay},
+                {"params": not_decayed, "weight_decay": 0.0},
+            ],
+            lr=args.lr,
+        )
+
+    net = make_net().to(device)
+    optimizer = make_optimizer(net)
+    value_normalizer = ValueNormalizer(net.value_head) if args.value_norm else None
+    # Cumulative wall time, training (rollout + update) vs evaluation (suites
+    # + canaries), carried in checkpoints so the ratio survives resumes.
+    wall = {"train": 0.0, "eval": 0.0}
 
     checkpoint_dir = Path(args.checkpoint_dir)
     latest_path = checkpoint_dir / "latest.pt"
     start_update = 0
     if latest_path.exists():
-        start_update = load_checkpoint(latest_path, net, optimizer, scheduler)
+        start_update = load_checkpoint(latest_path, net, optimizer, scheduler, value_normalizer, wall)
         print(f"resumed from {latest_path} at update {start_update}, difficulty={scheduler.difficulty} "
-              f"maps={maps_label(args, scheduler.maps)}")
+              f"maps={maps_label(args, scheduler.maps)}"
+              + (f" (--init-from {args.init_from} ignored: this run already has a checkpoint)"
+                 if args.init_from else ""))
+    elif args.init_from:
+        start_update = init_from_checkpoint(
+            Path(args.init_from), net, optimizer, scheduler, value_normalizer, make_optimizer
+        )
+        print(f"initialized from {args.init_from} at update {start_update}, difficulty={scheduler.difficulty} "
+              f"maps={maps_label(args, scheduler.maps)} -- a new run in {checkpoint_dir}")
 
     # The self-play pool lives beside latest.pt, not inside it, so tools that
     # only read the policy (eval_checkpoint.py, the tests) never load it.
@@ -764,7 +1017,7 @@ def main() -> None:
         sys.exit(f"{pool_path} exists, so this run trained with self-play, but --expert-frac is all 1 "
                  f"here. Resume it via its launcher, or archive it and start a new run.")
     pool = OpponentPool(
-        make_net=lambda: ActorCritic(param_entropy_norm=args.param_entropy_norm, tile_head=args.tile_head),
+        make_net=make_net,
         device=device, max_size=args.selfplay_pool_size, latest_prob=args.selfplay_latest_prob,
     )
     if selfplay and pool_path.exists():
@@ -794,6 +1047,10 @@ def main() -> None:
         "type_entropy", *[f"type_prob_{a}" for a in ACTIONS], "gamma", "rollout_length",
         "reward_mode", "potential_beta", "maps", "param_entropy_norm", "tile_head",
         "expert_frac", "selfplay_episodes", "selfplay_win_rate", "selfplay_pool_size",
+        "kl_stop", "adv_norm", "value_norm", "attack_size_head", "grad_steps", "epochs_completed",
+        "approx_kl_k3", "last_epoch_kl", "value_norm_mean", "value_norm_std",
+        *[f"attack_frac_prob_{f:.2f}" for f in ATTACK_FRACTIONS],
+        "train_seconds_total", "eval_seconds_total",
     ]
     log_is_new = not log_path.exists() or log_path.stat().st_size == 0
     if not log_is_new:
@@ -825,6 +1082,10 @@ def main() -> None:
             if "selfplay_episodes" in dropped and selfplay:
                 sys.exit(f"refusing to run self-play (--expert-frac {args.expert_frac}) into {log_path}, "
                          f"which cannot record it -- pass a new --log-csv")
+            if "kl_stop" in dropped and (args.kl_stop != KL_STOP_MODES[0] or args.adv_norm != ADV_NORM_MODES[0]
+                                         or args.value_norm or args.attack_size_head):
+                sys.exit(f"refusing to run --kl-stop/--adv-norm/--value-norm/--attack-size-head into "
+                         f"{log_path}, which cannot record them -- pass a new --log-csv")
             if "maps" in dropped and args.curriculum != "difficulty":
                 sys.exit(f"refusing to run curriculum {args.curriculum!r}, whose stages change the map "
                          f"pool, into {log_path}, which cannot record it -- pass a new --log-csv")
@@ -835,15 +1096,21 @@ def main() -> None:
         log_writer.writeheader()
 
     eval_log_path = Path(args.eval_log_csv)
-    eval_file, eval_writer = open_csv(eval_log_path, [
+    # kind: "suite" (a full --eval-episodes suite) or "canary". The other new
+    # columns are filled only with --eval-report-exclude-maps.
+    eval_new = ("kind", "wins_excl", "episodes_excl", "excluded_maps")
+    eval_file, eval_writer, eval_dropped = open_csv(eval_log_path, [
         "update", "steps_per_env", "difficulty", "maps", "gates_curriculum", "episodes", "wins",
         "win_rate", "ci_low", "ci_high", "truncated", "mean_peak_territory", "max_peak_territory",
-        "mean_ticks", "seconds",
-    ])
-    eval_episodes_file, eval_episodes_writer = open_csv(eval_log_path.parent / "eval_episodes.csv", [
+        "mean_ticks", "seconds", *eval_new,
+    ], new_columns=eval_new)
+    eval_episodes_file, eval_episodes_writer, episodes_dropped = open_csv(eval_log_path.parent / "eval_episodes.csv", [
         "update", "difficulty", "maps", "seed", "map", "winner", "ticks", "truncated",
-        "peak_territory_frac", "final_territory_frac",
-    ])
+        "peak_territory_frac", "final_territory_frac", "kind",
+    ], new_columns=("kind",))
+    if (eval_dropped or episodes_dropped) and (args.canary_every_steps > 0 or args.exclude_maps):
+        sys.exit(f"refusing to run canaries or --eval-report-exclude-maps into {eval_log_path} (or its "
+                 f"eval_episodes.csv), which cannot record them -- pass a new --eval-log-csv")
 
     obs_list, infos = vec_env.reset()
     batch = obs_to_batch(obs_list)
@@ -912,6 +1179,9 @@ def main() -> None:
             type_probs_t, type_entropy_t = net.type_diagnostics(*inputs)
             type_probs = type_probs_t.cpu().numpy()
             type_entropy = float(type_entropy_t.item())
+            frac_probs_t = net.attack_frac_diagnostics(*inputs)
+            frac_probs = (frac_probs_t.cpu().numpy() if frac_probs_t is not None
+                          else np.full(len(ATTACK_FRACTIONS), np.nan))
 
         stats = ppo_update(
             net,
@@ -926,6 +1196,9 @@ def main() -> None:
             epochs=args.epochs,
             minibatch_size=args.minibatch_size,
             target_kl=args.target_kl,
+            kl_stop=args.kl_stop,
+            adv_norm=args.adv_norm,
+            value_normalizer=value_normalizer,
         )
         # Released now rather than when the next update rebinds it: an eval
         # suite below stands up --eval-envs more Node workers, and at T=1000
@@ -943,6 +1216,7 @@ def main() -> None:
         mean_reward = reward_sum / (rollout_length * args.num_envs)
         steps_prev, steps_done = steps_done, steps_done + rollout_length
         elapsed = time.time() - t0
+        wall["train"] += elapsed
         early_flag = " EARLY-STOP" if stats["stopped_early"] else ""
         type_probs_str = " ".join(f"{a}={p:.2f}" for a, p in zip(ACTIONS, type_probs))
         print(
@@ -951,7 +1225,13 @@ def main() -> None:
             f"mean_reward={mean_reward:+.4f} policy_loss={stats['policy_loss']:+.4f} "
             f"value_loss={stats['value_loss']:.4f} entropy={stats['entropy']:.3f} "
             f"kl={stats['approx_kl']:.4f} gamma={gamma:.4f} T={rollout_length} ({elapsed:.1f}s){early_flag}\n"
-            f"  type_probs[{type_probs_str}] type_entropy={type_entropy:.3f}"
+            f"  type_probs[{type_probs_str}] type_entropy={type_entropy:.3f}\n"
+            f"  ppo: grad_steps={stats['grad_steps']} epochs={stats['epochs_completed']}/{args.epochs} "
+            f"({stats['minibatches_per_epoch']} minibatches/epoch) kl_k3={stats['approx_kl_k3']:.4f}"
+            + (f" value_norm mean={value_normalizer.mean:+.4f} std={value_normalizer.std:.4f}"
+               if value_normalizer is not None else "")
+            + (" attack_frac[" + " ".join(f"{f:.2f}={q:.2f}" for f, q in zip(ATTACK_FRACTIONS, frac_probs)) + "]"
+               if args.attack_size_head else "")
             + (f"\n  self-play: expert_frac={chooser.expert_frac:g} episodes={len(selfplay_outcomes)} "
                f"win_rate={selfplay_win_rate:.2f} pool={len(pool)}" if selfplay else "")
         )
@@ -974,17 +1254,54 @@ def main() -> None:
                 "selfplay_episodes": len(selfplay_outcomes),
                 "selfplay_win_rate": selfplay_win_rate,
                 "selfplay_pool_size": len(pool),
+                "kl_stop": args.kl_stop, "adv_norm": args.adv_norm, "value_norm": args.value_norm,
+                "attack_size_head": args.attack_size_head,
+                "grad_steps": stats["grad_steps"], "epochs_completed": stats["epochs_completed"],
+                "approx_kl_k3": stats["approx_kl_k3"], "last_epoch_kl": stats["last_epoch_kl"],
+                "value_norm_mean": value_normalizer.mean if value_normalizer is not None else float("nan"),
+                "value_norm_std": value_normalizer.std if value_normalizer is not None else float("nan"),
+                **{f"attack_frac_prob_{f:.2f}": q for f, q in zip(ATTACK_FRACTIONS, frac_probs)},
+                "train_seconds_total": wall["train"], "eval_seconds_total": wall["eval"],
             }
         )
         log_file.flush()
 
         if (update + 1) % args.checkpoint_every == 0:
-            save_checkpoint(latest_path, net, optimizer, scheduler, update + 1)
+            save_checkpoint(latest_path, net, optimizer, scheduler, update + 1, value_normalizer, wall)
             if selfplay:
                 pool.save(pool_path)
             print(f"  checkpoint saved: {latest_path}")
 
-        if eval_due(update, steps_prev, steps_done, args):
+        suite_due = eval_due(update, steps_prev, steps_done, args)
+        if not suite_due and args.canary_every_steps > 0 and (
+            steps_prev // args.canary_every_steps != steps_done // args.canary_every_steps
+        ):
+            # Logged only: never fed to the curriculum. Same sampled policy,
+            # stage and seed construction as a full suite, on a fixed subset.
+            canary_maps = scheduler.maps
+            label = maps_label(args, canary_maps)
+            t_eval = time.time()
+            episodes = run_eval_suite(args, net, device, scheduler.difficulty, canary_maps,
+                                      seeds=canary_seeds(args, canary_maps), dump_replays=False)
+            seconds = time.time() - t_eval
+            wall["eval"] += seconds
+            summary = summarize_suite(episodes, args.exclude_maps)
+            excl = (f" excl {'+'.join(args.exclude_maps)}: {summary['wins_excl']}/{summary['episodes_excl']}"
+                    if args.exclude_maps else "")
+            print(f"  canary vs {scheduler.difficulty} on {label}: won {summary['wins']}/{summary['episodes']}"
+                  f"{excl} mean_peak={summary['mean_peak_territory']:.3f} ({seconds:.0f}s; eval "
+                  f"{wall['eval'] / max(wall['eval'] + wall['train'], 1e-9):.1%} of wall time)")
+            eval_writer.writerow({
+                "update": update + 1, "steps_per_env": steps_done, "difficulty": scheduler.difficulty,
+                "maps": label, "gates_curriculum": False, "seconds": seconds, "kind": "canary", **summary,
+            })
+            for e in episodes:
+                eval_episodes_writer.writerow({"update": update + 1, "difficulty": scheduler.difficulty,
+                                               "maps": label, "kind": "canary", **e})
+            eval_file.flush()
+            eval_episodes_file.flush()
+
+        if suite_due:
             # Captured before record_eval() below, which can promote and
             # change the stage as a side effect -- everything logged for this
             # eval must describe the stage it actually ran against.
@@ -996,8 +1313,9 @@ def main() -> None:
             for difficulty in difficulties:
                 t_eval = time.time()
                 episodes = run_eval_suite(args, net, device, difficulty, stage_maps)
-                summary = summarize_suite(episodes)
+                summary = summarize_suite(episodes, args.exclude_maps)
                 seconds = time.time() - t_eval
+                wall["eval"] += seconds
                 gates = difficulty == stage_difficulty
                 if gates:
                     gating_summary = summary
@@ -1008,13 +1326,18 @@ def main() -> None:
                     f"truncated={summary['truncated']} mean_peak={summary['mean_peak_territory']:.3f} "
                     f"mean_ticks={summary['mean_ticks']:.0f} ({seconds:.0f}s)"
                     + (" -- gates curriculum" if gates else "")
+                    + (f"\n    excl {'+'.join(args.exclude_maps)}: won {summary['wins_excl']}/{summary['episodes_excl']}"
+                       if args.exclude_maps else "")
+                    + f"\n    per map: {per_map_line(episodes)}"
+                    + f"\n    eval is {wall['eval'] / max(wall['eval'] + wall['train'], 1e-9):.1%} of wall time so far"
                 )
                 eval_writer.writerow({
                     "update": update + 1, "steps_per_env": steps_done, "difficulty": difficulty,
-                    "maps": label, "gates_curriculum": gates, "seconds": seconds, **summary,
+                    "maps": label, "gates_curriculum": gates, "seconds": seconds, "kind": "suite", **summary,
                 })
                 for e in episodes:
-                    eval_episodes_writer.writerow({"update": update + 1, "difficulty": difficulty, "maps": label, **e})
+                    eval_episodes_writer.writerow({"update": update + 1, "difficulty": difficulty, "maps": label,
+                                                   "kind": "suite", **e})
                 eval_file.flush()
                 eval_episodes_file.flush()
                 notify_milestones(notified, checkpoint_dir, difficulty, summary, update + 1)
@@ -1034,7 +1357,7 @@ def main() -> None:
                 f"last_eval_win_rate={state['last_eval_win_rate']}"
             )
 
-    save_checkpoint(latest_path, net, optimizer, scheduler, args.updates)
+    save_checkpoint(latest_path, net, optimizer, scheduler, args.updates, value_normalizer, wall)
     if selfplay:
         pool.save(pool_path)
     vec_env.close()

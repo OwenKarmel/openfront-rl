@@ -76,11 +76,12 @@ def main() -> None:
 
     device = torch.device(a.device)
     if a.scripted:
-        policy, label = ScriptedPolicy(), "scripted-threshold-0.45"
+        policy, label, sized = ScriptedPolicy(), "scripted-threshold-0.45", False
     else:
         ckpt = torch.load(a.checkpoint, map_location=device, weights_only=False)
         head = "big" if any(k.startswith("tile_head_big.") for k in ckpt["model"]) else "small"
-        policy = ActorCritic(tile_head=head).to(device)
+        sized = any(k.startswith("attack_frac_head.") for k in ckpt["model"])
+        policy = ActorCritic(tile_head=head, attack_size_head=sized).to(device)
         policy.load_state_dict(ckpt["model"])
         policy.eval()
         label = f"{a.checkpoint}@{ckpt['update']}"
@@ -88,7 +89,7 @@ def main() -> None:
 
     args = argparse.Namespace(
         map=None, ticks_per_step=10, max_episode_steps=a.max_steps, reward_mode=REWARD_MODES[0],
-        potential_beta=0.0, eval_episodes=a.episodes, eval_envs=a.envs, eval_max_steps=a.max_steps,
+        potential_beta=0.0, attack_size_head=sized, eval_episodes=a.episodes, eval_envs=a.envs, eval_max_steps=a.max_steps,
         eval_replays=a.replays, eval_dir=str(Path(a.replay_dir).resolve()),
     )
     Path(a.out).parent.mkdir(parents=True, exist_ok=True)
