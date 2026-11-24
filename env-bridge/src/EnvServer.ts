@@ -78,6 +78,19 @@
  * Reward and `winner` are always AGENT's. The reset reply echoes
  * `opponentKind` for the same fail-fast reason as `rewardMode`.
  *
+ * `attackSizeHead` (optional, on reset; default false) lets the client
+ * choose how many troops each attack sends. With it on, every step whose
+ * action is expand, attack_opponent or boat_attack MUST carry
+ * `troopFraction` in (0, 1], and intentFor() sends that fraction of the
+ * seat's CURRENT troops -- `troops: fraction * troops()` for a land attack,
+ * `floor(fraction * troops())` for a boat (see troopsFor()). With it off
+ * (the default), `troopFraction` is rejected and the troop counts are
+ * exactly as before the option existed: `troops: null` for land attacks
+ * (AttackExecution.init() then takes Config.attackAmount() = troops/5) and
+ * boatAttackAmount() = floor(troops/5) for boats. Echoed on reset for the
+ * same fail-fast reason as `rewardMode`. The same setting applies to both
+ * seats in self-play.
+ *
  * `envFlags` (reset reply only) reports which of the env-var gated
  * behaviours this process is running with -- OPENFRONT_EXPAND_MASK,
  * OPENFRONT_BOAT_MASK, OPENFRONT_NEUTRAL_BOATS. They are read once at
@@ -230,6 +243,7 @@ interface ResetCmd {
   rewardMode?: string;
   potentialBeta?: number;
   opponentKind?: string;
+  attackSizeHead?: boolean;
 }
 /** One player's choice for a step -- AGENT's lives at the top level of
  * StepCmd, OPPONENT's (self-play only) under StepCmd.opponentAction. */
@@ -244,6 +258,10 @@ interface ActionChoice {
   // opponent slot to attack, indexing the same padded array observation()
   // reports (so the network's pointer head and this share one indexing).
   playerIdx?: number;
+  // Required iff the episode was reset with attackSizeHead, and then only
+  // for expand / attack_opponent / boat_attack: the fraction of the seat's
+  // current troops to send, in (0, 1]. See troopsFor().
+  troopFraction?: number;
 }
 interface StepCmd extends ActionChoice {
   cmd: "step";
@@ -836,16 +854,60 @@ function resolveWinner(episode: Episode): "AGENT" | "OPPONENT" | null {
   return null;
 }
 
-function intentFor(episode: Episode, seat: Seat, choice: ActionChoice): StampedIntent | null {
+/**
+ * The explicit troop count for an attack-size-head step, or undefined when
+ * the head is off (the caller then keeps the original sizing).
+ *
+ * Sampled HERE, when the intent is built -- which is what the real client
+ * does too (ClientGameRunner sends `myPlayer.troops() * attackRatio`). It is
+ * NOT what the original `troops: null` land-attack path does:
+ * GameImpl.executeNextTick() ticks the running executions first and init()s
+ * new ones at the END of the tick, so AttackExecution.init()'s
+ * attackAmount() = troops/5 sees one more tick of troop growth (and combat)
+ * than an amount fixed here. Boats were already sized here
+ * (boatAttackAmount() below), so for them fraction 0.2 is exactly the old
+ * behaviour; for land attacks it is the old behaviour one tick earlier.
+ * README "Action space" and tests/test_attack_size.py quantify this.
+ */
+function troopsFor(
+  episode: Episode,
+  seat: Seat,
+  choice: ActionChoice,
+  attackSizeHead: boolean,
+  boat: boolean,
+): number | undefined {
+  const fraction = choice.troopFraction;
+  if (!attackSizeHead) {
+    if (fraction !== undefined) {
+      throw new Error("troopFraction sent, but this episode was reset without attackSizeHead");
+    }
+    return undefined;
+  }
+  if (fraction === undefined || !Number.isFinite(fraction) || fraction <= 0 || fraction > 1) {
+    throw new Error(`${choice.action} needs troopFraction in (0, 1] with attackSizeHead, got ${fraction}`);
+  }
+  const troops = fraction * player(episode.game, seat.selfId).troops();
+  return boat ? Math.floor(troops) : troops;
+}
+
+function intentFor(
+  episode: Episode,
+  seat: Seat,
+  choice: ActionChoice,
+  attackSizeHead = false,
+): StampedIntent | null {
   const { action, macroX, macroY, playerIdx } = choice;
   switch (action) {
     case "noop":
+      if (choice.troopFraction !== undefined) {
+        throw new Error("troopFraction sent with noop");
+      }
       return null;
     case "expand":
       return {
         type: "attack",
         targetID: null,
-        troops: null,
+        troops: troopsFor(episode, seat, choice, attackSizeHead, false) ?? null,
         clientID: seat.clientID,
       };
     case "attack_opponent": {
@@ -867,7 +929,7 @@ function intentFor(episode: Episode, seat: Seat, choice: ActionChoice): StampedI
       return {
         type: "attack",
         targetID,
-        troops: null,
+        troops: troopsFor(episode, seat, choice, attackSizeHead, false) ?? null,
         clientID: seat.clientID,
       };
     }
@@ -886,6 +948,9 @@ function intentFor(episode: Episode, seat: Seat, choice: ActionChoice): StampedI
       // (like "noop") rather than throwing, consistent with the rest of
       // this module's stance on unreachable boat picks. Logged (not
       // silenced) so a persistently high rate would still be visible.
+      // Validated before the target, so a malformed fraction fails even on a
+      // step whose boat pick resolves to nothing.
+      const sized = troopsFor(episode, seat, choice, attackSizeHead, true);
       const dst = resolveBoatTarget(episode, seat, macroX, macroY);
       if (dst === null) {
         console.warn(
@@ -898,7 +963,7 @@ function intentFor(episode: Episode, seat: Seat, choice: ActionChoice): StampedI
       // Unlike AttackIntent, BoatAttackIntent.troops is a required
       // (non-nullable) float on the wire schema -- boatAttackAmount() is the
       // same default-sizing the engine's own Nation-bot boats use.
-      const troops = episode.game.config().boatAttackAmount(agent, owner);
+      const troops = sized ?? episode.game.config().boatAttackAmount(agent, owner);
       return {
         type: "boat",
         troops,
@@ -918,6 +983,7 @@ class Session {
   dumpGameRecordDir: string | undefined;
   rewardMode: RewardMode = "shaping_and_terminal";
   potentialBeta = 0;
+  attackSizeHead = false;
 
   async reset(cmd: ResetCmd): Promise<object> {
     // A dump requested for the previous episode is still pending if that
@@ -928,6 +994,10 @@ class Session {
     this.rewardMode = parseRewardMode(cmd.rewardMode);
     this.potentialBeta = parsePotentialBeta(cmd.potentialBeta);
     const opponentKind = parseOpponentKind(cmd.opponentKind);
+    if (cmd.attackSizeHead !== undefined && typeof cmd.attackSizeHead !== "boolean") {
+      throw new Error(`attackSizeHead must be a boolean, got ${JSON.stringify(cmd.attackSizeHead)}`);
+    }
+    this.attackSizeHead = cmd.attackSizeHead ?? false;
     this.episode = await Episode.create(
       cmd.map,
       cmd.seed,
@@ -946,6 +1016,7 @@ class Session {
       rewardMode: this.rewardMode,
       potentialBeta: this.potentialBeta,
       opponentKind,
+      attackSizeHead: this.attackSizeHead,
       envFlags: {
         expandMask: EXPAND_MASK_ENABLED,
         boatMask: BOAT_MASK_ENABLED,
@@ -959,7 +1030,7 @@ class Session {
     const episode = this.episode;
 
     const intents: StampedIntent[] = [];
-    const intent = intentFor(episode, episode.agentSeat(), cmd);
+    const intent = intentFor(episode, episode.agentSeat(), cmd, this.attackSizeHead);
     if (intent) intents.push(intent);
     if (episode.opponentKind === "policy") {
       if (cmd.opponentAction === undefined) {
@@ -968,7 +1039,7 @@ class Session {
       // Stamped after AGENT's in the same turn. Order within a turn is the
       // order executions are created and ticked, so AGENT's intent always
       // goes first on a tick where both act -- a small fixed seat asymmetry.
-      const oppIntent = intentFor(episode, episode.opponentSeat(), cmd.opponentAction);
+      const oppIntent = intentFor(episode, episode.opponentSeat(), cmd.opponentAction, this.attackSizeHead);
       if (oppIntent) intents.push(oppIntent);
     } else if (cmd.opponentAction !== undefined) {
       throw new Error("opponentAction sent to a Nation-AI episode, which has no seat to apply it to");

@@ -47,7 +47,12 @@ except ImportError as exc:  # pragma: no cover
     ) from exc
 
 ENV_BRIDGE_DIR = Path(__file__).resolve().parents[2] / "env-bridge"
-OPENFRONTIO_TSCONFIG = ENV_BRIDGE_DIR / ".." / "OpenFrontIO" / "tsconfig.json"
+# resolve(): tsx applies the tsconfig only to files under its REAL directory,
+# so a symlinked OpenFrontIO/ (a worktree sharing the main checkout's
+# submodule) would otherwise compile the engine without it -- breaking its
+# class-field semantics (NationNukeBehavior reads this.game before it is set).
+# A no-op in a normal checkout.
+OPENFRONTIO_TSCONFIG = (ENV_BRIDGE_DIR / ".." / "OpenFrontIO" / "tsconfig.json").resolve()
 
 # Must match ACTIONS in EnvServer.ts.
 ACTIONS = ["noop", "expand", "attack_opponent", "boat_attack"]
@@ -86,6 +91,18 @@ _OPPONENT_WIRE_FIELDS = tuple(_WIRE_FIELD.get(f, f) for f in OPPONENT_FEATURES)
 MACRO_GRID = 32
 BOAT_ATTACK_IDX = ACTIONS.index("boat_attack")
 ATTACK_OPPONENT_IDX = ACTIONS.index("attack_opponent")
+EXPAND_IDX = ACTIONS.index("expand")
+
+# The attack-size head's choices (attack_size_head=True / train.py's
+# --attack-size-head): the fraction of AGENT's CURRENT troops an expand,
+# attack_opponent or boat_attack sends -- action slot 3 indexes this list,
+# and the env sends the fraction itself as `troopFraction`. 0.20 is what
+# every attack sent before the head existed (Config.attackAmount() /
+# boatAttackAmount() = troops/5). network.py's NUM_ATTACK_FRACTIONS must
+# match its length.
+ATTACK_FRACTIONS = (0.10, 0.20, 0.35, 0.50, 0.75)
+DEFAULT_ATTACK_FRACTION_IDX = ATTACK_FRACTIONS.index(0.20)
+ATTACK_SIZED_ACTIONS = (EXPAND_IDX, ATTACK_OPPONENT_IDX, BOAT_ATTACK_IDX)
 
 # Every map in OpenFrontIO/resources/maps/ with both width and height <=1500
 # (checked against each map's manifest.json "map" dimensions) -- the other
@@ -199,6 +216,7 @@ class OpenFrontEnv(gym.Env):
         # See the module docstring. Like difficulty and map_pool, a change
         # takes effect at the next reset().
         opponent_kind: str = OPPONENT_KINDS[0],
+        attack_size_head: bool = False,
     ) -> None:
         super().__init__()
         if opponent_kind not in OPPONENT_KINDS:
@@ -225,6 +243,10 @@ class OpenFrontEnv(gym.Env):
         self.reward_mode = reward_mode
         self.potential_beta = float(potential_beta)
         self.opponent_kind = opponent_kind
+        # Off (default): the troopFraction field is never sent and the
+        # env-bridge sizes attacks exactly as before (troops/5). On: action
+        # slot 3 picks ATTACK_FRACTIONS[i] for every attack-type step.
+        self.attack_size_head = bool(attack_size_head)
         # The kind of the episode actually in progress -- opponent_kind can
         # be changed for the NEXT episode while this one is still running.
         self._episode_opponent_kind: str | None = None
@@ -260,7 +282,7 @@ class OpenFrontEnv(gym.Env):
         # for any value otherwise, same "cheap to sample, server validates
         # anyway" spirit as the existing type-level legality mask.
         self.action_space = spaces.MultiDiscrete(
-            [len(ACTIONS), MACRO_GRID * MACRO_GRID, MAX_OPPONENTS]
+            [len(ACTIONS), MACRO_GRID * MACRO_GRID, MAX_OPPONENTS, len(ATTACK_FRACTIONS)]
         )
         # Populated with real dimensions on the first reset(); Box shape must
         # be static, so it's declared for map_name's known geometry via a
@@ -378,11 +400,12 @@ class OpenFrontEnv(gym.Env):
         self._write(cmd)
         return self._read_reply()
 
-    @staticmethod
-    def _encode_action(action) -> dict[str, Any]:
-        """[action_type_idx, macro_tile_idx, player_idx] -> the wire's
-        {"action", "macroX"/"macroY" | "playerIdx"} (see EnvServer.ts's
-        ActionChoice)."""
+    def _encode_action(self, action) -> dict[str, Any]:
+        """[action_type_idx, macro_tile_idx, player_idx(, attack_frac_idx)]
+        -> the wire's {"action", "macroX"/"macroY" | "playerIdx",
+        "troopFraction"} (see EnvServer.ts's ActionChoice). Slot 3 is read
+        only with attack_size_head and only for an attack-type action; a
+        3-slot action is accepted with the head off, as before it existed."""
         type_idx = int(action[0])
         choice: dict[str, Any] = {"action": ACTIONS[type_idx]}
         if type_idx == BOAT_ATTACK_IDX:
@@ -392,6 +415,8 @@ class OpenFrontEnv(gym.Env):
             choice["macroY"] = macro_y
         elif type_idx == ATTACK_OPPONENT_IDX:
             choice["playerIdx"] = int(action[2])
+        if self.attack_size_head and type_idx in ATTACK_SIZED_ACTIONS:
+            choice["troopFraction"] = ATTACK_FRACTIONS[int(action[3])]
         return choice
 
     def step_send(self, action, opponent_action=None) -> None:
@@ -515,6 +540,10 @@ class OpenFrontEnv(gym.Env):
         # same command it was before self-play existed.
         if self.opponent_kind != OPPONENT_KINDS[0]:
             reset_cmd["opponentKind"] = self.opponent_kind
+        if self.attack_size_head:
+            # Sent only when on, so a default reset is byte-identical to one
+            # from before the option existed.
+            reset_cmd["attackSizeHead"] = True
         if self.dump_game_record_dir is not None:
             reset_cmd["dumpGameRecordDir"] = self.dump_game_record_dir
         raw = self._send(reset_cmd)
@@ -544,6 +573,12 @@ class OpenFrontEnv(gym.Env):
         # predates a flag ignores the variable, and one spawned before the
         # variable changed is running the old setting. Either way the run
         # would not be what its launcher says.
+        if bool(raw.get("attackSizeHead", False)) != self.attack_size_head:
+            raise RuntimeError(
+                f"env-bridge reports attackSizeHead={raw.get('attackSizeHead')!r}, but this env "
+                f"was built with attack_size_head={self.attack_size_head}"
+                + (" (it predates the option)" if "attackSizeHead" not in raw else "")
+            )
         server_flags = raw.get("envFlags")
         for var, wanted in requested_env_flags().items():
             running = None if server_flags is None else server_flags.get(ENV_FLAGS[var])
