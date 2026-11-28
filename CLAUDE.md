@@ -74,6 +74,15 @@ update 5320, in its first canary; resumed 2026-11-28 with `--recycle-every 3
 --canary-envs 4` (memory only, see the launcher header). Run `training/mem_logger.sh <pid> checkpoints/run6_bighead_attacksize/mem_log.csv 30`
 beside it, as for run5.
 
+**Status 2026-11-28 (evening):** run6 is to be paused at its first checkpoint
+after the update-5450 suite (~19:30 UTC), resumable with its launcher. In its
+place runs run7, the Tier-0-only control, `training/run_bighead_tier0_only.sh`
+(`checkpoints/run7_bighead_tier0_only/`): run6's launcher without
+`--attack-size-head`, `--init-from` run4's update-5310 checkpoint, until update
+5450 (~14–15 h, so ~2026-11-29 10:00 UTC), with `mem_logger.sh` beside it.
+Compare its 5350/5400/5450 suites with run6's (same seeds), then decide which
+run to continue. The two cannot run at once on this box (GPU and RAM).
+
 Never resume a run by retyping the `train.py` command. Checkpoints store
 weights, optimizer state and curriculum position (plus, for connected-first
 runs, the curriculum ladder) but **not** hyperparameters, so a resume that

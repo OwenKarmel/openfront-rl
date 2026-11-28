@@ -115,6 +115,11 @@ MuZero/EfficientZero, action/observation space, phased milestones).
       canary evals, `--eval-report-exclude-maps labyrinth`) and
       `--attack-size-head`. Without `--attack-size-head` it is the
       Tier-0-only control. Header has the reasons and the success bar.
+    - `run_bighead_tier0_only.sh` — **run7, the Tier-0-only control**
+      (`checkpoints/run7_bighead_tier0_only/`, prepared 2026-11-28): run6's
+      launcher without `--attack-size-head`, same `--init-from`. Runs
+      5310 → 5450 while run6 is paused, so their suites at 5350/5400/5450
+      compare one-for-one on the same seeds.
     - `run_bighead_selfplay_terminal.sh` — run5 on the GTX 1660 box
       (`checkpoints/run5_bighead_selfplay_terminal/`, started 2026-11-23;
       died 2026-11-24 17:49 UTC of an OOM kill, left paused at its update-5415
@@ -1270,6 +1275,17 @@ npm run replay:game -- ../training/replays/<gameID>.json
       seeds, at least the script's 18/64; hard win rate excluding labyrinth
       well above run4's 21/~61,000; eval under 15% of wall time; full epochs
       actually running (`epochs_completed` = 8 on most updates).
+      **First results (update 5408, 2026-11-28):** 0/128 suite wins; mean
+      peak territory 0.074 vs run4's 0.196, lower than run4's final
+      checkpoint on 62 of the same 64 seeds; eval 12.7% of wall time (met);
+      the epoch KL stop still ends updates after ~3.5 of 8 epochs at real
+      epoch-mean KL ~0.021, 0.030–0.037 on the stopping epoch (not met).
+- [ ] **Run7: Tier-0-only control** (`training/run_bighead_tier0_only.sh`,
+      `checkpoints/run7_bighead_tier0_only/`, 2026-11-28). Run6 minus
+      `--attack-size-head`, from the same run4 checkpoint, to update 5450
+      (~14–15 h) while run6 is paused at its post-5450-suite checkpoint.
+      Tells whether run6's territory drop comes from the head or from the
+      four Tier-0 fixes.
 - [ ] Roadmap Phases 2-3 (not yet built, see the action-space-expansion
       plan): building/structure actions, then diplomacy actions
       (alliance/donate/embargo) — diplomacy explicitly gated on raising
