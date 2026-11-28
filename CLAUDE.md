@@ -69,7 +69,9 @@ fixes (`--kl-stop epoch --value-norm --adv-norm minibatch`, canary evals,
 `--eval-report-exclude-maps labyrinth`) and `--attack-size-head`. The
 launcher header and the README Status entry carry the reasons and the success
 bar. Relaunching the launcher resumes its own `latest.pt` (`--init-from` is
-then ignored). Run `training/mem_logger.sh <pid> checkpoints/run6_bighead_attacksize/mem_log.csv 30`
+then ignored). Its first launch (2026-11-27 23:01 UTC) was OOM-killed at
+update 5320, in its first canary; resumed 2026-11-28 with `--recycle-every 3
+--canary-envs 4` (memory only, see the launcher header). Run `training/mem_logger.sh <pid> checkpoints/run6_bighead_attacksize/mem_log.csv 30`
 beside it, as for run5.
 
 Never resume a run by retyping the `train.py` command. Checkpoints store

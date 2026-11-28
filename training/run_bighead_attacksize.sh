@@ -66,6 +66,17 @@
 #     (train_seconds_total + eval_seconds_total));
 #   - full epochs actually running (epochs_completed = 8 on most updates).
 #
+# MEMORY (2026-11-28): the first launch was OOM-killed at update 5320, in its
+# first canary (mem_log.csv: oom_kill 23 -> 24, container at 12.6 GB with 36
+# EnvServer processes). Resumed from that update's checkpoint with
+#   --recycle-every 3   (was 25) -- a Node worker's RSS climbs ~130 -> ~300 MB
+#                       over its first ~3 episodes and then plateaus (V8 heap
+#                       warm-up, measured 2026-11-28), so respawning every 3
+#                       keeps the 10 training workers ~1 GB lower
+#   --canary-envs 4     (was --eval-envs, 8) -- ~1.2 GB less during canaries
+# Both change memory and wall time only, never a game
+# (tests/test_worker_memory_flags.py). Full suites still use 8 workers.
+#
 # Safe to relaunch: with latest.pt present, train.py resumes it and ignores
 # --init-from. RUN_NAME overrides the run directory -- for smoke tests only.
 
@@ -108,6 +119,8 @@ exec "${OPENFRONT_PYTHON:-/home/developer/miniconda/envs/openfront-rl/bin/python
   --eval-every-steps 50000 \
   --canary-every-steps 10000 \
   --canary-episodes 16 \
+  --canary-envs 4 \
+  --recycle-every 3 \
   --eval-report-exclude-maps labyrinth \
   --attack-size-head \
   --checkpoint-dir "checkpoints/$RUN" \

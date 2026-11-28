@@ -361,6 +361,19 @@ def parse_args() -> argparse.Namespace:
         help="games per canary eval (see --canary-every-steps); at most --eval-episodes",
     )
     p.add_argument(
+        "--canary-envs", type=int, default=0,
+        help="parallel env workers for a canary eval; 0 (default) uses --eval-envs. Wall time "
+             "and memory only -- results do not depend on it",
+    )
+    p.add_argument(
+        "--recycle-every", type=int, default=25,
+        help="respawn each Node env worker every this many episodes (OpenFrontEnv.recycle_every; "
+             "0 = never). Default 25 as before. A worker's RSS climbs from ~130 MB to a ~300 MB "
+             "plateau over its first ~3 episodes (V8 heap warm-up), so recycling more often keeps "
+             "10 training workers ~1 GB lower, for one ~2 s Node start per recycle. Memory and "
+             "wall time only: each episode's game is fixed by its seed",
+    )
+    p.add_argument(
         "--eval-report-exclude-maps", default="",
         help="comma-separated maps left out of eval_log.csv's wins_excl/episodes_excl columns "
              "(e.g. labyrinth, where nearly all of run4's hard wins came from). Reporting only: "
@@ -442,6 +455,8 @@ def make_env(
         reward_mode=getattr(args, "reward_mode", REWARD_MODES[0]),
         potential_beta=getattr(args, "potential_beta", 0.0),
         attack_size_head=getattr(args, "attack_size_head", False),
+        # getattr for the same reason as above; 25 is OpenFrontEnv's default.
+        recycle_every=getattr(args, "recycle_every", 25),
     )
 
 
@@ -745,7 +760,7 @@ def canary_seeds(args: argparse.Namespace, maps: str | None) -> list[int]:
 
 def run_eval_suite(
     args: argparse.Namespace, net: ActorCritic, device: torch.device, difficulty: str, maps: str | None,
-    seeds: list[int] | None = None, dump_replays: bool = True,
+    seeds: list[int] | None = None, dump_replays: bool = True, num_envs: int | None = None,
 ) -> list[dict]:
     """Plays --eval-episodes episodes on the fixed eval seeds with the SAMPLED
     policy -- the one training optimizes and the one training episodes are
@@ -761,6 +776,8 @@ def run_eval_suite(
 
     seeds: which of the suite's seeds to play (default all of 0..N-1) --
     the canary passes a subset. dump_replays=False skips --eval-replays.
+    num_envs: parallel workers (default --eval-envs; the canary passes
+    --canary-envs). Results do not depend on it, only wall time and memory.
 
     Returns one dict per episode, in seed order."""
     seeds = list(range(args.eval_episodes)) if seeds is None else list(seeds)
@@ -769,7 +786,7 @@ def run_eval_suite(
     prefix = f"{EVAL_SEED_PREFIX}-{difficulty}-{maps_label(args, maps)}"
     envs = [
         make_env(args, difficulty, prefix, maps=maps, max_steps=max_steps)
-        for _ in range(min(args.eval_envs, n))
+        for _ in range(min(num_envs or args.eval_envs, n))
     ]
     pending = list(seeds)
     live: dict[int, dict] = {}  # worker index -> its episode in progress
@@ -903,6 +920,8 @@ def main() -> None:
         sys.exit("--canary-every-steps and --canary-episodes must be >= 0")
     if (args.canary_every_steps > 0) != (args.canary_episodes > 0):
         sys.exit("--canary-every-steps and --canary-episodes go together: set both, or neither")
+    if args.canary_envs < 0 or args.recycle_every < 0:
+        sys.exit("--canary-envs and --recycle-every must be >= 0")
     if args.canary_episodes > args.eval_episodes:
         sys.exit("--canary-episodes must be at most --eval-episodes (canary seeds are a subset of the suite's)")
     args.exclude_maps = tuple(m for m in args.eval_report_exclude_maps.split(",") if m)
@@ -928,7 +947,10 @@ def main() -> None:
           f"value_norm={args.value_norm} attack_size_head={args.attack_size_head}"
           + (f" (fractions {list(ATTACK_FRACTIONS)})" if args.attack_size_head else ""))
     if args.canary_every_steps > 0:
-        print(f"canary: {args.canary_episodes} games every {args.canary_every_steps} steps/env (logged only)")
+        print(f"canary: {args.canary_episodes} games every {args.canary_every_steps} steps/env (logged only), "
+              f"{args.canary_envs or args.eval_envs} workers")
+    print(f"env workers: recycled every {args.recycle_every} episodes" if args.recycle_every
+          else "env workers: never recycled")
     if args.exclude_maps:
         print(f"eval report: wins_excl/episodes_excl leave out {list(args.exclude_maps)}")
     # The env-bridge's env-var gated behaviours are set by the launcher's
@@ -1282,7 +1304,8 @@ def main() -> None:
             label = maps_label(args, canary_maps)
             t_eval = time.time()
             episodes = run_eval_suite(args, net, device, scheduler.difficulty, canary_maps,
-                                      seeds=canary_seeds(args, canary_maps), dump_replays=False)
+                                      seeds=canary_seeds(args, canary_maps), dump_replays=False,
+                                      num_envs=args.canary_envs or args.eval_envs)
             seconds = time.time() - t_eval
             wall["eval"] += seconds
             summary = summarize_suite(episodes, args.exclude_maps)

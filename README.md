@@ -581,6 +581,15 @@ games, ~311 h — against ~290 h of training. Two knobs, both off by default:
   replays.
 - Full suites (`--eval-every-steps`, `--eval-episodes`) are unchanged and
   still gate promotion (`kind=suite`).
+- `--canary-envs` (default 0 = `--eval-envs`) runs canaries on fewer
+  workers, and `--recycle-every` (default 25, as before) respawns each Node
+  env worker every that many episodes. Both trade wall time for memory and
+  never change a game (`tests/test_worker_memory_flags.py`). Measured
+  2026-11-28: a worker's RSS climbs from ~130 MB to a ~300 MB plateau over its
+  first ~3 episodes (V8 heap warm-up, not the slow per-episode leak the
+  25-episode recycle was sized for), so the 10 training workers sit at
+  ~3.7 GB after an hour; run6's first launch was OOM-killed in its first
+  canary, with 8 more eval workers on top of that.
 
 `train_log.csv` records `train_seconds_total` (rollout + update) and
 `eval_seconds_total` (suites + canaries), cumulative and carried in
@@ -1311,7 +1320,8 @@ Key flags: `--num-envs`, `--rollout-length`, `--rollout-match-horizon`,
 `--eval-log-csv`, `--param-entropy-norm`, `--tile-head`, `--expert-frac`,
 `--selfplay-pool-size`, `--selfplay-snapshot-every`, `--selfplay-latest-prob`, `--kl-stop`,
 `--adv-norm`, `--value-norm`, `--attack-size-head`, `--init-from`,
-`--canary-every-steps`, `--canary-episodes`, `--eval-report-exclude-maps` (see `train.py --help` for the full
+`--canary-every-steps`, `--canary-episodes`, `--canary-envs`, `--recycle-every`,
+`--eval-report-exclude-maps` (see `train.py --help` for the full
 list — learning rate, GAE/clip/entropy coefficients and minibatch size are
 exposed too). The current run's values and the reasoning behind the coupled
 ones are in [Training (PPO) hyperparameters](#training-ppo-hyperparameters).

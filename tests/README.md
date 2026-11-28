@@ -7,7 +7,7 @@ Run one directly, or all of them with `tests/run_all.sh`:
 
 ```bash
 /home/developer/miniconda/envs/openfront-rl/bin/python tests/test_schedules.py
-tests/run_all.sh          # all eighteen, in ascending cost order (~20min)
+tests/run_all.sh          # all nineteen, in ascending cost order (~20min)
 tests/run_all.sh -q       # same, only the per-file verdict
 ```
 
@@ -45,6 +45,7 @@ tmpfs on this box.
 | `smoke_test_multiopp.py` | env-bridge | 2s | variable-N opponent encoding: padding contributes nothing, permutation invariance, `attack_target_mask` respected, pointer-head log_prob composition, env round trip |
 | `test_neutral_boats.py` | env-bridge | 6s | `OPENFRONT_NEUTRAL_BOATS=1` on fourislands: the boat mask grows from opponent-only to opponent-or-unowned land (same seed, flag off vs on), and a boat to another island's unowned land actually lands. Plus the `envFlags` echo and the stale-worker refusal |
 | `test_eval_suite.py` | env-bridge | 20s | `run_eval_suite`: fixed seeds give the same maps every suite, workers are reused and every step is one batched `net.act()` (sampled policy), capped episodes are truncated not won, replays dumped only for seeds < `--eval-replays`, one gameID per (stage, seed) |
+| `test_worker_memory_flags.py` | env-bridge | ~1min | `--recycle-every` reaches `OpenFrontEnv` and really respawns the worker; `run_eval_suite()` with 1 vs 3 workers and recycling every episode vs every 25 plays identical games |
 | `test_expand_mask.py` | env-bridge, snapshot | 71s | `OPENFRONT_EXPAND_MASK=1`: reproduces eval `0ab47d4b` (the episode that conquered its island then pulsed forever) and measures where the mass goes once `expand` is masked off |
 | `test_boat_mask.py` | env-bridge, snapshot | 32s | `OPENFRONT_BOAT_MASK=1`: reproduces eval `cc83d2cc` (landlocked all game) and measures the same redistribution for `boat_attack` |
 | `test_selfplay.py` | env-bridge, OpenFrontIO npm | ~1min | self-play: `--expert-frac` parsing, `OpponentPool` FIFO/sampling/eviction fallback/save-load, `OpponentChooser` (expert_frac 1 is all-Nation and draws no randomness, the mix follows the stage); through a real env-bridge, the two seats' observations mirror exactly, random play by both seats ends with the right `winner`, the step guards refuse a missing/extra `opponent_action`, and the self-play GameRecord lists both humans and replays IN SYNC under `npm run replay:game` |
